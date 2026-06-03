@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.atrium.system</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/mac/pp/ai-company/system</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/mac/.local/bin/uv</string>
+    <string>run</string>
+    <string>--extra</string>
+    <string>live</string>
+    <string>--extra</string>
+    <string>postgres</string>
+    <string>python</string>
+    <string>-m</string>
+    <string>app</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>ATRIUM_HOST</key>
+    <string>127.0.0.1</string>
+    <key>ATRIUM_PORT</key>
+    <string>8787</string>
+    <key>ATRIUM_DATA_DIR</key>
+    <string>/Users/mac/pp/ai-company/system/data</string>
+    <key>ATRIUM_DATABASE_URL</key>
+    <string>postgresql+asyncpg://atrium:atrium@127.0.0.1:5432/atrium</string>
+    <key>ATRIUM_GRAPH_BACKEND</key>
+    <string>relational</string>
+    <key>ATRIUM_AGENT_BACKEND</key>
+    <string>letta</string>
+    <key>ATRIUM_ENTITLEMENT_HOST_SHELL</key>
+    <string>true</string>
+    <key>ATRIUM_ENTITLEMENT_HOST_FILESYSTEM</key>
+    <string>true</string>
+    <key>ATRIUM_ENTITLEMENT_BROWSER_AUTOMATION</key>
+    <string>true</string>
+    <key>ATRIUM_ENTITLEMENT_DESKTOP_AUTOMATION</key>
+    <string>true</string>
+    <key>ATRIUM_ENTITLEMENT_EXTERNAL_SEND</key>
+    <string>false</string>
+    <key>ATRIUM_ENTITLEMENT_CREDENTIALS</key>
+    <string>false</string>
+    <key>ATRIUM_MCP_GATEWAY_URL</key>
+    <string></string>
+    <key>ATRIUM_MCP_GATEWAY_TOKEN_KEYCHAIN_SERVICE</key>
+    <string></string>
+    <key>ATRIUM_MCP_GATEWAY_TOKEN_KEYCHAIN_ACCOUNT</key>
+    <string>atrium</string>
+    <key>ATRIUM_MCP_ENABLED_SERVERS</key>
+    <string></string>
+    <key>ATRIUM_ORG_AUTOSPAWN_ENABLED</key>
+    <string>true</string>
+    <key>ATRIUM_ORG_AUTOMERGE_ENABLED</key>
+    <string>true</string>
+    <key>ATRIUM_OLLAMA_BASE_URL</key>
+    <string>http://127.0.0.1:11434</string>
+    <key>ATRIUM_OLLAMA_EMBEDDING_MODEL</key>
+    <string>bge-m3</string>
+    <key>ATRIUM_EMBEDDING_DIM</key>
+    <string>1024</string>
+    <key>ATRIUM_CLAUDE_CODE_COMMAND</key>
+    <string>/Users/mac/.local/bin/claude</string>
+    <key>CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC</key>
+    <string>1</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/mac/pp/ai-company/system/logs/atrium.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/mac/pp/ai-company/system/logs/atrium.err.log</string>
+</dict>
+</plist>

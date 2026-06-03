@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.atrium.backup</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/mac/pp/ai-company</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/mac/pp/ai-company/ops/scripts/backup_postgres.sh</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>ATRIUM_DATABASE_URL</key>
+    <string>postgresql+asyncpg://atrium:atrium@127.0.0.1:5432/atrium</string>
+    <key>ATRIUM_BACKUP_DIR</key>
+    <string>/Users/mac/pp/ai-company/system/data/backups</string>
+    <key>ATRIUM_POSTGRES_CONTAINER</key>
+    <string>atrium-postgres</string>
+    <key>ATRIUM_POSTGRES_USER</key>
+    <string>atrium</string>
+    <key>ATRIUM_POSTGRES_DB</key>
+    <string>atrium</string>
+    <key>ATRIUM_BACKUP_SCHEMA</key>
+    <string>atrium</string>
+    <key>ATRIUM_BACKUP_OFFSITE_DIR</key>
+    <string>/Users/mac/Library/Mobile Documents/com~apple~CloudDocs/ATRIUM/backups</string>
+    <key>ATRIUM_BACKUP_REQUIRE_OFFSITE</key>
+    <string>true</string>
+    <key>ATRIUM_DOCKER_CONFIG</key>
+    <string>/tmp/atrium-docker-config</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>
+    <integer>3</integer>
+    <key>Minute</key>
+    <integer>15</integer>
+  </dict>
+
+  <key>StandardOutPath</key>
+  <string>/Users/mac/pp/ai-company/system/logs/atrium-backup.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/mac/pp/ai-company/system/logs/atrium-backup.err.log</string>
+</dict>
+</plist>

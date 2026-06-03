@@ -1,0 +1,372 @@
+@import 'tailwindcss';
+
+/* ============================================================
+   ATRIUM — "Midnight Atrium" theme
+   A warm, lamp-lit 24/7 office that never sleeps.
+   ============================================================ */
+
+@theme {
+  /* — Type — */
+  --font-display: 'Pixelify Sans', 'Noto Sans Thai', system-ui, sans-serif;
+  --font-soft: 'Bricolage Grotesque', 'Noto Sans Thai', system-ui, sans-serif;
+  --font-sans: 'Spline Sans', 'Noto Sans Thai', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', monospace;
+
+  /* — Surfaces (warm near-black, candle-lit) — */
+  --color-ink: #131009;
+  --color-surface: #1a1610;
+  --color-surface-2: #221d15;
+  --color-surface-3: #2c261c;
+  --color-surface-4: #382f22;
+  --color-line: #3c3325;
+  --color-line-soft: #2a2418;
+
+  /* — Text — */
+  --color-cream: #efe7d7;
+  --color-cream-dim: #aba090;
+  --color-cream-faint: #6f6657;
+
+  /* — Accents — */
+  --color-amber: #f4a945;
+  --color-amber-bright: #ffc879;
+  --color-amber-deep: #a96e23;
+  --color-honey: #e8c07a;
+
+  --color-teal: #57d6bf;
+  --color-teal-bright: #8ef0de;
+  --color-teal-deep: #1f6b60;
+
+  --color-coral: #f0735f;
+  --color-coral-bright: #ff9685;
+  --color-coral-deep: #9c3a2a;
+
+  --color-lavender: #b3a4ee;
+  --color-lavender-deep: #5a4e8f;
+
+  --color-sky: #7eb0dc;
+
+  /* — Radii (pixel-blocky: small corners everywhere, pills stay round) — */
+  --radius-card: 4px;
+  --radius-pill: 999px;
+  --radius-xs: 1px;
+  --radius-sm: 2px;
+  --radius-md: 2px;
+  --radius-lg: 3px;
+  --radius-xl: 4px;
+  --radius-2xl: 5px;
+  --radius-3xl: 6px;
+
+  /* — Shadows / glow — */
+  --shadow-panel: 0 24px 48px -24px rgba(0, 0, 0, 0.8),
+    0 2px 8px -2px rgba(0, 0, 0, 0.5);
+  --shadow-lamp: 0 0 42px -8px rgba(244, 169, 69, 0.45);
+
+  /* — Motion — */
+  --ease-out-soft: cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+/* ---------- Base ---------- */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  font-size: 15px;
+  line-height: 1.5;
+  letter-spacing: 0.1px;
+  color: var(--color-cream);
+  background-color: var(--color-ink);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+  overflow: hidden;
+
+  /* layered warm light: a soft lamp in the upper-left, cooler depth lower-right */
+  background-image:
+    radial-gradient(
+      120% 90% at 12% -8%,
+      rgba(244, 169, 69, 0.12),
+      transparent 46%
+    ),
+    radial-gradient(
+      90% 80% at 96% 8%,
+      rgba(87, 214, 191, 0.07),
+      transparent 50%
+    ),
+    radial-gradient(
+      140% 120% at 70% 118%,
+      rgba(20, 14, 32, 0.55),
+      transparent 60%
+    );
+  background-attachment: fixed;
+}
+
+/* film-grain atmosphere overlay */
+#root::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  pointer-events: none;
+  opacity: 0.04;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='3' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--font-display);
+  font-weight: 600;
+  color: var(--color-cream);
+  margin: 0;
+  letter-spacing: -0.01em;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+/* Generated raster assets are now high-resolution sources; let the browser downsample smoothly. */
+.pixel-img {
+  image-rendering: auto;
+}
+
+::selection {
+  background: rgba(244, 169, 69, 0.28);
+  color: var(--color-amber-bright);
+}
+
+/* ---------- Scrollbars ---------- */
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-surface-4) transparent;
+}
+*::-webkit-scrollbar {
+  width: 9px;
+  height: 9px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-surface-4);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--color-line);
+  background-clip: content-box;
+}
+
+/* ---------- Reusable utilities ---------- */
+
+@utility panel {
+  background:
+    linear-gradient(
+      180deg,
+      color-mix(in oklab, var(--color-surface-2), white 2%),
+      var(--color-surface)
+    );
+  border: 1px solid var(--color-line-soft);
+  border-radius: var(--radius-card);
+  box-shadow: var(--shadow-panel);
+}
+
+@utility hairline {
+  border: 1px solid var(--color-line-soft);
+}
+
+/* gentle vertical entrance for stacked items */
+@keyframes atrium-rise {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes atrium-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@keyframes atrium-shimmer {
+  from {
+    background-position: -160% 0;
+  }
+  to {
+    background-position: 260% 0;
+  }
+}
+
+.animate-rise {
+  animation: atrium-rise 0.4s var(--ease-out-soft) both;
+}
+
+.live-dot {
+  animation: atrium-pulse 1.6s ease-in-out infinite;
+}
+
+/* ---------- App shell layout ---------- */
+
+/* desktop: three columns (แผนก / ออฟฟิศ / รายละเอียด).
+   Widths come from CSS vars set inline by App so the left rail can collapse and
+   the dock can be resized/collapsed. The mobile media query below overrides the
+   whole property, so the vars are ignored on narrow screens. */
+.app-main {
+  grid-template-columns: var(--left-col, 296px) minmax(0, 1fr) var(--dock-col, 480px);
+}
+
+/* office room corridor: a thin horizontal tab strip that scrolls when rooms overflow */
+.office-tabstrip {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-soft) transparent;
+}
+.office-tabstrip::-webkit-scrollbar {
+  height: 6px;
+}
+.office-tabstrip::-webkit-scrollbar-thumb {
+  background: var(--color-line-soft);
+  border-radius: 3px;
+}
+
+/* draggable divider on the dock's left edge */
+.dock-resize {
+  position: absolute;
+  inset-block: 0;
+  left: 0;
+  width: 10px;
+  transform: translateX(-5px);
+  cursor: col-resize;
+  z-index: 20;
+  touch-action: none;
+}
+.dock-resize::after {
+  content: '';
+  position: absolute;
+  inset-block: 0;
+  left: 50%;
+  width: 2px;
+  transform: translateX(-50%);
+  background: transparent;
+  transition: background-color 0.15s var(--ease-out-soft);
+}
+.dock-resize:hover::after,
+.dock-resize:active::after {
+  background: var(--color-amber);
+  box-shadow: 0 0 12px rgba(244, 169, 69, 0.55);
+}
+
+/* the mobile section switcher is desktop-hidden */
+.app-tabbar {
+  display: none;
+}
+
+/* ---------- Responsive: phone / narrow ---------- */
+/*
+   Below 900px the 744px-min three-column grid no longer fits and body
+   overflow is hidden, so collapse to a single column and show one
+   section at a time, driven by [data-section] on .app-main and the
+   bottom tab bar below.
+*/
+@media (max-width: 900px) {
+  .app-main {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+  }
+
+  /* collapse/resize affordances are desktop-only */
+  .dock-resize {
+    display: none;
+  }
+
+  /*
+     Only one section occupies the single cell at a time. The grid's
+     direct children are, in order: LeftRail (rail), the office
+     <section>, and the dock <aside>. LeftRail renders its own root,
+     so it is targeted positionally via :nth-child(1).
+  */
+  .app-main > :nth-child(1),
+  .app-main > .app-office,
+  .app-main > .app-dock {
+    grid-column: 1;
+    grid-row: 1;
+    min-width: 0;
+    display: none;
+  }
+
+  .app-main[data-section='depts'] > :nth-child(1),
+  .app-main[data-section='office'] > .app-office,
+  .app-main[data-section='detail'] > .app-dock {
+    display: flex;
+  }
+
+  /* the office <section> is `relative` (not flex) — show as block */
+  .app-main[data-section='office'] > .app-office {
+    display: block;
+  }
+
+  /* the dock owns the left border on desktop; drop it when full-width */
+  .app-main > .app-dock {
+    border-left: none !important;
+  }
+
+  /* bottom tab bar */
+  .app-tabbar {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 4px;
+    flex: 0 0 auto;
+    padding: 6px max(8px, env(safe-area-inset-left)) calc(6px + env(safe-area-inset-bottom));
+    background:
+      linear-gradient(
+        180deg,
+        color-mix(in oklab, var(--color-surface-2), white 2%),
+        var(--color-surface)
+      );
+    border-top: 1px solid var(--color-line-soft);
+  }
+
+  .app-tabbar-btn {
+    font-family: var(--font-display);
+    font-size: 12px;
+    letter-spacing: 0.04em;
+    padding: 9px 6px;
+    border-radius: var(--radius-card);
+    border: 1px solid transparent;
+    color: var(--color-cream-faint);
+    background: transparent;
+    transition:
+      color 0.18s var(--ease-out-soft),
+      background-color 0.18s var(--ease-out-soft),
+      border-color 0.18s var(--ease-out-soft);
+  }
+
+  .app-tabbar-btn[data-active='true'] {
+    color: var(--color-amber-bright);
+    background: rgba(244, 169, 69, 0.1);
+    border-color: rgba(244, 169, 69, 0.32);
+  }
+}

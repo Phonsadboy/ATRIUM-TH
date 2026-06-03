@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.atrium.watchdog</string>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/mac</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/Users/mac/.local/bin/atrium-watchdog.sh</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>ATRIUM_WATCHDOG_URL</key>
+    <string>http://127.0.0.1:8787/health</string>
+    <key>ATRIUM_WATCHDOG_HEALTH_URL</key>
+    <string>http://127.0.0.1:8787/health</string>
+    <key>ATRIUM_WATCHDOG_TIMEOUT</key>
+    <string>20</string>
+    <key>ATRIUM_WATCHDOG_MISSES_BEFORE_RESTART</key>
+    <string>5</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StartInterval</key>
+  <integer>60</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/mac/Library/Logs/atrium-watchdog.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/mac/Library/Logs/atrium-watchdog.err.log</string>
+</dict>
+</plist>

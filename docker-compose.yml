@@ -1,0 +1,90 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: atrium-ollama
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:11434:11434"
+    volumes:
+      - atrium-ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 15s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+  letta:
+    image: letta/letta:latest
+    container_name: atrium-letta
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      LETTA_PG_URI: postgresql://atrium:atrium@postgres:5432/letta
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-https://api.anthropic.com}
+      OLLAMA_BASE_URL: http://ollama:11434/v1
+    ports:
+      - "127.0.0.1:8283:8283"
+    profiles:
+      - v2
+
+  postgres:
+    image: pgvector/pgvector:pg17
+    container_name: atrium-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: atrium
+      POSTGRES_USER: atrium
+      POSTGRES_PASSWORD: atrium
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - atrium-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U atrium -d atrium"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  system:
+    build:
+      context: ./system
+      dockerfile: Dockerfile
+    container_name: atrium-system
+    restart: unless-stopped
+    env_file:
+      - path: ./system/.env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+    environment:
+      ATRIUM_HOST: 0.0.0.0
+      ATRIUM_PORT: 8787
+      ATRIUM_DATABASE_URL: postgresql+asyncpg://atrium:atrium@postgres:5432/atrium
+      ATRIUM_DATA_DIR: /data
+      ATRIUM_GRAPH_BACKEND: auto
+      ATRIUM_AGENT_BACKEND: letta
+      ATRIUM_ORG_AUTOSPAWN_ENABLED: "true"
+      ATRIUM_ORG_AUTOMERGE_ENABLED: "true"
+      ATRIUM_OLLAMA_BASE_URL: http://ollama:11434
+      ATRIUM_OLLAMA_EMBEDDING_MODEL: bge-m3
+      ATRIUM_EMBEDDING_DIM: "1024"
+      ATRIUM_LETTA_BASE_URL: http://letta:8283
+      ATRIUM_ANTHROPIC_BASE_URL: https://api.anthropic.com
+      ATRIUM_OPENAI_BASE_URL: https://api.openai.com/v1
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: "1"
+    ports:
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - atrium-system-data:/data
+
+volumes:
+  atrium-postgres:
+  atrium-system-data:
+  atrium-ollama:
