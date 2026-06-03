@@ -17,6 +17,7 @@ pnpm-debug.log*
 # Dependencies
 node_modules
 **/node_modules
+/ui/node_modules/
 
 # Build output
 dist
@@ -24,6 +25,7 @@ dist-ssr
 build
 coverage
 htmlcov
+/ui/dist/
 
 # Tool caches
 .cache/
@@ -53,6 +55,7 @@ ops/QA_AGENT_RESULTS/
 ops/screenshots/
 ops/db-backups/
 ops/*_probe.py
+!ops/windows_host_bridge_probe.py
 ops/*_audit.py
 ops/QA_*.md
 ops/*_DESIGN.md

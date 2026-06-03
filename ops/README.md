@@ -6,6 +6,8 @@ local installation, macOS startup, account OAuth, and database maintenance.
 ## Included
 
 - `chatgpt_account_oauth_login.py` - local ChatGPT account OAuth login helper
+- `windows_host_bridge_probe.py` - Windows HostBridge parity probe for shell,
+  browser, desktop, notification, and interactive desktop checks
 - `launchd/` - macOS LaunchAgent examples and wrapper scripts
 - `scripts/backup_postgres.sh` - local Postgres backup script
 - `scripts/migrate_sqlite_to_postgres.py` - one-time SQLite to Postgres migration helper
@@ -34,6 +36,20 @@ pnpm dev --host 127.0.0.1 --port 5173
 ## macOS launchd
 
 See `ops/launchd/README.md` when ATRIUM should start automatically at login.
+
+## Windows HostBridge
+
+Use the simulation mode from macOS/Linux for branch coverage:
+
+```bash
+uv --project system run python ops/windows_host_bridge_probe.py --simulate
+```
+
+Run the full parity probe only from a signed-in Windows desktop session:
+
+```powershell
+uv --project system run python ops/windows_host_bridge_probe.py --full
+```
 
 ## Backups
 
