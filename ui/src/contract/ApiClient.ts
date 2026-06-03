@@ -934,8 +934,8 @@ export class ApiClient implements CompanyClient {
   // ----- Knowledge debt & catalog -----
   getKnowledgeDebt = (): Promise<KnowledgeDebtReport> => this.request('/api/knowledge-debt', 'GET')
   getCatalog = (): Promise<CatalogResponse> => this.request('/api/catalog', 'GET')
-  getProviderAuthStatus = (): Promise<ProviderAuthStatusResponse> =>
-    this.request('/api/provider-auth/status', 'GET')
+  getProviderAuthStatus = (probeClaude = false): Promise<ProviderAuthStatusResponse> =>
+    this.request(`/api/provider-auth/status${probeClaude ? '?probe=true' : ''}`, 'GET')
   getProviderAuthReference = (): Promise<ProviderAuthReferenceResponse> =>
     this.request('/api/provider-auth/reference', 'GET')
   getProviderEnvSettings = (): Promise<ProviderEnvSettingsResponse> =>

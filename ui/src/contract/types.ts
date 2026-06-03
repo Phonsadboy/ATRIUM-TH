@@ -1679,7 +1679,7 @@ export interface ProviderAuthReferenceResponse {
 
 export interface ProviderAuthStartResponse {
   id?: string
-  status?: string
+  status?: string | Record<string, unknown>
   authorizationUrl?: string
   redirectUri?: string
   startedAt?: number

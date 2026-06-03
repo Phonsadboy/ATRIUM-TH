@@ -138,6 +138,39 @@ def claude_code_auth_status(command: str = "claude", timeout_s: float = _AUTH_ST
         return _parse_and_cache_auth_status(resolved=resolved, base=base, cached=cached, now=now, proc=proc)
 
 
+def claude_code_cached_auth_status(command: str = "claude") -> dict[str, Any] | None:
+    resolved = shutil.which(command) if "/" not in command else command if Path(command).exists() else None
+    if not resolved:
+        return None
+    with _AUTH_STATUS_LOCK:
+        cached = _AUTH_STATUS_CACHE.get(resolved)
+    if not cached:
+        return None
+    cached_at, cached_status = cached
+    now = time.time()
+    last_fresh_at = cached_status.get("lastFreshAt")
+    if not isinstance(last_fresh_at, (int, float)):
+        last_fresh_at = cached_at
+    cache_age_s = max(0.0, now - cached_at)
+    stale_age_s = max(0.0, now - float(last_fresh_at))
+    if cache_age_s <= _AUTH_STATUS_TTL_S:
+        return cached_status
+    if stale_age_s <= _AUTH_STATUS_STALE_GRACE_S and isinstance(cached_status.get("ready"), bool):
+        return {
+            **cached_status,
+            "fresh": False,
+            "stale": True,
+            "state": "ready_cached" if cached_status.get("ready") else "not_logged_in_cached",
+            "status": cached_status.get("status") or ("ready" if cached_status.get("ready") else "not_logged_in"),
+            "probeFailed": False,
+            "probeStatus": "cache_only",
+            "checkedAt": now,
+            "lastFreshAt": float(last_fresh_at),
+            "staleAgeS": round(stale_age_s, 3),
+        }
+    return None
+
+
 def _parse_and_cache_auth_status(
     *,
     resolved: str,

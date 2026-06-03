@@ -52,6 +52,18 @@ function providerConfigured(
   return typeof provider?.configured === 'boolean' ? provider.configured : null
 }
 
+function mergeProviderAuthStatus(
+  current: ProviderAuthStatusResponse | null,
+  next: ProviderAuthStatusResponse,
+): ProviderAuthStatusResponse {
+  const nextClaudeReady = next.claudeCode?.ready
+  const currentClaudeReady = current?.claudeCode?.ready
+  if (typeof nextClaudeReady !== 'boolean' && typeof currentClaudeReady === 'boolean' && current?.claudeCode) {
+    return { ...next, claudeCode: current.claudeCode }
+  }
+  return next
+}
+
 export function RightDock() {
   const selectedDeptId = useUI((s) => s.selectedDeptId)
   const rightTab = useUI((s) => s.rightTab)
@@ -78,34 +90,34 @@ export function RightDock() {
   useEffect(() => {
     if (!settingsOpen) return
     let cancelled = false
-    const load = async () => {
+    const load = async (probeClaude = false) => {
       try {
         const [status, reference] = await Promise.all([
-          client.getProviderAuthStatus(),
+          client.getProviderAuthStatus(probeClaude),
           client.getProviderAuthReference(),
         ])
         if (!cancelled) {
-          setProviderAuth(status)
+          setProviderAuth((current) => mergeProviderAuthStatus(current, status))
           setProviderReference(reference)
         }
       } catch (err) {
         if (!cancelled) setAuthError(err instanceof Error ? err.message : String(err))
       }
     }
-    void load()
-    const timer = window.setInterval(load, 3000)
+    void load(true)
+    const timer = window.setInterval(() => void load(false), 3000)
     return () => {
       cancelled = true
       window.clearInterval(timer)
     }
   }, [settingsOpen])
 
-  const refreshProviderAuth = async () => {
+  const refreshProviderAuth = async (probeClaude = false) => {
     const [status, reference] = await Promise.all([
-      client.getProviderAuthStatus(),
+      client.getProviderAuthStatus(probeClaude),
       client.getProviderAuthReference(),
     ])
-    setProviderAuth(status)
+    setProviderAuth((current) => mergeProviderAuthStatus(current, status))
     setProviderReference(reference)
     return status
   }
@@ -132,8 +144,14 @@ export function RightDock() {
     setAuthBusy('claude')
     setAuthError(null)
     try {
-      await client.startClaudeCodeLogin()
-      await refreshProviderAuth()
+      const session = await client.startClaudeCodeLogin()
+      if (session.status && typeof session.status === 'object') {
+        setProviderAuth((current) => ({
+          chatgptAccount: current?.chatgptAccount ?? {},
+          claudeCode: session.status as Record<string, unknown>,
+        }))
+      }
+      await refreshProviderAuth(true)
     } catch (err) {
       setAuthError(err instanceof Error ? err.message : String(err))
     } finally {
@@ -398,14 +416,15 @@ export function RightDock() {
                   <button
                     type="button"
                     onClick={connectClaudeCode}
-                    disabled={authBusy === 'claude' || claudeReady}
+                    disabled={authBusy === 'claude'}
                     className="rounded-lg border px-2.5 py-1.5 text-[12px] transition-colors disabled:opacity-50"
                     style={{
                       borderColor: claudeReady ? withAlpha(ACCENT_HEX.teal, 0.45) : withAlpha(ACCENT_HEX.lavender, 0.45),
                       color: claudeReady ? ACCENT_HEX.teal : ACCENT_HEX.lavender,
                     }}
+                    title={claudeReady ? 'ตรวจสอบสถานะ Claude Code อีกครั้ง' : 'เปิด Claude Code login หรือตรวจสอบบัญชี'}
                   >
-                    {authBusy === 'claude' ? 'กำลังเปิด…' : claudeReady ? 'เชื่อมแล้ว' : 'เชื่อม'}
+                    {authBusy === 'claude' ? 'กำลังตรวจ…' : claudeReady ? 'ตรวจอีกครั้ง' : 'เชื่อม'}
                   </button>
                 </div>
 

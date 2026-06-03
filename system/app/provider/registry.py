@@ -105,7 +105,12 @@ def get_provider(provider_id: str, settings: Settings | None = None) -> LLMProvi
 
 
 def _claude_code_light_status(command: str) -> dict:
+    from .claude_code_provider import claude_code_cached_auth_status
+
     resolved = shutil.which(command) if "/" not in command else command if Path(command).exists() else None
+    cached = claude_code_cached_auth_status(command)
+    if cached:
+        return cached
     return {
         "ready": None,
         "command": command,
