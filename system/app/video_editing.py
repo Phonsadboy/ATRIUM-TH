@@ -4,6 +4,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import asyncio
+import html
 import json
 import mimetypes
 import os
@@ -13,6 +14,7 @@ import subprocess
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 from .atrium_domain import agent_message_metadata
 from .clock import now_ms
@@ -2183,6 +2185,7 @@ def _motion_timeline_payload(project: dict[str, Any], spec: dict[str, Any]) -> d
             "sourceStartFrame": int(round(start * fps)),
             "speed": speed,
             "fit": clip.get("fit") or spec.get("fit") or "cover",
+            "hasAudio": bool(probe.get("audio")),
         })
         current += duration
     text_layers: list[dict[str, Any]] = []
@@ -2228,7 +2231,32 @@ def _motion_timeline_payload(project: dict[str, Any], spec: dict[str, Any]) -> d
             "opacity": max(0.0, min(float(layer.get("opacity") or 1.0), 1.0)),
             "animation": layer.get("animation") or "fade",
         })
-    duration_seconds = max(_timeline_duration_seconds(project, spec), current)
+    audio_layers: list[dict[str, Any]] = []
+    timeline_duration = _timeline_duration_seconds(project, spec)
+    for layer in spec.get("audio") or []:
+        if not isinstance(layer, dict):
+            continue
+        try:
+            source = _audio_source(project, layer)
+        except Exception:
+            continue
+        start = max(0.0, _float_or_none(layer.get("start")) or 0.0)
+        media_start = max(0.0, _float_or_none(layer.get("mediaStart") or layer.get("sourceStart") or layer.get("in")) or 0.0)
+        end = _float_or_none(layer.get("end") or layer.get("out"))
+        if end is None:
+            probe = _ffprobe(source)
+            source_duration = float((probe.get("format") or {}).get("duration") or (probe.get("audio") or [{}])[0].get("duration") or timeline_duration)
+            end = min(timeline_duration, start + max(0.1, source_duration - media_start))
+        audio_layers.append({
+            "id": str(layer.get("id") or uid("aud")),
+            "src": source.as_uri(),
+            "startFrame": int(round(start * fps)),
+            "durationFrames": max(1, int(round((max(start + 0.1, end) - start) * fps))),
+            "sourceStartFrame": int(round(media_start * fps)),
+            "volume": max(0.0, min(float(layer.get("volume") or 1.0), 1.0)),
+            "role": layer.get("role") or "audio",
+        })
+    duration_seconds = max(timeline_duration, current)
     return {
         "projectId": project["id"],
         "timelineId": spec.get("id"),
@@ -2243,6 +2271,7 @@ def _motion_timeline_payload(project: dict[str, Any], spec: dict[str, Any]) -> d
         "clips": clips_payload,
         "textLayers": text_layers,
         "overlayLayers": overlay_layers,
+        "audioLayers": audio_layers,
     }
 
 
@@ -2589,15 +2618,385 @@ def _write_revideo_package(package_dir: Path, payload: dict[str, Any]) -> list[s
     return written
 
 
+def _media_src_path(value: Any) -> Path | None:
+    raw = str(value or "").strip()
+    if not raw or raw.startswith(("http://", "https://", "data:")):
+        return None
+    if raw.startswith("file://"):
+        parsed = urlparse(raw)
+        path = Path(unquote(parsed.path)).expanduser()
+    else:
+        path = Path(raw).expanduser()
+    try:
+        path = path.resolve()
+    except OSError:
+        return None
+    return path if path.is_file() else None
+
+
+def _copy_hyperframes_media(package_dir: Path, payload: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    packaged = copy.deepcopy(payload)
+    copied: list[str] = []
+    assets_dir = package_dir / "assets"
+    for collection in ("clips", "overlayLayers", "audioLayers"):
+        layers = packaged.get(collection) if isinstance(packaged.get(collection), list) else []
+        for layer in layers:
+            if not isinstance(layer, dict):
+                continue
+            source = _media_src_path(layer.get("src"))
+            if source is None:
+                continue
+            filename = safe_filename(f"{layer.get('id') or collection}_{source.name}")
+            target = assets_dir / filename
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if source != target:
+                shutil.copy2(source, target)
+            layer["src"] = target.relative_to(package_dir).as_posix()
+            copied.append(str(target))
+    return packaged, copied
+
+
+def _hf_seconds(frames: Any, fps: float) -> float:
+    return round(max(0.0, float(frames or 0) / max(float(fps or 30), 1.0)), 4)
+
+
+def _hf_duration(layer: dict[str, Any], fps: float) -> float:
+    return round(max(0.1, float(layer.get("durationFrames") or 1) / max(float(fps or 30), 1.0)), 4)
+
+
+def _hf_id(value: Any, prefix: str) -> str:
+    raw = re.sub(r"[^A-Za-z0-9_-]+", "-", str(value or "").strip()).strip("-")
+    if not raw:
+        raw = uid(prefix)
+    if not re.match(r"^[A-Za-z]", raw):
+        raw = f"{prefix}-{raw}"
+    return raw[:96]
+
+
+def _hf_attr(value: Any) -> str:
+    return html.escape(str(value or ""), quote=True)
+
+
+def _hf_text(value: Any) -> str:
+    return html.escape(str(value or ""), quote=False)
+
+
+def _css_len(value: Any, fallback: str) -> str:
+    if value is None or value == "":
+        return fallback
+    if isinstance(value, (int, float)):
+        return f"{float(value):g}px"
+    text = str(value).strip()
+    if re.fullmatch(r"-?\d+(\.\d+)?", text):
+        return f"{text}px"
+    return text
+
+
+def _css_hex_rgba(value: Any, opacity: Any, fallback: str = "rgba(0,0,0,0.5)") -> str:
+    raw = str(value or "").strip()
+    match = re.fullmatch(r"#?([0-9A-Fa-f]{6})", raw)
+    if not match:
+        return fallback
+    rgb = match.group(1)
+    alpha = max(0.0, min(_float_or_none(opacity) if _float_or_none(opacity) is not None else 1.0, 1.0))
+    return f"rgba({int(rgb[0:2], 16)},{int(rgb[2:4], 16)},{int(rgb[4:6], 16)},{alpha:.3f})"
+
+
+def _hf_layer_position_style(layer: dict[str, Any], *, default_y: str = "50%") -> str:
+    position = layer.get("position") if isinstance(layer.get("position"), dict) else {}
+    anchor = str(position.get("anchor") or layer.get("anchor") or "center").lower()
+    tx = "-50%" if "center" in anchor else "-100%" if "right" in anchor else "0%"
+    ty = "-50%" if "center" in anchor else "-100%" if "bottom" in anchor else "0%"
+    return (
+        f"left:{_css_len(position.get('x') or layer.get('x'), '50%')};"
+        f"top:{_css_len(position.get('y') or layer.get('y'), default_y)};"
+        f"translate:{tx} {ty};"
+    )
+
+
+def _hf_text_style(layer: dict[str, Any]) -> str:
+    stroke = layer.get("stroke") if isinstance(layer.get("stroke"), dict) else {}
+    shadow = layer.get("shadow") if isinstance(layer.get("shadow"), dict) else {}
+    box = layer.get("box") if isinstance(layer.get("box"), dict) else {}
+    styles = [
+        _hf_layer_position_style(layer, default_y="82%" if str(layer.get("id") or "").startswith("cap") else "18%"),
+        f"font-family:{_hf_attr(layer.get('fontFamily') or 'Inter, Arial, sans-serif')};",
+        f"font-size:{int(layer.get('size') or layer.get('fontSize') or 52)}px;",
+        f"font-weight:{int(_float_or_none(layer.get('fontWeight')) or 800)};",
+        f"color:{_hf_attr(layer.get('color') or '#ffffff')};",
+        f"max-width:{_css_len(layer.get('maxWidth'), '88%')};",
+    ]
+    if stroke.get("width"):
+        styles.append(f"-webkit-text-stroke:{int(stroke.get('width') or 0)}px {_hf_attr(stroke.get('color') or '#000000')};")
+    if shadow.get("color"):
+        styles.append(
+            "text-shadow:"
+            f"{int(shadow.get('x') or 0)}px {int(shadow.get('y') or 4)}px {int(shadow.get('blur') or 10)}px {_hf_attr(shadow.get('color'))};"
+        )
+    if box:
+        styles.extend([
+            f"background:{_css_hex_rgba(box.get('color') or '#000000', box.get('opacity'), fallback='rgba(0,0,0,0.5)')};",
+            f"padding:{int(box.get('padding') or 0)}px;",
+            f"border-radius:{int(box.get('radius') or 0)}px;",
+        ])
+    return "".join(styles)
+
+
+def _hf_overlay_style(layer: dict[str, Any]) -> str:
+    width = _css_len(layer.get("width"), "28%")
+    height = "auto" if str(layer.get("height") or "auto").strip() == "auto" else _css_len(layer.get("height"), "auto")
+    opacity = max(0.0, min(float(layer.get("opacity") or 1.0), 1.0))
+    return f"{_hf_layer_position_style(layer)}width:{width};height:{height};opacity:{opacity:.3f};"
+
+
+def _hyperframes_design_markdown(payload: dict[str, Any]) -> str:
+    style = payload.get("styleGuide") if isinstance(payload.get("styleGuide"), dict) else {}
+    colors = style.get("colors") if isinstance(style.get("colors"), dict) else {}
+    fonts = style.get("fonts") if isinstance(style.get("fonts"), dict) else {}
+    color_lines = "\n".join(
+        f"- {key}: {value}"
+        for key, value in colors.items()
+        if isinstance(key, str) and isinstance(value, str)
+    ) or "- background: #080808\n- text: #ffffff\n- primary: #38bdf8\n- accent: #fbbf24"
+    font_lines = "\n".join(
+        f"- {key}: {value}"
+        for key, value in fonts.items()
+        if isinstance(key, str) and isinstance(value, str)
+    ) or "- heading: Inter\n- body: Inter"
+    return (
+        "# HyperFrames Design\n\n"
+        "## Style Prompt\n"
+        "ATRIUM motion package rendered as clean HTML-native video: high contrast, readable Thai-capable typography, deliberate motion, and no generic default palette.\n\n"
+        "## Colors\n"
+        f"{color_lines}\n\n"
+        "## Typography\n"
+        f"{font_lines}\n\n"
+        "## Motion Rules\n"
+        "- Use short, seekable GSAP timelines registered on window.__timelines.\n"
+        "- Keep text within safe areas and avoid overlap during hero frames.\n"
+        "- Prefer fade-up or pop entrances with quick exits near clip end.\n\n"
+        "## What NOT to Do\n"
+        "- Do not use unbounded repeat loops.\n"
+        "- Do not animate media playback directly.\n"
+        "- Do not depend on wall-clock time or random values.\n"
+    )
+
+
+def _hyperframes_index_html(payload: dict[str, Any]) -> str:
+    fps = float(payload.get("fps") or 30)
+    width = int(payload.get("width") or 1080)
+    height = int(payload.get("height") or 1920)
+    duration = _hf_seconds(payload.get("durationFrames"), fps)
+    style = payload.get("styleGuide") if isinstance(payload.get("styleGuide"), dict) else {}
+    colors = style.get("colors") if isinstance(style.get("colors"), dict) else {}
+    motion = style.get("motion") if isinstance(style.get("motion"), dict) else {}
+    background = motion.get("backgroundColor") or colors.get("background") or "#080808"
+    composition_id = _hf_id(payload.get("compositionId") or "AtriumVideo", "comp")
+    track = 0
+    body_parts: list[str] = []
+    animation_layers: list[dict[str, Any]] = []
+    for clip in payload.get("clips") or []:
+        if not isinstance(clip, dict):
+            continue
+        track += 1
+        clip_id = _hf_id(clip.get("id"), "clip")
+        start = _hf_seconds(clip.get("startFrame"), fps)
+        clip_duration = _hf_duration(clip, fps)
+        media_start = _hf_seconds(clip.get("sourceStartFrame"), fps)
+        fit_class = "contain" if str(clip.get("fit") or "").lower() == "contain" else "cover"
+        src = _hf_attr(clip.get("src"))
+        body_parts.append(
+            f'<video id="{_hf_attr(clip_id)}" class="clip hf-video hf-{fit_class}" data-start="{start}" data-duration="{clip_duration}" '
+            f'data-track-index="{track}" data-media-start="{media_start}" src="{src}" muted playsinline></video>'
+        )
+        if clip.get("hasAudio"):
+            track += 1
+            body_parts.append(
+                f'<audio id="{_hf_attr(clip_id)}-audio" class="clip" data-start="{start}" data-duration="{clip_duration}" '
+                f'data-track-index="{track}" data-media-start="{media_start}" data-volume="1" src="{src}"></audio>'
+            )
+    for layer in payload.get("audioLayers") or []:
+        if not isinstance(layer, dict):
+            continue
+        track += 1
+        audio_id = _hf_id(layer.get("id"), "audio")
+        body_parts.append(
+            f'<audio id="{_hf_attr(audio_id)}" class="clip" data-start="{_hf_seconds(layer.get("startFrame"), fps)}" '
+            f'data-duration="{_hf_duration(layer, fps)}" data-track-index="{track}" '
+            f'data-media-start="{_hf_seconds(layer.get("sourceStartFrame"), fps)}" '
+            f'data-volume="{max(0.0, min(float(layer.get("volume") or 1.0), 1.0)):.3f}" src="{_hf_attr(layer.get("src"))}"></audio>'
+        )
+    for layer in payload.get("overlayLayers") or []:
+        if not isinstance(layer, dict):
+            continue
+        track += 1
+        layer_id = _hf_id(layer.get("id"), "overlay")
+        body_parts.append(
+            f'<img id="{_hf_attr(layer_id)}" class="clip hf-overlay" data-start="{_hf_seconds(layer.get("startFrame"), fps)}" '
+            f'data-duration="{_hf_duration(layer, fps)}" data-track-index="{track}" src="{_hf_attr(layer.get("src"))}" '
+            f'style="{_hf_attr(_hf_overlay_style(layer))}" />'
+        )
+        animation_layers.append({"id": layer_id, "start": _hf_seconds(layer.get("startFrame"), fps), "duration": _hf_duration(layer, fps), "animation": layer.get("animation") or "fade"})
+    for layer in payload.get("textLayers") or []:
+        if not isinstance(layer, dict):
+            continue
+        track += 1
+        layer_id = _hf_id(layer.get("id"), "text")
+        body_parts.append(
+            f'<div id="{_hf_attr(layer_id)}" class="clip hf-text" data-start="{_hf_seconds(layer.get("startFrame"), fps)}" '
+            f'data-duration="{_hf_duration(layer, fps)}" data-track-index="{track}" style="{_hf_attr(_hf_text_style(layer))}">'
+            f'{_hf_text(layer.get("text"))}</div>'
+        )
+        animation_layers.append({"id": layer_id, "start": _hf_seconds(layer.get("startFrame"), fps), "duration": _hf_duration(layer, fps), "animation": layer.get("animation") or "fade-up"})
+    timeline_lines = [
+        "window.__timelines = window.__timelines || {};",
+        "const tl = gsap.timeline({ paused: true });",
+    ]
+    for layer in animation_layers:
+        selector = json.dumps(f"#{layer['id']}")
+        start = float(layer["start"])
+        layer_duration = float(layer["duration"])
+        entrance = max(0.12, min(0.45, layer_duration / 3.0))
+        exit_at = max(start + entrance + 0.05, start + layer_duration - min(0.35, layer_duration / 3.0))
+        animation = str(layer.get("animation") or "fade")
+        if animation == "pop":
+            from_state = "{ opacity: 0, scale: 0.92 }"
+            to_state = f"{{ opacity: 1, scale: 1, duration: {entrance:.3f}, ease: 'back.out(1.6)' }}"
+            exit_state = "{ opacity: 0, scale: 0.96, duration: 0.22, ease: 'power2.in' }"
+        elif animation == "fade-up":
+            from_state = "{ opacity: 0, y: 26 }"
+            to_state = f"{{ opacity: 1, y: 0, duration: {entrance:.3f}, ease: 'power3.out' }}"
+            exit_state = "{ opacity: 0, y: -18, duration: 0.24, ease: 'power2.in' }"
+        else:
+            from_state = "{ opacity: 0 }"
+            to_state = f"{{ opacity: 1, duration: {entrance:.3f}, ease: 'power2.out' }}"
+            exit_state = "{ opacity: 0, duration: 0.24, ease: 'power2.in' }"
+        timeline_lines.append(f"tl.fromTo({selector}, {from_state}, {to_state}, {start:.3f});")
+        if layer_duration > entrance + 0.3:
+            timeline_lines.append(f"tl.to({selector}, {exit_state}, {exit_at:.3f});")
+    timeline_lines.append(f"window.__timelines[{json.dumps(composition_id)}] = tl;")
+    body = "\n    ".join(body_parts)
+    timeline_script = "\n      ".join(timeline_lines)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{_hf_text(payload.get("projectId") or "ATRIUM HyperFrames")}</title>
+  <style>
+    html, body {{
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      background: {_hf_attr(background)};
+      overflow: hidden;
+    }}
+    #stage {{
+      position: relative;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: {_hf_attr(background)};
+      color: {_hf_attr(colors.get("text") or "#ffffff")};
+      font-family: Inter, Arial, sans-serif;
+    }}
+    .hf-video {{
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+    }}
+    .hf-cover {{ object-fit: cover; }}
+    .hf-contain {{ object-fit: contain; background: {_hf_attr(background)}; }}
+    .hf-overlay {{
+      position: absolute;
+      object-fit: contain;
+      will-change: transform, opacity;
+    }}
+    .hf-text {{
+      position: absolute;
+      box-sizing: border-box;
+      line-height: 1.08;
+      text-align: center;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      will-change: transform, opacity;
+    }}
+  </style>
+</head>
+<body>
+  <div id="stage" data-composition-id="{_hf_attr(composition_id)}" data-start="0" data-duration="{duration}" data-width="{width}" data-height="{height}">
+    {body}
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
+  <script>
+    {timeline_script}
+  </script>
+</body>
+</html>
+"""
+
+
+def _hyperframes_package_files(payload: dict[str, Any]) -> dict[str, str]:
+    timeline_json = json.dumps(payload, ensure_ascii=False, indent=2)
+    package_json = json.dumps({
+        "private": True,
+        "type": "module",
+        "scripts": {
+            "doctor": "npx --yes hyperframes doctor",
+            "lint": "npx --yes hyperframes lint",
+            "inspect": "npx --yes hyperframes inspect",
+            "preview": "npx --yes hyperframes preview",
+            "render": "npx --yes hyperframes render --output out/atrium-video.mp4",
+        },
+        "devDependencies": {
+            "hyperframes": "^0.6.72",
+        },
+    }, indent=2)
+    readme = (
+        "# ATRIUM HyperFrames Package\n\n"
+        "This package is generated by ATRIUM `video.render_motion` with `renderer=hyperframes`.\n\n"
+        "## Commands\n\n"
+        "- `npm run lint`\n"
+        "- `npm run inspect`\n"
+        "- `npm run preview`\n"
+        "- `npm run render`\n\n"
+        "Source of truth: `index.html` and `timeline.json`.\n"
+    )
+    return {
+        "package.json": package_json + "\n",
+        "README.md": readme,
+        "DESIGN.md": _hyperframes_design_markdown(payload),
+        "timeline.json": timeline_json + "\n",
+        "index.html": _hyperframes_index_html(payload),
+    }
+
+
+def _write_hyperframes_package(package_dir: Path, payload: dict[str, Any]) -> tuple[list[str], dict[str, Any]]:
+    package_payload, copied = _copy_hyperframes_media(package_dir, payload)
+    written: list[str] = []
+    for rel, content in _hyperframes_package_files(package_payload).items():
+        path = package_dir / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        written.append(str(path))
+    (package_dir / "out").mkdir(parents=True, exist_ok=True)
+    return [*copied, *written], package_payload
+
+
 def _motion_renderers(args: dict[str, Any]) -> list[str]:
     raw = str(args.get("renderer") or args.get("engine") or args.get("motionRenderer") or "remotion").strip().lower()
     if raw in {"remotion", ""}:
         return ["remotion"]
     if raw in {"revideo", "redot", "redotvideo"}:
         return ["revideo"]
-    if raw in {"both", "all", "remotion+revideo", "revideo+remotion"}:
+    if raw in {"hyperframes", "hyperframe", "hf", "html", "html-video"}:
+        return ["hyperframes"]
+    if raw in {"both", "remotion+revideo", "revideo+remotion"}:
         return ["remotion", "revideo"]
-    raise ValueError("renderer must be remotion, revideo, or both")
+    if raw in {"all", "remotion+revideo+hyperframes", "hyperframes+remotion+revideo"}:
+        return ["remotion", "revideo", "hyperframes"]
+    raise ValueError("renderer must be remotion, revideo, hyperframes, both, or all")
 
 
 def _motion_package_commands(renderer: str) -> dict[str, str]:
@@ -2605,6 +3004,14 @@ def _motion_package_commands(renderer: str) -> dict[str, str]:
         return {
             "install": "npm install",
             "render": "npm run render",
+        }
+    if renderer == "hyperframes":
+        return {
+            "doctor": "npx --yes hyperframes doctor",
+            "lint": "npx --yes hyperframes lint",
+            "inspect": "npx --yes hyperframes inspect",
+            "preview": "npx --yes hyperframes preview",
+            "render": "npx --yes hyperframes render --output out/atrium-video.mp4",
         }
     return {
         "install": "npm install",
@@ -2636,16 +3043,21 @@ async def _render_motion(repo: Any, run: dict[str, Any], args: dict[str, Any]) -
     written: list[str] = []
     for package_renderer in renderers:
         target_dir = package_dir if len(renderers) == 1 else package_dir / package_renderer
-        package_files = (
-            _write_revideo_package(target_dir, payload)
-            if package_renderer == "revideo"
-            else _write_motion_package(target_dir, payload)
-        )
+        if package_renderer == "revideo":
+            package_files = _write_revideo_package(target_dir, payload)
+        elif package_renderer == "hyperframes":
+            package_files, _ = _write_hyperframes_package(target_dir, payload)
+        else:
+            package_files = _write_motion_package(target_dir, payload)
         written.extend(package_files)
+        entry_point = {
+            "revideo": "src/project.ts",
+            "hyperframes": "index.html",
+        }.get(package_renderer, "src/index.tsx")
         packages.append({
             "renderer": package_renderer,
             "packageDir": str(target_dir),
-            "entryPoint": str(target_dir / ("src/project.ts" if package_renderer == "revideo" else "src/index.tsx")),
+            "entryPoint": str(target_dir / entry_point),
             "files": package_files,
             "commands": _motion_package_commands(package_renderer),
         })
@@ -2702,8 +3114,13 @@ async def _render_motion(repo: Any, run: dict[str, Any], args: dict[str, Any]) -
             manifest["renderResult"] = render_result
             if render_artifact:
                 manifest["renderArtifactId"] = render_artifact["id"]
+        elif "hyperframes" in renderers and len(renderers) == 1:
+            render_result, render_artifact = await _maybe_render_hyperframes(repo, run, project, manifest, package_dir, args)
+            manifest["renderResult"] = render_result
+            if render_artifact:
+                manifest["renderArtifactId"] = render_artifact["id"]
         else:
-            render_result = {"ok": False, "status": "skipped", "reason": "Automatic rendering is currently supported for renderer=remotion only."}
+            render_result = {"ok": False, "status": "skipped", "reason": "Automatic rendering is currently supported for a single renderer=remotion or renderer=hyperframes only."}
             manifest["renderResult"] = render_result
     project.setdefault("motionPackages", []).append(manifest)
     _save_project(project)
@@ -2783,6 +3200,175 @@ async def _maybe_render_remotion(
     project.setdefault("renders", []).append(render_manifest)
     await repo.put_entity("video_render", render_manifest, dept=str(project["ownerDept"]), project=str(project["id"]), status="done", ts=render_manifest["createdAt"])
     return {"ok": True, "status": "rendered", "render": render_manifest, "stdout": result.get("stdout", "")[-1200:]}, artifact
+
+
+def _node_major_version(value: str) -> int | None:
+    match = re.search(r"v?(\d+)", str(value or ""))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def _hyperframes_cli_command(package_dir: Path, args: dict[str, Any]) -> tuple[list[str] | None, str | None]:
+    local = package_dir / "node_modules" / ".bin" / "hyperframes"
+    if local.exists():
+        return [str(local)], None
+    global_cli = shutil.which("hyperframes")
+    if global_cli:
+        return [global_cli], None
+    npx = shutil.which("npx")
+    if not npx:
+        return None, "npx is unavailable"
+    if not (args.get("allowInstall") or args.get("allow_install")):
+        return None, "HyperFrames CLI is not installed; rerun with allowInstall=true or run npm install in packageDir."
+    return [npx, "--yes", "hyperframes"], None
+
+
+async def _maybe_render_hyperframes(
+    repo: Any,
+    run: dict[str, Any],
+    project: dict[str, Any],
+    manifest: dict[str, Any],
+    package_dir: Path,
+    args: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    node = shutil.which("node")
+    if not node:
+        return {"ok": False, "status": "skipped", "reason": "Node.js 22+ is required for HyperFrames"}, None
+    node_check = await asyncio.to_thread(_run, [node, "--version"], timeout=20)
+    node_major = _node_major_version(str(node_check.get("stdout") or node_check.get("stderr") or ""))
+    if node_check["returnCode"] != 0 or node_major is None or node_major < 22:
+        return {
+            "ok": False,
+            "status": "skipped",
+            "reason": "Node.js 22+ is required for HyperFrames",
+            "nodeVersion": str(node_check.get("stdout") or node_check.get("stderr") or "").strip(),
+        }, None
+    try:
+        ffmpeg = _require_ffmpeg()
+    except ValueError as exc:
+        return {"ok": False, "status": "skipped", "reason": str(exc)}, None
+    cli, reason = _hyperframes_cli_command(package_dir, args)
+    if not cli:
+        return {
+            "ok": False,
+            "status": "skipped",
+            "reason": reason or "HyperFrames CLI is unavailable",
+            "nodeVersion": str(node_check.get("stdout") or "").strip(),
+            "ffmpeg": ffmpeg,
+        }, None
+    lint = await asyncio.to_thread(
+        _run,
+        [*cli, "lint"],
+        cwd=package_dir,
+        timeout=float(args.get("lintTimeoutSeconds") or 180),
+    )
+    if lint["returnCode"] != 0:
+        return {
+            "ok": False,
+            "status": "lint_failed",
+            "returnCode": lint["returnCode"],
+            "stdout": str(lint.get("stdout") or "")[-3000:],
+            "stderr": str(lint.get("stderr") or "")[-3000:],
+            "nodeVersion": str(node_check.get("stdout") or "").strip(),
+            "ffmpeg": ffmpeg,
+        }, None
+    inspect_result = None
+    if args.get("inspect") or args.get("runInspect") or args.get("run_inspect"):
+        inspect_result = await asyncio.to_thread(
+            _run,
+            [*cli, "inspect"],
+            cwd=package_dir,
+            timeout=float(args.get("inspectTimeoutSeconds") or 300),
+        )
+        if inspect_result["returnCode"] != 0 and args.get("strictInspect"):
+            return {
+                "ok": False,
+                "status": "inspect_failed",
+                "returnCode": inspect_result["returnCode"],
+                "stdout": str(inspect_result.get("stdout") or "")[-3000:],
+                "stderr": str(inspect_result.get("stderr") or "")[-3000:],
+                "lint": {"returnCode": lint["returnCode"], "stdout": str(lint.get("stdout") or "")[-1200:], "stderr": str(lint.get("stderr") or "")[-1200:]},
+            }, None
+    output_name = safe_filename(str(args.get("outputName") or args.get("output_name") or "atrium-video.mp4"))
+    output_path = package_dir / "out" / output_name
+    if output_path.suffix.lower() not in {".mp4", ".webm"}:
+        output_path = output_path.with_suffix(".mp4")
+    render = await asyncio.to_thread(
+        _run,
+        [*cli, "render", "--output", str(output_path)],
+        cwd=package_dir,
+        timeout=float(args.get("timeoutSeconds") or 1800),
+    )
+    if not output_path.is_file():
+        candidates = sorted(
+            [
+                *(package_dir / "out").glob("*.mp4"),
+                *(package_dir / "out").glob("*.webm"),
+                *(package_dir / "renders").glob("*.mp4"),
+                *(package_dir / "renders").glob("*.webm"),
+            ],
+            key=lambda path: path.stat().st_mtime if path.is_file() else 0,
+            reverse=True,
+        )
+        if candidates:
+            output_path = candidates[0]
+    if render["returnCode"] != 0 or not output_path.is_file():
+        return {
+            "ok": False,
+            "status": "render_failed",
+            "returnCode": render["returnCode"],
+            "stdout": str(render.get("stdout") or "")[-3000:],
+            "stderr": str(render.get("stderr") or "")[-3000:],
+            "lint": {"returnCode": lint["returnCode"], "stdout": str(lint.get("stdout") or "")[-1200:], "stderr": str(lint.get("stderr") or "")[-1200:]},
+            **({"inspect": {"returnCode": inspect_result["returnCode"], "stdout": str(inspect_result.get("stdout") or "")[-1200:], "stderr": str(inspect_result.get("stderr") or "")[-1200:]}} if inspect_result else {}),
+        }, None
+    render_id = uid("render")
+    artifact = await _persist_file_artifact(
+        repo,
+        path=output_path,
+        owner_dept=str(project["ownerDept"]),
+        created_by=str(run.get("requestedBy") or project["ownerDept"]),
+        name=output_path.name,
+        tags=["video_render", "hyperframes", str(args.get("kind") or "preview")],
+        project_id=str(project["id"]),
+        note=f"rendered HyperFrames package {manifest['id']}",
+    )
+    render_manifest = {
+        "id": render_id,
+        "projectId": project["id"],
+        "timelineId": manifest.get("timelineId"),
+        "timelineVersion": manifest.get("timelineVersion"),
+        "kind": str(args.get("kind") or "preview"),
+        "path": str(output_path),
+        "artifactId": artifact["id"],
+        "artifactUri": artifact.get("uri"),
+        "artifactStorage": artifact.get("storage"),
+        "artifactObjectStore": artifact.get("objectStore") if isinstance(artifact.get("objectStore"), dict) else None,
+        "downloadUrl": f"/api/artifacts/{artifact['id']}/download",
+        "previewUrl": f"/api/artifacts/{artifact['id']}/preview",
+        "createdAt": now_ms(),
+        "renderer": "hyperframes",
+        "motionId": manifest["id"],
+        "lint": {"returnCode": lint["returnCode"], "stdout": str(lint.get("stdout") or "")[-1200:], "stderr": str(lint.get("stderr") or "")[-1200:]},
+        **({"inspect": {"returnCode": inspect_result["returnCode"], "stdout": str(inspect_result.get("stdout") or "")[-1200:], "stderr": str(inspect_result.get("stderr") or "")[-1200:]}} if inspect_result else {}),
+    }
+    artifact.update(_video_artifact_context_fields(project, artifact["id"], render=render_manifest))
+    await repo.put_entity("artifact", artifact, dept=str(project["ownerDept"]), project=str(project["id"]), status=artifact.get("status"), ts=render_manifest["createdAt"])
+    project.setdefault("renders", []).append(render_manifest)
+    await repo.put_entity("video_render", render_manifest, dept=str(project["ownerDept"]), project=str(project["id"]), status="done", ts=render_manifest["createdAt"])
+    return {
+        "ok": True,
+        "status": "rendered",
+        "render": render_manifest,
+        "stdout": str(render.get("stdout") or "")[-1200:],
+        "stderr": str(render.get("stderr") or "")[-1200:],
+        "nodeVersion": str(node_check.get("stdout") or "").strip(),
+        "ffmpeg": ffmpeg,
+    }, artifact
 
 
 def _apply_image_layers(ffmpeg: str, project: dict[str, Any], spec: dict[str, Any], input_path: Path, render_dir: Path) -> Path:
@@ -5241,6 +5827,7 @@ def _build_context_packet(
             "renderPreview": {"tool": "video.render_edit", "args": {"projectId": project["id"], "kind": "preview", "asyncMode": True}},
             "renderMotionPackage": {"tool": "video.render_motion", "args": {"projectId": project["id"], "timelineId": (timeline or {}).get("id"), "version": (timeline or {}).get("version"), "renderer": "remotion"}},
             "renderRevideoPackage": {"tool": "video.render_motion", "args": {"projectId": project["id"], "timelineId": (timeline or {}).get("id"), "version": (timeline or {}).get("version"), "renderer": "revideo"}},
+            "renderHyperFramesPackage": {"tool": "video.render_motion", "args": {"projectId": project["id"], "timelineId": (timeline or {}).get("id"), "version": (timeline or {}).get("version"), "renderer": "hyperframes"}},
             "patchTimeline": {"tool": "video.patch_timeline", "args": {"projectId": project["id"], "timelineId": (timeline or {}).get("id"), "baseVersion": (timeline or {}).get("version")}},
         },
     }
