@@ -160,7 +160,7 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("ATRIUM_IMAGE_GENERATION_BASE_URL", "IMAGE_GENERATION_BASE_URL"),
     )
     image_generation_timeout_s: float | None = Field(
-        default=1800.0,
+        default=600.0,
         validation_alias=AliasChoices("ATRIUM_IMAGE_GENERATION_TIMEOUT_S", "IMAGE_GENERATION_TIMEOUT_S"),
     )
     image_generation_worker_concurrency: int = Field(

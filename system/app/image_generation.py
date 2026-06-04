@@ -1,8 +1,10 @@
 """OpenAI image generation/editing integration for ATRIUM artifacts."""
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
+import json
 import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -20,6 +22,10 @@ from .db.repo import Repo
 from .events import hub
 from .file_intake import bytes_from_uri, guess_mime, message_attachment_from_artifact, safe_filename
 from .ids import uid
+from .provider.chatgpt_oauth import (
+    ChatGPTCodexOAuthTokenProvider,
+    chatgpt_oauth_status,
+)
 from .schema import Artifact, ArtifactVersion
 from .storage.object_store import get_object_store
 from .threads import is_exec
@@ -62,6 +68,8 @@ GPT_IMAGE_2_MAX_EDGE = 3840
 IMAGE_RETRYABLE_STATUS_CODES = {408, 409, 425, 429, 500, 502, 503, 504, 520, 522, 524}
 IMAGE_GENERATION_MAX_ATTEMPTS = 3
 IMAGE_GENERATION_RETRY_DELAYS_MS = (60_000, 180_000, 300_000)
+IMAGE_GENERATION_TIMEOUT_DEFAULT_S = 600.0
+CHATGPT_OAUTH_IMAGE_RESPONSES_MODEL = "gpt-5.4-mini"
 
 
 class ImageGenerationError(RuntimeError):
@@ -74,6 +82,10 @@ class RetryableImageGenerationError(ImageGenerationError):
     def __init__(self, message: str, *, delay_ms: int = 60_000) -> None:
         super().__init__(message)
         self.delay_ms = max(1_000, int(delay_ms))
+
+
+class ChatGPTOAuthImageGenerationExhausted(RetryableImageGenerationError):
+    """Raised after the ChatGPT OAuth image route exhausts its local attempts."""
 
 
 @dataclass(frozen=True)
@@ -106,6 +118,7 @@ class ImageApiResult:
     usage: dict[str, Any] | None
     request_id: str | None
     raw_created: int | None = None
+    provider: str = "openai"
 
 
 def _url(base_url: str, path: str) -> str:
@@ -408,8 +421,52 @@ def _is_http_url(value: str) -> bool:
 def _image_timeout(settings: Settings) -> float | None:
     value = settings.image_generation_timeout_s
     if value is None or value <= 0:
-        return None
-    return value
+        return IMAGE_GENERATION_TIMEOUT_DEFAULT_S
+    return min(float(value), IMAGE_GENERATION_TIMEOUT_DEFAULT_S)
+
+
+def image_generation_auth_status(settings: Settings | None = None) -> dict[str, Any]:
+    settings = settings or get_settings()
+    chatgpt_status = chatgpt_oauth_status(settings)
+    has_chatgpt_oauth = bool(chatgpt_status.get("ready"))
+    has_api_key_fallback = bool(settings.image_generation_api_key)
+    return {
+        "configured": has_chatgpt_oauth,
+        "primaryProvider": "chatgpt_account",
+        "primaryConfigured": has_chatgpt_oauth,
+        "primaryBaseUrl": settings.chatgpt_account_base_url,
+        "fallbackProvider": "openai",
+        "fallbackConfigured": has_api_key_fallback,
+        "fallbackBaseUrl": settings.image_generation_base_url,
+        "timeoutS": _image_timeout(settings),
+        "chatgptAccountOAuth": chatgpt_status,
+        "usesDedicatedImageKey": has_api_key_fallback,
+    }
+
+
+def _sse_json_events(body: str):
+    for line in str(body or "").splitlines():
+        if not line.startswith("data:"):
+            continue
+        raw = line[5:].strip()
+        if not raw or raw == "[DONE]":
+            continue
+        with contextlib.suppress(json.JSONDecodeError):
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                yield parsed
+
+
+def _walk_event_values(value: Any, path: str = "$"):
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            nested_path = f"{path}.{key}"
+            yield nested_path, key, nested
+            yield from _walk_event_values(nested, nested_path)
+        return
+    if isinstance(value, list | tuple):
+        for idx, nested in enumerate(value):
+            yield from _walk_event_values(nested, f"{path}[{idx}]")
 
 
 def _truthy(value: Any) -> bool:
@@ -1342,6 +1399,210 @@ async def resolve_image_references(repo: Repo, artifact_ids: list[str]) -> list[
     return refs
 
 
+class ChatGPTOAuthImageClient:
+    def __init__(self, settings: Settings | None = None):
+        self.settings = settings or get_settings()
+        self._token_provider = ChatGPTCodexOAuthTokenProvider(self.settings)
+
+    def ready(self) -> bool:
+        return bool(chatgpt_oauth_status(self.settings).get("ready"))
+
+    @staticmethod
+    def _reference_data_url(ref: ImageReference) -> str:
+        encoded = base64.b64encode(ref.data).decode("ascii")
+        return f"data:{ref.mime};base64,{encoded}"
+
+    def _input_content(
+        self,
+        *,
+        prompt: str,
+        references: list[ImageReference],
+        mask: ImageReference | None,
+        n: int,
+        size: str,
+        quality: str,
+        output_format: str,
+        background: str | None,
+    ) -> list[dict[str, Any]]:
+        instruction_parts = [
+            prompt,
+            "",
+            "Generate the requested image with the image_generation tool.",
+            f"Requested count: {_coerce_n(n)}.",
+            f"Requested size/aspect setting: {size}.",
+            f"Requested quality: {quality}.",
+            f"Requested output format: {output_format}.",
+        ]
+        if background:
+            instruction_parts.append(f"Requested background: {background}.")
+        if references:
+            instruction_parts.append("Use the attached reference image(s) as visual guidance.")
+        if mask:
+            instruction_parts.append("Use the attached mask image as edit guidance where possible.")
+        content: list[dict[str, Any]] = [{"type": "input_text", "text": "\n".join(instruction_parts).strip()}]
+        for ref in references:
+            content.append({"type": "input_image", "image_url": self._reference_data_url(ref)})
+        if mask:
+            content.append({"type": "input_image", "image_url": self._reference_data_url(mask)})
+        return content
+
+    def _payload(
+        self,
+        *,
+        prompt: str,
+        references: list[ImageReference],
+        mask: ImageReference | None,
+        n: int,
+        size: str,
+        quality: str,
+        output_format: str,
+        background: str | None,
+    ) -> dict[str, Any]:
+        return {
+            "model": CHATGPT_OAUTH_IMAGE_RESPONSES_MODEL,
+            "instructions": (
+                "Use the image_generation tool to generate image artifacts. "
+                "Prioritize exact requested text and composition. Return only a short final note after generation."
+            ),
+            "input": [{
+                "role": "user",
+                "content": self._input_content(
+                    prompt=prompt,
+                    references=references,
+                    mask=mask,
+                    n=n,
+                    size=size,
+                    quality=quality,
+                    output_format=output_format,
+                    background=background,
+                ),
+            }],
+            "tools": [{"type": "image_generation"}],
+            "tool_choice": "auto",
+            "store": False,
+            "stream": True,
+        }
+
+    @staticmethod
+    def _event_error_message(event: dict[str, Any]) -> str:
+        error = event.get("error") if isinstance(event.get("error"), dict) else {}
+        message = error.get("message") if isinstance(error, dict) else None
+        return str(message or event.get("message") or "ChatGPT OAuth image generation failed")
+
+    async def _post_once(self, payload: dict[str, Any]) -> ImageApiResult:
+        token = await self._token_provider.access_token()
+        timeout = _image_timeout(self.settings)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(
+                    self.settings.chatgpt_account_base_url.rstrip("/") + "/responses",
+                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                    json=payload,
+                )
+        except httpx.TimeoutException as exc:
+            raise RetryableImageGenerationError(f"ChatGPT OAuth image generation timed out after {timeout} seconds") from exc
+        except httpx.RequestError as exc:
+            raise RetryableImageGenerationError(f"ChatGPT OAuth image generation request failed: {exc}") from exc
+        request_id = resp.headers.get("x-request-id")
+        if resp.status_code >= 400:
+            detail = resp.text[:1200]
+            with contextlib.suppress(Exception):
+                parsed = resp.json()
+                error = parsed.get("error") if isinstance(parsed, dict) else None
+                if isinstance(error, dict):
+                    detail = str(error.get("message") or error)[:1200]
+                elif isinstance(parsed, dict):
+                    detail = str(parsed.get("detail") or parsed)[:1200]
+            message = f"ChatGPT OAuth image generation error {resp.status_code}: {detail}"
+            if resp.status_code in IMAGE_RETRYABLE_STATUS_CODES:
+                raise RetryableImageGenerationError(message)
+            raise ImageGenerationError(message)
+
+        events = list(_sse_json_events(resp.text))
+        images: list[GeneratedImage] = []
+        seen: set[str] = set()
+        final_model = CHATGPT_OAUTH_IMAGE_RESPONSES_MODEL
+        usage: dict[str, Any] | None = None
+        for event in events:
+            event_type = str(event.get("type") or "")
+            if event_type in {"response.failed", "response.incomplete", "error"}:
+                raise ImageGenerationError(self._event_error_message(event))
+            response = event.get("response") if isinstance(event.get("response"), dict) else None
+            if response:
+                final_model = str(response.get("model") or final_model)
+                if isinstance(response.get("usage"), dict):
+                    usage = response["usage"]
+            for _path, key, value in _walk_event_values(event):
+                if key not in {"result", "b64_json", "base64", "b64", "image_base64", "imageBase64"}:
+                    continue
+                text = str(value or "").strip() if isinstance(value, str) else ""
+                if not text or text[:128] in seen:
+                    continue
+                data_url = _decode_data_url(text, "image/png")
+                raw = data_url.data if data_url else _decode_base64_bytes(text, allow_short=True)
+                if not raw:
+                    continue
+                seen.add(text[:128])
+                mime = data_url.mime if data_url else _mime_from_image_bytes(raw, "image/png")
+                images.append(GeneratedImage(data=raw, mime=mime))
+        if not images:
+            event_types = sorted({str(event.get("type") or "") for event in events if isinstance(event, dict)})
+            raise ImageGenerationError(
+                "ChatGPT OAuth image generation returned no parseable image data; "
+                f"events={', '.join(event_types[:24]) or 'none'}"
+            )
+        return ImageApiResult(
+            images=images,
+            model=final_model,
+            usage=usage,
+            request_id=request_id,
+            provider="chatgpt_account",
+        )
+
+    async def create(
+        self,
+        *,
+        prompt: str,
+        references: list[ImageReference],
+        mask: ImageReference | None,
+        model: str | None,
+        n: int,
+        size: str | None,
+        quality: str | None,
+        output_format: str | None,
+        output_compression: int | None,
+        background: str | None,
+        moderation: str | None,
+    ) -> ImageApiResult:
+        del model, output_compression, moderation
+        if not self.ready():
+            raise ImageGenerationError(
+                "ChatGPT account OAuth is not configured for image generation; sign in with ChatGPT OAuth first."
+            )
+        payload = self._payload(
+            prompt=prompt,
+            references=references,
+            mask=mask,
+            n=n,
+            size=str(size or "auto").strip() or "auto",
+            quality=_coerce_quality(quality),
+            output_format=_coerce_output_format(output_format),
+            background=background,
+        )
+        last_exc: Exception | None = None
+        for attempt in range(1, IMAGE_GENERATION_MAX_ATTEMPTS + 1):
+            try:
+                return await self._post_once(payload)
+            except RetryableImageGenerationError as exc:
+                last_exc = exc
+                if attempt >= IMAGE_GENERATION_MAX_ATTEMPTS:
+                    raise ChatGPTOAuthImageGenerationExhausted(str(exc), delay_ms=exc.delay_ms) from exc
+                await asyncio.sleep(min(_image_retry_delay_ms(attempt) / 1000.0, 10.0))
+        if last_exc:
+            raise ChatGPTOAuthImageGenerationExhausted(str(last_exc)) from last_exc
+        raise ImageGenerationError("ChatGPT OAuth image generation failed before making a request")
+
+
 class OpenAIImageClient:
     def __init__(self, settings: Settings | None = None):
         self.settings = settings or get_settings()
@@ -1758,6 +2019,7 @@ class OpenAIImageClient:
             usage=usage,
             request_id=request_id,
             raw_created=raw_created,
+            provider="openai",
         )
 
 
@@ -1836,7 +2098,7 @@ async def store_generated_image_artifact(
         if tag and tag not in all_tags:
             all_tags.append(tag)
     metadata = {
-        "source": "openai-image-api",
+        "source": "chatgpt-oauth-image-generation" if provider == "chatgpt_account" else "openai-image-api",
         "provider": provider,
         "model": model,
         "mode": mode,
@@ -1965,20 +2227,54 @@ async def generate_image_assets(
     mode = "edit" if references or mask else "generate"
     selected_model, model_policy = _image_model_policy(raw, settings)
     options = _image_request_options(raw, selected_model)
-    client = OpenAIImageClient(settings)
-    result = await client.create(
-        prompt=prompt,
-        references=references,
-        mask=mask,
-        model=selected_model,
-        n=options["n"],
-        size=options["size"],
-        quality=options["quality"],
-        output_format=options["outputFormat"],
-        output_compression=options["outputCompression"],
-        background=options["background"],
-        moderation=options["moderation"],
-    )
+    warnings: list[str] = []
+    auth_status = image_generation_auth_status(settings)
+    fallback_reason: str | None = None
+
+    async def create_with_openai_fallback(reason: str) -> ImageApiResult:
+        if not settings.image_generation_api_key:
+            raise ImageGenerationError(
+                f"{reason}; ATRIUM_IMAGE_GENERATION_API_KEY is not configured, so OpenAI /v1/images fallback is unavailable"
+            )
+        warnings.append("used OpenAI /v1/images fallback after ChatGPT OAuth image generation was unavailable")
+        fallback_client = OpenAIImageClient(settings)
+        return await fallback_client.create(
+            prompt=prompt,
+            references=references,
+            mask=mask,
+            model=selected_model,
+            n=options["n"],
+            size=options["size"],
+            quality=options["quality"],
+            output_format=options["outputFormat"],
+            output_compression=options["outputCompression"],
+            background=options["background"],
+            moderation=options["moderation"],
+        )
+
+    if auth_status.get("primaryConfigured"):
+        try:
+            result = await ChatGPTOAuthImageClient(settings).create(
+                prompt=prompt,
+                references=references,
+                mask=mask,
+                model=selected_model,
+                n=options["n"],
+                size=options["size"],
+                quality=options["quality"],
+                output_format=options["outputFormat"],
+                output_compression=options["outputCompression"],
+                background=options["background"],
+                moderation=options["moderation"],
+            )
+        except ChatGPTOAuthImageGenerationExhausted as exc:
+            fallback_reason = f"ChatGPT OAuth image generation exhausted retries: {exc}"
+            result = await create_with_openai_fallback(fallback_reason)
+    else:
+        raise ImageGenerationError(
+            "ChatGPT OAuth image generation is not configured; "
+            "OpenAI /v1/images fallback is used only after the ChatGPT OAuth route exhausts retries"
+        )
     display_requester = str(
         raw.get("requestedBy")
         or raw.get("requested_by")
@@ -2011,21 +2307,27 @@ async def generate_image_assets(
                 task_ids=task_ids,
                 tags=tags,
                 model=result.model,
-                provider="openai",
+                provider=result.provider,
                 mode=mode,
                 reference_artifact_ids=[ref.artifact_id for ref in references],
                 mask_artifact_id=mask.artifact_id if mask else None,
                 usage=result.usage,
                 revised_prompt=image.revised_prompt,
                 options=options,
-                model_policy={**model_policy, "selectedModel": result.model},
+                model_policy={
+                    **model_policy,
+                    "selectedModel": result.model,
+                    "primaryProvider": auth_status.get("primaryProvider"),
+                    "fallbackProvider": auth_status.get("fallbackProvider"),
+                    "fallbackReason": fallback_reason,
+                },
             )
         )
     artifacts = [item["artifact"] for item in stored]
     locations = [artifact_location(artifact) for artifact in artifacts]
     primary = artifacts[0] if artifacts else None
     summary = (
-        f"created {len(artifacts)} image artifact(s) via {result.model}: "
+        f"created {len(artifacts)} image artifact(s) via {result.provider}/{result.model}: "
         + ", ".join(location["artifactId"] for location in locations)
     )
     return {
@@ -2037,7 +2339,7 @@ async def generate_image_assets(
         "mode": mode,
         "summary": summary,
         "model": result.model,
-        "provider": "openai",
+        "provider": result.provider,
         "artifacts": artifacts,
         "artifact": primary,
         "locations": locations,
@@ -2046,8 +2348,14 @@ async def generate_image_assets(
         "options": options,
         "referenceArtifactIds": [ref.artifact_id for ref in references],
         "maskArtifactId": mask.artifact_id if mask else None,
-        "modelPolicy": {**model_policy, "selectedModel": result.model},
-        "warnings": [],
+        "modelPolicy": {
+            **model_policy,
+            "selectedModel": result.model,
+            "primaryProvider": auth_status.get("primaryProvider"),
+            "fallbackProvider": auth_status.get("fallbackProvider"),
+            "fallbackReason": fallback_reason,
+        },
+        "warnings": warnings,
     }
 
 

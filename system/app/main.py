@@ -143,6 +143,7 @@ from .image_generation import (
     PRIMARY_IMAGE_MODEL,
     ImageGenerationError,
     generate_image_assets,
+    image_generation_auth_status,
     queue_image_generation_assets,
 )
 from .handoffs import (
@@ -2509,8 +2510,8 @@ def _tool_runtime_block_reason(run: dict[str, Any]) -> str | None:
     args = run.get("args") or {}
     if run.get("customTool"):
         return None
-    if tool == "image.generate" and not settings.image_generation_api_key:
-        return "ATRIUM_IMAGE_GENERATION_API_KEY is not configured"
+    if tool == "image.generate" and not image_generation_auth_status(settings).get("configured"):
+        return "ChatGPT account OAuth is not configured; OpenAI /v1/images fallback is used only after the ChatGPT OAuth image route exhausts retries"
     if tool == "audio.transcribe":
         status = audio_transcription_status(settings)
         if not status.get("enabled"):
@@ -12712,11 +12713,19 @@ async def create_critique_report(input: CreateCritiqueInput) -> dict[str, Any]:
 @app.get("/api/images/status")
 async def get_image_generation_status() -> dict[str, Any]:
     settings = get_settings()
+    auth = image_generation_auth_status(settings)
     return {
-        "configured": bool(settings.image_generation_api_key),
-        "provider": "openai",
-        "baseUrl": settings.image_generation_base_url,
-        "usesDedicatedImageKey": bool(settings.image_generation_api_key),
+        "configured": bool(auth.get("configured")),
+        "provider": auth.get("primaryProvider"),
+        "baseUrl": auth.get("primaryBaseUrl"),
+        "primaryProvider": auth.get("primaryProvider"),
+        "primaryConfigured": bool(auth.get("primaryConfigured")),
+        "primaryBaseUrl": auth.get("primaryBaseUrl"),
+        "fallbackProvider": auth.get("fallbackProvider"),
+        "fallbackConfigured": bool(auth.get("fallbackConfigured")),
+        "fallbackBaseUrl": auth.get("fallbackBaseUrl"),
+        "usesDedicatedImageKey": bool(auth.get("usesDedicatedImageKey")),
+        "timeoutS": auth.get("timeoutS"),
         "defaultModel": PRIMARY_IMAGE_MODEL,
         "fallbackModel": FALLBACK_IMAGE_MODEL,
         "modelPolicy": {
