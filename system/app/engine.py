@@ -947,10 +947,22 @@ async def _complete_runtime_turn(
     await commit_and_release(repo.s)
 
     async def emit_runtime_event(event: Any) -> None:
+        runtime_kind = getattr(event, "kind", None) or (event.get("kind") if isinstance(event, dict) else None)
         if thread_id and stream_msg_id:
             pulse = runtime_event_to_hub_pulse(event, thread_id=thread_id, msg_id=stream_msg_id)
             if pulse:
                 hub.pulse(pulse)
+                with contextlib.suppress(Exception):
+                    from .telegram_gateway import maybe_stream_telegram_progress_event
+
+                    await maybe_stream_telegram_progress_event(
+                        repo,
+                        reply_message_id=stream_msg_id,
+                        thread_id=thread_id,
+                        event_kind=str(pulse.get("kind") or runtime_kind or ""),
+                        text=str(pulse.get("chunk") or pulse.get("message") or ""),
+                        run=pulse.get("run") if isinstance(pulse.get("run"), dict) else None,
+                    )
         if thread_id:
             with contextlib.suppress(Exception):
                 from .memory.ledger import record_runtime_event_ledger
@@ -1437,7 +1449,7 @@ async def _complete_engine_chat_with_tools(
         round_records: list[dict[str, Any]] = []
         for call in result.tool_calls:
             if on_stream_event is not None and stream_msg_id:
-                hub.pulse({
+                pulse = {
                     "kind": "tool_call",
                     "threadId": thread_id,
                     "msgId": stream_msg_id,
@@ -1450,7 +1462,18 @@ async def _complete_engine_chat_with_tools(
                         "status": "running",
                         "startedAt": now_ms(),
                     },
-                })
+                }
+                hub.pulse(pulse)
+                with contextlib.suppress(Exception):
+                    from .telegram_gateway import maybe_stream_telegram_progress_event
+
+                    await maybe_stream_telegram_progress_event(
+                        repo,
+                        reply_message_id=stream_msg_id,
+                        thread_id=thread_id,
+                        event_kind="tool_call",
+                        run=pulse["run"],
+                    )
             async with session_scope() as s:
                 record = await run_chat_tool(
                     Repo(s),
@@ -1461,12 +1484,23 @@ async def _complete_engine_chat_with_tools(
                 )
             round_records.append(record)
             if on_stream_event is not None and stream_msg_id:
-                hub.pulse({
+                pulse = {
                     "kind": "tool_result",
                     "threadId": thread_id,
                     "msgId": stream_msg_id,
                     "run": record,
-                })
+                }
+                hub.pulse(pulse)
+                with contextlib.suppress(Exception):
+                    from .telegram_gateway import maybe_stream_telegram_progress_event
+
+                    await maybe_stream_telegram_progress_event(
+                        repo,
+                        reply_message_id=stream_msg_id,
+                        thread_id=thread_id,
+                        event_kind="tool_result",
+                        run=record,
+                    )
         tool_runs.extend(round_records)
         messages.append(tool_result_message(round_records))
 
@@ -1769,6 +1803,32 @@ async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int)
         repo=repo,
     )
     await sink.start()
+
+    async def handle_chat_stream_event(event: LLMStreamEvent) -> None:
+        await sink.handle(event)
+        with contextlib.suppress(Exception):
+            from .telegram_gateway import maybe_stream_telegram_progress_event
+
+            await maybe_stream_telegram_progress_event(
+                repo,
+                reply_message_id=reply_message_id,
+                thread_id=thread_id,
+                event_kind=event.kind,
+                text=event.text,
+                reply=sink.message,
+            )
+
+    with contextlib.suppress(Exception):
+        from .telegram_gateway import maybe_stream_telegram_progress_event
+
+        await maybe_stream_telegram_progress_event(
+            repo,
+            reply_message_id=reply_message_id,
+            thread_id=thread_id,
+            event_kind="thinking_delta",
+            reply=sink.message,
+        )
+
     stopped = False
     stream_error: str | None = None
     try:
@@ -1788,7 +1848,7 @@ async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int)
                 messages=_llm_chat_history(history, user_msg),
                 now=now,
                 thread_id=thread_id,
-                on_stream_event=sink.handle,
+                on_stream_event=handle_chat_stream_event,
                 input_tokens=4500,
                 client_tools=runtime_tools,
                 stream_msg_id=reply_message_id,
@@ -1803,7 +1863,7 @@ async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int)
                 user_msg=user_msg,
                 thread_id=thread_id,
                 now=now,
-                on_stream_event=sink.handle,
+                on_stream_event=handle_chat_stream_event,
                 stream_msg_id=reply_message_id,
             )
     except ChatStreamCancelled:

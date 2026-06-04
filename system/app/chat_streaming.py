@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -104,6 +105,22 @@ class ChatMessageStreamSink:
         self._persist_every_chars = persist_every_chars
         self._persist_every_ms = persist_every_ms
 
+    async def _merge_latest_channel_reply(self, msg: dict[str, Any]) -> dict[str, Any]:
+        if self.repo is None:
+            return msg
+        current = msg.get("channelReply") if isinstance(msg.get("channelReply"), dict) else None
+        latest_msg = None
+        with contextlib.suppress(Exception):
+            latest_msg = await self.repo.get_message(self.msg_id, thread_id=self.thread_id)
+        latest = latest_msg.get("channelReply") if isinstance(latest_msg, dict) and isinstance(latest_msg.get("channelReply"), dict) else None
+        if not latest:
+            return msg
+        if not current:
+            return {**msg, "channelReply": latest}
+        progress_keys = {key: value for key, value in latest.items() if key.startswith("progress")}
+        merged = {**latest, **current, **progress_keys}
+        return {**msg, "channelReply": merged}
+
     async def start(self) -> None:
         self.message["text"] = ""
         self.message["pending"] = True
@@ -152,6 +169,7 @@ class ChatMessageStreamSink:
         if not force and len(self.text) == self._last_persist_len:
             return
         msg = {**self.message, "text": self.text, "pending": pending}
+        msg = await self._merge_latest_channel_reply(msg)
         if self.repo is not None:
             await self.repo.update_message(msg)
             # Engine-backed chat streams can run for minutes. Commit each
