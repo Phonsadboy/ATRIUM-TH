@@ -64,17 +64,20 @@ function AssignTaskForm({
   const [deptId, setDeptId] = useState(initialDeptId)
   const [priority, setPriority] = useState<Priority>('normal')
   const [byExec, setByExec] = useState(initialByExec)
+  const [reviewMinutes, setReviewMinutes] = useState('5')
 
   const canSubmit = title.trim() !== '' && deptId !== ''
 
   const submit = () => {
     if (!canSubmit) return
+    const reviewIntervalMs = Math.max(1, Number(reviewMinutes) || 5) * 60_000
     client.assignTask({
       title: title.trim(),
       detail: detail.trim() || undefined,
       departmentId: deptId,
       priority,
       byExecutive: byExec,
+      reviewIntervalMs,
     })
     select(deptId)
     setRightTab('tasks')
@@ -143,6 +146,18 @@ function AssignTaskForm({
               )
             })}
           </div>
+        </Field>
+
+        <Field label="ปลุกตรวจงานทุก (นาที)">
+          <input
+            className={inputClass}
+            style={{ borderColor: 'var(--color-line-soft)' }}
+            type="number"
+            min={1}
+            step={1}
+            value={reviewMinutes}
+            onChange={(e) => setReviewMinutes(e.target.value)}
+          />
         </Field>
 
         <div

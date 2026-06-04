@@ -5,6 +5,7 @@ import { ACCENT_HEX } from '../lib/visuals'
 import { money, relTime } from '../lib/format'
 import { Icon, type IconName } from '../components/Icon'
 import type { Approval, ApprovalKind } from '../contract/types'
+import { isExecutiveReviewApproval, isHumanApproval } from '../lib/approvals'
 
 const KIND_LABEL: Record<ApprovalKind, string> = {
   external_action: 'การกระทำภายนอก',
@@ -30,8 +31,9 @@ export function ApprovalsDrawer() {
     (a, b) => a.length === b.length && a.every((x, i) => x.id === b[i].id),
   )
 
-  const pending = approvals.filter((a) => a.status === 'pending')
-  const resolved = approvals.filter((a) => a.status !== 'pending')
+  const executivePending = approvals.filter((a) => a.status === 'pending' && isExecutiveReviewApproval(a))
+  const pending = approvals.filter((a) => a.status === 'pending' && isHumanApproval(a))
+  const resolved = approvals.filter((a) => a.status !== 'pending' && isHumanApproval(a))
   const deptName = (id: string | null) => {
     const d = id ? departments.find((x) => x.id === id) : undefined
     return d ? `${d.emoji} ฝ่าย${d.name}` : 'บริษัท'
@@ -74,7 +76,9 @@ export function ApprovalsDrawer() {
       <div className="min-h-0 flex-1 space-y-4 overflow-x-hidden overflow-y-auto pr-1">
         {pending.length === 0 && resolved.length === 0 && (
           <div className="mt-12 text-center text-sm text-[var(--color-cream-faint)]">
-            ยังไม่มีคำขออนุมัติ
+            {executivePending.length > 0
+              ? `ผู้บริหาร AI กำลังตรวจงานปิด ${executivePending.length} รายการในคิว`
+              : 'ยังไม่มีคำขออนุมัติที่ต้องให้คุณตัดสิน'}
           </div>
         )}
 
@@ -102,7 +106,7 @@ export function ApprovalsDrawer() {
 
       {pending.length > 0 && (
         <div className="mt-3 text-center text-[11px] text-[var(--color-cream-faint)]">
-          คำขอที่กระทบภายนอกหรือใช้งบ ต้องให้คุณอนุมัติก่อนเสมอ
+          แสดงเฉพาะ human gate จริง งานปิดของแผนกให้ผู้บริหาร AI ตรวจในคิว
         </div>
       )}
     </Drawer>

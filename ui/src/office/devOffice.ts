@@ -112,6 +112,7 @@ function buildSeed(): CompanyState {
     activity: [],
     approvals: [],
     objectives: [],
+    executiveQueue: [],
     budget: { dailyCapUsd: 500, spentTodayUsd: 12.4 },
   }
 }

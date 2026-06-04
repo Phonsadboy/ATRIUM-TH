@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -56,6 +57,123 @@ class RuntimeJobStabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(claimed, [job])
         repo.mark_job.assert_awaited_once_with("job_1", "running")
         release.assert_awaited_once_with(repo.s)
+
+    async def test_claim_due_jobs_uses_atomic_repo_claim_when_available(self) -> None:
+        from app import engine
+
+        job = SimpleNamespace(id="job_1")
+        repo = SimpleNamespace(
+            s=object(),
+            claim_due_jobs=mock.AsyncMock(return_value=[job]),
+            due_jobs=mock.AsyncMock(),
+            mark_job=mock.AsyncMock(),
+        )
+
+        with mock.patch.object(engine, "commit_and_release", new=mock.AsyncMock()) as release:
+            claimed = await engine._claim_due_jobs(repo, 123, limit=3, kind="chat_reply")
+
+        self.assertEqual(claimed, [job])
+        repo.claim_due_jobs.assert_awaited_once_with(123, limit=3, kind="chat_reply", exclude_kinds=None)
+        repo.due_jobs.assert_not_awaited()
+        repo.mark_job.assert_not_awaited()
+        release.assert_awaited_once_with(repo.s)
+
+    def test_parallel_chat_partition_serializes_one_department(self) -> None:
+        from app import engine
+
+        jobs = [
+            SimpleNamespace(id="job_a1", payload={"departmentId": "dept_a"}),
+            SimpleNamespace(id="job_a2", payload={"departmentId": "dept_a"}),
+            SimpleNamespace(id="job_b1", payload={"departmentId": "dept_b"}),
+        ]
+
+        runnable, deferred = engine._partition_parallel_chat_jobs(jobs, limit=3)
+
+        self.assertEqual([job.id for job in runnable], ["job_a1", "job_b1"])
+        self.assertEqual([job.id for job in deferred], ["job_a2"])
+
+        runnable, deferred = engine._partition_parallel_chat_jobs(jobs, limit=3, busy_department_ids={"dept_a"})
+
+        self.assertEqual([job.id for job in runnable], ["job_b1"])
+        self.assertEqual([job.id for job in deferred], ["job_a1", "job_a2"])
+
+    async def test_chat_reply_starter_runs_distinct_departments_in_parallel(self) -> None:
+        from app import engine
+
+        jobs = [
+            SimpleNamespace(id="job_a1", kind="chat_reply", payload={"departmentId": "dept_a"}),
+            SimpleNamespace(id="job_b1", kind="chat_reply", payload={"departmentId": "dept_b"}),
+        ]
+        running = 0
+        max_running = 0
+        both_started = asyncio.Event()
+        release_jobs = asyncio.Event()
+        claim_calls = 0
+
+        async def fake_claim_due_job_records(now, *, kind, limit, exclude_kinds=None):
+            nonlocal claim_calls
+            claim_calls += 1
+            return jobs if claim_calls == 1 else []
+
+        async def fake_process_claimed_job_record(job, settings=None):
+            nonlocal running, max_running
+            running += 1
+            max_running = max(max_running, running)
+            if running == 2:
+                both_started.set()
+            try:
+                await release_jobs.wait()
+            finally:
+                running -= 1
+            return 1
+
+        settings = SimpleNamespace(engine_job_timeout_s=1.0, chat_reply_worker_concurrency=2)
+        in_flight: dict[asyncio.Task[int], SimpleNamespace] = {}
+        with (
+            mock.patch.object(engine, "_running_chat_reply_department_ids", new=mock.AsyncMock(return_value=set())),
+            mock.patch.object(engine, "_claim_due_job_records", side_effect=fake_claim_due_job_records),
+            mock.patch.object(engine, "_process_claimed_job_record", side_effect=fake_process_claimed_job_record),
+        ):
+            started = await engine._start_available_chat_reply_jobs(in_flight, settings)
+            await asyncio.wait_for(both_started.wait(), timeout=1)
+            release_jobs.set()
+            results = await asyncio.gather(*in_flight.keys())
+
+        self.assertEqual(started, 2)
+        self.assertEqual(results, [1, 1])
+        self.assertEqual(max_running, 2)
+
+    async def test_department_advancement_runs_distinct_departments_in_parallel(self) -> None:
+        from app import engine
+
+        departments = [{"id": "dept_a"}, {"id": "dept_b"}, {"id": "exec"}]
+        running = 0
+        max_running = 0
+        both_started = asyncio.Event()
+
+        async def fake_advance_department_in_session(dept_id, *, departments, now):
+            nonlocal running, max_running
+            running += 1
+            max_running = max(max_running, running)
+            if running == 2:
+                both_started.set()
+            try:
+                await asyncio.wait_for(both_started.wait(), timeout=1)
+                await asyncio.sleep(0)
+            finally:
+                running -= 1
+            return True
+
+        settings = SimpleNamespace(department_worker_concurrency=2)
+        with mock.patch.object(
+            engine,
+            "_advance_department_in_session",
+            side_effect=fake_advance_department_in_session,
+        ):
+            changed = await engine._advance_departments_parallel(departments, 123, settings)
+
+        self.assertEqual(changed, 2)
+        self.assertEqual(max_running, 2)
 
     def test_job_stale_threshold_uses_job_timeout_not_heartbeat_only(self) -> None:
         from app.main import _job_stale_after_ms

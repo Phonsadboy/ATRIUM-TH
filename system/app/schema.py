@@ -332,6 +332,11 @@ class Task(Schema):
     sub_task_ids: list[str] = Field(default_factory=list)
     deadline_at: Optional[int] = None
     result: Optional[dict[str, Any]] = None
+    review_interval_ms: Optional[int] = None
+    next_review_at: Optional[int] = None
+    last_review_reminder_at: Optional[int] = None
+    review_reminder_count: int = 0
+    review_schedule_token: Optional[str] = None
 
 
 class MessageCodeBlock(Schema):
@@ -393,7 +398,7 @@ class ChatFlowStep(Schema):
 
 
 class ChatFlow(Schema):
-    kind: Literal["activity", "handoff", "war_room", "meeting", "cost", "status"]
+    kind: Literal["activity", "handoff", "war_room", "meeting", "cost", "status", "department_work"]
     title: Optional[str] = None
     steps: list[ChatFlowStep] = Field(default_factory=list)
     refs: dict[str, Any] = Field(default_factory=dict)
@@ -802,6 +807,25 @@ class Budget(Schema):
     spent_today_usd: float
 
 
+class ExecutiveQueueItem(Schema):
+    id: str
+    kind: str
+    status: str
+    title: str
+    detail: Optional[str] = None
+    department_id: Optional[str] = None
+    thread_id: Optional[str] = None
+    task_id: Optional[str] = None
+    user_message_id: Optional[str] = None
+    reply_message_id: Optional[str] = None
+    run_after: int
+    priority: int
+    attempts: int = 0
+    last_error: Optional[str] = None
+    created_at: int = 0
+    updated_at: int = 0
+
+
 class CompanyState(Schema):
     company_name: str
     now: int
@@ -812,6 +836,7 @@ class CompanyState(Schema):
     activity: list[ActivityEvent]
     approvals: list[Approval]
     objectives: list[ScheduledObjective]
+    executive_queue: list[ExecutiveQueueItem] = Field(default_factory=list)
     budget: Budget
     permission_policy: PermissionPolicy
 
@@ -871,6 +896,11 @@ class AssignTaskInput(Schema):
     watchers: list[str] = Field(default_factory=list)
     parent_task_id: Optional[str] = None
     deadline_at: Optional[int] = None
+    review_interval_ms: Optional[int] = None
+
+
+class UpdateTaskReviewScheduleInput(Schema):
+    review_interval_ms: Optional[int] = None
 
 
 class ReassignTaskInput(Schema):

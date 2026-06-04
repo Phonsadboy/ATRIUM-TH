@@ -213,6 +213,11 @@ export interface Task {
   subTaskIds?: ID[]
   deadlineAt?: number | null
   result?: Record<string, unknown> | null
+  reviewIntervalMs?: number | null
+  nextReviewAt?: number | null
+  lastReviewReminderAt?: number | null
+  reviewReminderCount?: number
+  reviewScheduleToken?: string | null
 }
 
 /* ---------- Chat ---------- */
@@ -1102,9 +1107,29 @@ export interface CompanyState {
   activity: ActivityEvent[]
   approvals: Approval[]
   objectives: ScheduledObjective[]
+  executiveQueue: ExecutiveQueueItem[]
   budget: Budget
   /** Owner Mode guardrail policy (present from the FastAPI backend). */
   permissionPolicy?: PermissionPolicy
+}
+
+export interface ExecutiveQueueItem {
+  id: ID
+  kind: string
+  status: string
+  title: string
+  detail?: string | null
+  departmentId?: ID | null
+  threadId?: ThreadId | null
+  taskId?: ID | null
+  userMessageId?: ID | null
+  replyMessageId?: ID | null
+  runAfter: number
+  priority: number
+  attempts: number
+  lastError?: string | null
+  createdAt: number
+  updatedAt: number
 }
 
 /* ============================================================

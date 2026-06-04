@@ -118,7 +118,7 @@ BLUEPRINTS: list[dict] = [
         "emoji": "🦉", "accent": "amber", "providerId": "claude_code", "model": "claude-sonnet-4-7",
         "thinkingEffort": "high", "agentName": "ออตโต้", "state": "thinking", "mood": 0.82,
         "skills": ["วางกลยุทธ์", "แตกงาน", "ประสานแผนก", "ตรวจคุณภาพ"],
-        "tools": ["มอบหมายงาน", "ส่งต่องาน", "สรุปรายงาน"], "autonomy": True,
+        "tools": ["มอบหมายงาน", "ส่งต่องาน", "สรุปรายงาน", "เปลี่ยนชื่อตัวเอง"], "autonomy": True,
         "room": {"x": 7, "y": 1, "w": 5, "h": 4},
         "mem": {
             "concepts": ["เป้าหมายไตรมาส", "ลำดับความสำคัญ", "งบประมาณ"], "people": ["ผู้ใช้", "ทุกแผนก"],
@@ -400,7 +400,7 @@ async def _seed_threads(repo: Repo, now: int, thread_id_for) -> None:
         return {"id": uid("msg"), "threadId": tid, "role": role, "authorName": author, "text": text, "ts": _mins(now, mins_ago)}
 
     for m in [
-        msg("executive", "executive", "ออตโต้", "สวัสดีครับ ผมออตโต้ ผู้บริหารของบริษัท บอกได้เลยว่าวันนี้อยากให้ทีมทำอะไร", 22),
+        msg("executive", "executive", "ออตโต้", "สวัสดีครับ ผมออตโต้ ผู้บริหารของบริษัท อยากให้ผมใช้ชื่ออะไรดีครับ", 22),
         msg("executive", "user", "คุณ", "อยากเปิดตัว ATRIUM ภายใน 6 สัปดาห์ เริ่มวางแผนเลย", 20),
         msg("executive", "executive", "ออตโต้", "รับทราบครับ ผมแตกเป็น 4 งานย่อย ส่งให้กลยุทธ์เริ่มโรดแมป และให้วิจัยสำรวจตลาดคู่ขนานแล้ว เดี๋ยวสรุปความคืบหน้าให้เป็นระยะ", 19),
         msg(thread_id_for("engineering"), "user", "คุณ", "ต่อสัญญา API ให้ UI ก่อนนะ ส่วน backend ค่อยมาทีหลัง", 58),

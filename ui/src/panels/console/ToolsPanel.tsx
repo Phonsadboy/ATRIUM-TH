@@ -4,6 +4,7 @@ import { Field, Pill, inputClass, withAlpha } from '../../components/primitives'
 import { ACCENT_HEX } from '../../lib/visuals'
 import { relTime } from '../../lib/format'
 import { isExec } from '../../lib/threads'
+import { isHumanApproval } from '../../lib/approvals'
 import type { ToolCatalogItem, ToolName, ToolRun, ToolRunStatus, ToolRiskClass, Approval, PolicyMode } from '../../contract/types'
 import { Section, Loading, Empty, ErrorNote, Row, PrimaryBtn, GhostBtn, Tabs, FormCard, SubLabel, useAsync, useDepts, useNow } from './shared'
 
@@ -336,7 +337,7 @@ function RunsList() {
 function ToolApprovals() {
   const { data, loading, error, reload } = useAsync(() => client.listToolApprovals({ limit: 100 }), [])
   const { label } = useDepts()
-  const approvals = data ?? []
+  const approvals = (data ?? []).filter(isHumanApproval)
   const pending = approvals.filter((a) => a.status === 'pending')
 
   if (loading && !data) return <Loading />

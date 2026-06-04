@@ -1,5 +1,6 @@
+import { useEffect, useState } from 'react'
 import { motion } from 'framer-motion'
-import { useSelector } from '../state/useCompany'
+import { useSelector, client } from '../state/useCompany'
 import { useUI } from '../state/ui'
 import { Progress, Pill, cx } from './primitives'
 import { PRIORITY_HEX, PRIORITY_LABEL, ACCENT_HEX } from '../lib/visuals'
@@ -20,10 +21,22 @@ export function TaskCard({ task, compact }: { task: Task; compact?: boolean }) {
     task.status === 'review' ||
     task.status === 'revising'
   const cancelled = task.status === 'cancelled'
+  const reviewMinutes = task.reviewIntervalMs ? Math.max(1, Math.round(task.reviewIntervalMs / 60_000)) : ''
+  const [reviewDraft, setReviewDraft] = useState(String(reviewMinutes))
+
+  useEffect(() => {
+    setReviewDraft(String(reviewMinutes))
+  }, [reviewMinutes])
+
+  const saveReviewSchedule = () => {
+    const minutes = Number(reviewDraft)
+    void client.updateTaskReviewSchedule(task.id, minutes > 0 ? Math.round(minutes) * 60_000 : null)
+  }
 
   return (
-    <motion.button
-      type="button"
+    <motion.div
+      role="button"
+      tabIndex={0}
       layout
       initial={{ opacity: 0, y: 6 }}
       animate={{ opacity: cancelled ? 0.55 : 1, y: 0 }}
@@ -89,6 +102,45 @@ export function TaskCard({ task, compact }: { task: Task; compact?: boolean }) {
       <div className="mt-1 text-[10px] text-[var(--color-cream-faint)]">
         จาก {originLabel(task.origin, getName)}
       </div>
-    </motion.button>
+
+      {task.status === 'blocked' && (
+        <div
+          className="mt-2 rounded-md border px-2 py-1.5 text-[10px] leading-relaxed text-[var(--color-cream-dim)]"
+          style={{
+            borderColor: `${STATUS_HEX.blocked}55`,
+            background: `${STATUS_HEX.blocked}14`,
+          }}
+        >
+          ติดปัญหา: แผนกหรือเครื่องมือไปต่อไม่ได้ รอผู้บริหารตรวจสาเหตุจากแชทและบันทึกงาน
+        </div>
+      )}
+
+      {!compact && !cancelled && (
+        <div
+          className="mt-2 flex items-center gap-1.5 text-[10px] text-[var(--color-cream-faint)]"
+          onClick={(event) => event.stopPropagation()}
+        >
+          <span>ปลุกตรวจทุก</span>
+          <input
+            type="number"
+            min={0}
+            step={1}
+            value={reviewDraft}
+            onChange={(event) => setReviewDraft(event.target.value)}
+            className="h-7 w-16 rounded-md border bg-transparent px-2 text-[11px] text-[var(--color-cream)] outline-none"
+            style={{ borderColor: 'var(--color-line-soft)' }}
+          />
+          <span>นาที</span>
+          <button
+            type="button"
+            onClick={saveReviewSchedule}
+            className="ml-auto rounded-md border px-2 py-1 text-[10px] text-[var(--color-cream-dim)] transition-colors hover:text-[var(--color-cream)]"
+            style={{ borderColor: 'var(--color-line-soft)' }}
+          >
+            บันทึก
+          </button>
+        </div>
+      )}
+    </motion.div>
   )
 }

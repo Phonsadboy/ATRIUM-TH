@@ -17,6 +17,7 @@ from app.provider.claude_code_provider import (
     _AUTH_STATUS_CACHE,
     _AUTH_STATUS_TIMEOUT_S,
     _ClaudeCodeImageContext,
+    _extract_tool_calls,
     claude_code_auth_status,
     _messages_prompt,
 )
@@ -165,6 +166,36 @@ class ProviderMultimodalMappingTest(unittest.TestCase):
             self.assertEqual(stop.tool_calls[0].name, "call_atrium_api")
             self.assertEqual(stop.tool_calls[0].input, {"method": "GET", "path": "/health"})
             self.assertEqual(stop.meta["toolSupport"], "atrium-json-shim")
+
+    def test_claude_code_extracts_loose_multiline_tool_call_text(self) -> None:
+        text = (
+            'รับทราบครับ จะส่งไปยัง executive room\n\n'
+            '{"tool_calls":[{"id":"call_1","name":"post_visible_chat_message","input":{"text":"'
+            '## Concept 1 — "Shock Value + Curiosity Gap"\n'
+            'Headline เช่น "ทำไมคนซื้อซ้ำถึง 3 ครั้ง?"\n'
+            '- bullet หนึ่ง\n'
+            '","targetDepartmentId":"exec"}}]}'
+        )
+
+        calls = _extract_tool_calls(text, [{
+            "name": "post_visible_chat_message",
+            "description": "Post a visible message",
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "targetDepartmentId": {"type": "string"},
+                },
+                "required": ["text"],
+            },
+        }])
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0].id, "call_1")
+        self.assertEqual(calls[0].name, "post_visible_chat_message")
+        self.assertEqual(calls[0].input["targetDepartmentId"], "exec")
+        self.assertIn('Concept 1 — "Shock Value + Curiosity Gap"', calls[0].input["text"])
+        self.assertIn('Headline เช่น "ทำไมคนซื้อซ้ำถึง 3 ครั้ง?"', calls[0].input["text"])
 
     def test_claude_code_auth_status_allows_slow_keychain_probe(self) -> None:
         completed = stat_result = mock.Mock()

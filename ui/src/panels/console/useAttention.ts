@@ -5,6 +5,7 @@
 // source never blanks the others. Drives both the nav badges and the Overview.
 import { useCallback, useEffect, useState } from 'react'
 import { client, useSelector } from '../../state/useCompany'
+import { isHumanApproval } from '../../lib/approvals'
 import type {
   Approval,
   KnowledgeDebtDepartment,
@@ -41,7 +42,7 @@ const DEBT_THRESHOLD = 0.6
 export function useAttention(enabled: boolean): Attention {
   // approvals ride the live snapshot, so they stay current without polling
   const approvals = useSelector(
-    (s) => s.approvals.filter((a) => a.status === 'pending'),
+    (s) => s.approvals.filter((a) => a.status === 'pending' && isHumanApproval(a)),
     (a, b) => a.length === b.length && a.every((x, i) => x.id === b[i]?.id),
   )
 
@@ -79,7 +80,7 @@ export function useAttention(enabled: boolean): Attention {
               ? projects.value.filter((p) => p.reviewStatus === 'pending_user')
               : [],
           warRooms: wars.status === 'fulfilled' ? wars.value : [],
-          toolApprovals: tools.status === 'fulfilled' ? tools.value : [],
+          toolApprovals: tools.status === 'fulfilled' ? tools.value.filter(isHumanApproval) : [],
           orgPlans: plans.status === 'fulfilled' ? plans.value : [],
           debt:
             debt.status === 'fulfilled'

@@ -2,8 +2,9 @@
 
 This module keeps Telegram as a channel adapter around the existing ATRIUM chat
 runtime. Inbound Telegram events become normal chat messages and queued
-``chat_reply`` jobs; outbound delivery is attached to the final reply message
-after the same worker finishes.
+``chat_reply`` jobs; a progress job keeps Telegram updated while the reply is
+pending, then outbound delivery edits that live message into the final answer
+when possible.
 """
 from __future__ import annotations
 
@@ -49,6 +50,7 @@ DEFAULT_OUTBOUND_RETRY_ATTEMPTS = 3
 DEFAULT_OUTBOUND_RETRY_DELAY_S = 8.0
 DEFAULT_PROGRESS_TYPING_INTERVAL_S = 4.0
 DEFAULT_PROGRESS_MAX_WINDOW_S = 600.0
+DEFAULT_PROGRESS_PREVIEW_CHARS = 3200
 TELEGRAM_MEDIA_FIELDS = (
     "document",
     "audio",
@@ -152,6 +154,19 @@ def _telegram_progress_typing_interval_s(auth: dict[str, Any] | None = None) -> 
 def _telegram_progress_max_window_s(auth: dict[str, Any] | None = None) -> float:
     auth = auth or {}
     return float(auth.get("progressMaxWindowS") or DEFAULT_PROGRESS_MAX_WINDOW_S)
+
+
+def _telegram_progress_messages_enabled(auth: dict[str, Any] | None = None) -> bool:
+    auth = auth or {}
+    value = auth.get("progressMessages", auth.get("progressMessage", True))
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in {"0", "false", "off", "no", "disabled"}
+
+
+def _telegram_progress_preview_chars(auth: dict[str, Any] | None = None) -> int:
+    auth = auth or {}
+    return max(600, min(int(auth.get("progressPreviewChars") or DEFAULT_PROGRESS_PREVIEW_CHARS), TELEGRAM_MAX_TEXT - 500))
 
 
 def _csv_values(raw: Any) -> list[str]:
@@ -850,6 +865,116 @@ def _telegram_target(channel_reply: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in target.items() if value not in (None, "")}
 
 
+def _coerce_telegram_message_id(raw: Any) -> int | str | None:
+    if raw in (None, ""):
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    with contextlib.suppress(ValueError):
+        return int(text)
+    return text
+
+
+def _telegram_result_message_id(response: dict[str, Any]) -> str | None:
+    result = response.get("result") if isinstance(response.get("result"), dict) else {}
+    value = result.get("message_id")
+    return None if value in (None, "") else str(value)
+
+
+def _telegram_edit_target(channel_reply: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "chat_id": channel_reply.get("chatId"),
+        "message_id": _coerce_telegram_message_id(channel_reply.get("progressMessageId")),
+    }
+
+
+def _pending_reply_placeholder(text: str) -> bool:
+    normalized = str(text or "").strip()
+    return normalized in {
+        "กำลังคิดและทำงานต่อในคิวเบื้องหลัง...",
+        "กำลังคิดและทำงานต่อใน war room...",
+        "กลับมาตรวจงานที่ตั้งเวลาไว้และกำลังทำต่อ...",
+    }
+
+
+def _trim_telegram_text(text: str, limit: int) -> str:
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    return f"{text[: max(0, limit - 1)].rstrip()}…"
+
+
+def _telegram_progress_text(reply: dict[str, Any], auth: dict[str, Any]) -> str:
+    status = str(reply.get("status") or ("sending" if reply.get("pending") else "sent")).strip()
+    status_label = {
+        "queued": "อยู่ในคิว กำลังเตรียมบริบท",
+        "sending": "กำลังคิดและส่งคำตอบ",
+        "pending_approval": "รออนุมัติเครื่องมือ",
+        "failed": "เกิดข้อผิดพลาด",
+        "cancelled": "ถูกยกเลิก",
+    }.get(status, "กำลังทำงาน")
+    raw_text = str(reply.get("text") or "").strip()
+    preview = "" if _pending_reply_placeholder(raw_text) else raw_text
+    lines = [
+        "ATRIUM กำลังทำงาน",
+        f"สถานะ: {status_label}",
+    ]
+    if preview:
+        max_preview = _telegram_progress_preview_chars(auth)
+        lines.extend(["", "คำตอบที่กำลังร่าง:", _trim_telegram_text(preview, max_preview)])
+    else:
+        lines.extend(["", "กำลังอ่านบริบท เรียกโมเดล หรือรอผลเครื่องมืออยู่..."])
+    return _trim_telegram_text("\n".join(lines), TELEGRAM_MAX_TEXT)
+
+
+async def _telegram_edit_message_text(bot_token: str, channel_reply: dict[str, Any], text: str) -> dict[str, Any]:
+    edit_target = _telegram_edit_target(channel_reply)
+    if not edit_target.get("chat_id") or not edit_target.get("message_id"):
+        raise TelegramGatewayError("Telegram progress edit target missing chatId/messageId")
+    payload = {
+        **edit_target,
+        "text": _trim_telegram_text(text, TELEGRAM_MAX_TEXT),
+        "disable_web_page_preview": False,
+    }
+    try:
+        return await asyncio.to_thread(_telegram_api_request, bot_token, "editMessageText", payload)
+    except TelegramGatewayError as exc:
+        if "message is not modified" in str(exc).lower():
+            return {"ok": True, "result": {"message_id": edit_target["message_id"], "not_modified": True}}
+        raise
+
+
+async def _send_or_edit_telegram_progress(
+    bot_token: str,
+    reply: dict[str, Any],
+    channel_reply: dict[str, Any],
+    settings: Settings,
+    auth: dict[str, Any],
+) -> dict[str, Any]:
+    del settings
+    text = _telegram_progress_text(reply, auth)
+    progress_id = str(channel_reply.get("progressMessageId") or "").strip()
+    if progress_id:
+        edited = await _telegram_edit_message_text(bot_token, channel_reply, text)
+        return {"ok": True, "method": "editMessageText", "progressMessageId": progress_id, "response": edited.get("result")}
+    target = _telegram_target(channel_reply)
+    if not target.get("chat_id"):
+        raise TelegramGatewayError("Telegram progress target missing chatId")
+    sent = await asyncio.to_thread(
+        _telegram_api_request,
+        bot_token,
+        "sendMessage",
+        {
+            **target,
+            "text": text,
+            "disable_web_page_preview": True,
+        },
+    )
+    progress_id = _telegram_result_message_id(sent)
+    return {"ok": True, "method": "sendMessage", "progressMessageId": progress_id, "response": sent.get("result")}
+
+
 def _multipart_body(fields: dict[str, Any], file_field: str, filename: str, data: bytes, mime: str) -> tuple[bytes, str]:
     boundary = "----atriumtelegram" + secrets.token_hex(12)
     parts: list[bytes] = []
@@ -927,13 +1052,26 @@ async def send_telegram_payload(bot_token: str, payload: dict[str, Any], setting
     with contextlib.suppress(Exception):
         await asyncio.to_thread(_telegram_api_request, bot_token, "sendChatAction", {**target, "action": "typing"})
     auth = load_telegram_auth(settings)
-    for idx, chunk in enumerate(_split_text(str(payload.get("text") or ""), _telegram_outbound_chunk_chars(settings, auth))):
+    chunks = _split_text(str(payload.get("text") or ""), _telegram_outbound_chunk_chars(settings, auth))
+    start_idx = 0
+    if channel_reply.get("progressMessageId") and chunks:
+        try:
+            edited = await _telegram_edit_message_text(bot_token, channel_reply, chunks[0])
+            receipts.append({"method": "editMessageText", "response": edited.get("result"), "progressFinal": True})
+            start_idx = 1
+        except Exception as exc:
+            receipts.append({
+                "method": "editMessageText",
+                "error": f"{type(exc).__name__}: {exc}",
+                "fallback": "sendMessage",
+            })
+    for idx, chunk in enumerate(chunks[start_idx:], start=start_idx):
         message_payload = {
             **target,
             "text": chunk,
             "disable_web_page_preview": False,
         }
-        if idx > 0:
+        if idx > 0 or start_idx > 0:
             message_payload.pop("reply_parameters", None)
         sent = await asyncio.to_thread(_telegram_api_request, bot_token, "sendMessage", message_payload)
         receipts.append({"method": "sendMessage", "response": sent.get("result")})
@@ -974,6 +1112,18 @@ async def maybe_deliver_telegram_reply_for_message(
         return {"ok": True, "status": "skipped", "reason": "not_telegram"}
     if reply.get("pending"):
         return {"ok": True, "status": "skipped", "reason": "reply_pending"}
+    with contextlib.suppress(Exception):
+        progress_record = await repo.get_entity("telegram_progress_message", str(reply.get("id") or ""))
+        if (
+            isinstance(progress_record, dict)
+            and progress_record.get("progressMessageId")
+            and not channel_reply.get("progressMessageId")
+        ):
+            channel_reply = {
+                **channel_reply,
+                "progressMessageId": str(progress_record["progressMessageId"]),
+                "progressUpdatedAt": progress_record.get("updatedAt"),
+            }
     settings = settings or get_settings()
     auth = load_telegram_auth(settings)
     bot_token = str(auth.get("botToken") or "").strip()
@@ -1099,6 +1249,48 @@ async def process_telegram_progress_job(repo: Repo, payload: dict[str, Any], now
     if not target.get("chat_id"):
         return {"ok": False, "status": "skipped", "reason": "missing_target"}
     await asyncio.to_thread(_telegram_api_request, bot_token, "sendChatAction", {**target, "action": "typing"})
+    progress_status: dict[str, Any] | None = None
+    if _telegram_progress_messages_enabled(auth):
+        try:
+            progress_status = await _send_or_edit_telegram_progress(
+                bot_token,
+                reply,
+                channel_reply,
+                settings,
+                auth,
+            )
+            progress_id = progress_status.get("progressMessageId")
+            if progress_id:
+                channel_reply = {
+                    **channel_reply,
+                    "progressMessageId": str(progress_id),
+                    "progressUpdatedAt": now,
+                }
+                await repo.put_entity(
+                    "telegram_progress_message",
+                    {
+                        "id": reply_id,
+                        "provider": "telegram",
+                        "replyMessageId": reply_id,
+                        "threadId": thread_id,
+                        "chatId": channel_reply.get("chatId"),
+                        "progressMessageId": str(progress_id),
+                        "updatedAt": now,
+                    },
+                    dept=dept_id_from_thread(str(thread_id or "")),
+                    status="active",
+                    ts=now,
+                )
+                await repo.update_message({
+                    **reply,
+                    "channelReply": channel_reply,
+                })
+        except Exception as exc:
+            progress_status = {
+                "ok": False,
+                "status": "progress_failed",
+                "error": f"{type(exc).__name__}: {exc}",
+            }
     expires_at = int(payload.get("expiresAt") or 0)
     if expires_at and now < expires_at:
         interval_ms = int(max(2.0, _telegram_progress_typing_interval_s(auth)) * 1000)
@@ -1107,13 +1299,19 @@ async def process_telegram_progress_job(repo: Repo, payload: dict[str, Any], now
             "telegram_progress",
             {
                 **payload,
+                "channelReply": channel_reply,
                 "attempt": int(payload.get("attempt") or 0) + 1,
             },
             now + interval_ms,
             priority=3,
         )
-        return {"ok": True, "status": "typing_rescheduled", "nextRunAt": now + interval_ms}
-    return {"ok": True, "status": "expired"}
+        return {
+            "ok": True,
+            "status": "typing_rescheduled",
+            "progress": progress_status,
+            "nextRunAt": now + interval_ms,
+        }
+    return {"ok": True, "status": "expired", "progress": progress_status}
 
 
 async def run_telegram_polling_loop(

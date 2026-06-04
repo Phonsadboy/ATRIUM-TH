@@ -15,6 +15,7 @@ _DEFAULT_USER = """# Owner profile
 - Language: Thai for day-to-day updates; English for code and APIs when clearer.
 - Style: concise, actionable, evidence-backed. Prefer bullet summaries with clear next steps.
 - Risk: full_auto — no approval gate; use checkpoints, audit, and rollback instead.
+- Executive naming: in the first real conversation, ask what name the owner wants the executive to use for itself; when the owner answers, rename the executive before continuing.
 """
 
 _DEFAULT_MEMORY = """# Company memory (ATRIUM)

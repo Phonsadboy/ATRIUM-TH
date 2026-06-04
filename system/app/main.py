@@ -32,7 +32,7 @@ from urllib.parse import quote, unquote, urlparse
 
 from fastapi import Body, FastAPI, File, Form, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import JSONResponse, Response
 from fastapi.routing import APIRoute
 from pydantic import Field
 
@@ -317,6 +317,7 @@ from .schema import (
     UpdatePlaybookInput,
     UpdatePreferenceInput,
     UpdateProjectInput,
+    UpdateTaskReviewScheduleInput,
     UpdateTriggerInput,
     UpdateWarRoomInput,
     Trigger,
@@ -339,6 +340,7 @@ from .scheduling import (
     resolve_trigger_cadence,
 )
 from .threads import dept_id_from_thread, is_exec, thread_id_for
+from .task_review import apply_task_review_schedule, enqueue_task_review_reminder, normalize_review_interval_ms, review_interval_label
 from .telegram_gateway import handle_telegram_update, run_telegram_polling_loop, telegram_webhook_secret
 
 logger = logging.getLogger(__name__)
@@ -5337,7 +5339,6 @@ async def _approve_pending_approvals_for_full_auto(
         approval
         for approval in reversed(await repo.list_pending_approvals())
         if approval.get("status") == "pending"
-        and (approval.get("action") or {}).get("action") != "close_task"
     ]
     pending: list[dict[str, Any]] = []
     skipped_user_review = 0
@@ -5353,9 +5354,13 @@ async def _approve_pending_approvals_for_full_auto(
     for approval in pending:
         try:
             approval["status"] = "approved"
+            approval["resolvedAt"] = now
             action = approval.get("action")
+            actor = "executive" if isinstance(action, dict) and action.get("action") == "close_task" else approved_by
+            approval["resolvedBy"] = actor
+            approval["autoApprovedBy"] = actor
             if isinstance(action, dict) and not action.get("approvedBy"):
-                action["approvedBy"] = approved_by
+                action["approvedBy"] = actor
                 approval["action"] = action
             did_execute = await _execute_approval_action(repo, approval)
             if did_execute:
@@ -5363,7 +5368,11 @@ async def _approve_pending_approvals_for_full_auto(
             await repo.save_approval(approval)
             await _upsert_approval_chat_message(repo, approval)
             await repo.add_activity(_activity(
-                f"อนุมัติอัตโนมัติจากโหมดสิทธิ์เต็ม: {approval['title']}",
+                (
+                    f"ผู้บริหาร AI ตรวจและอนุมัติปิดงาน: {approval['title']}"
+                    if isinstance(action, dict) and action.get("action") == "close_task"
+                    else f"อนุมัติอัตโนมัติจากโหมดสิทธิ์เต็ม: {approval['title']}"
+                ),
                 type_="approval",
                 department_id=approval.get("departmentId"),
                 severity="good",
@@ -6054,7 +6063,9 @@ def _system_prompt(dept: dict[str, Any], memory_context: str = "") -> str:
         base = (
             f"คุณคือ {dept['agentName']} ผู้บริหารของบริษัท AI ATRIUM. "
             "หน้าที่คือรับโจทย์จากผู้ใช้ แตกงาน มอบหมายงาน ตรวจคุณภาพ และสรุปกลับเป็นภาษาไทยที่ชัดเจน. "
-            "ตอบให้กระชับ มีเหตุผล และพร้อมนำไปปฏิบัติ."
+            "ตอบให้กระชับ มีเหตุผล และพร้อมนำไปปฏิบัติ. "
+            "ในการคุยจริงครั้งแรกกับเจ้าของ ให้ถามว่าอยากให้ผู้บริหารคนนี้ชื่ออะไร; "
+            "เมื่อเจ้าของบอกชื่อ ให้ใช้ tool rename_self เพื่อบันทึกชื่อนั้นเป็นชื่อของตัวเองก่อนทำงานต่อ."
         )
     else:
         base = (
@@ -8097,8 +8108,8 @@ async def get_graph_health() -> dict[str, Any]:
 
 
 @app.get("/api/state", response_model=CompanyState)
-async def get_state() -> dict[str, Any]:
-    return await _snapshot()
+async def get_state() -> JSONResponse:
+    return JSONResponse(content=await _snapshot())
 
 
 @app.get("/api/departments", response_model=list[Department])
@@ -9056,6 +9067,7 @@ async def close_department(dept_id: str) -> dict[str, Any]:
 
 @app.post("/api/tasks", response_model=Task)
 async def assign_task(input: AssignTaskInput) -> dict[str, Any]:
+    now = now_ms()
     async with session_scope() as s:
         repo = Repo(s)
         dept = await repo.get_department(input.department_id)
@@ -9077,8 +9089,8 @@ async def assign_task(input: AssignTaskInput) -> dict[str, Any]:
             "departmentId": input.department_id,
             "origin": {"kind": "executive"} if input.by_executive else {"kind": "user"},
             "progress": 0,
-            "createdAt": now_ms(),
-            "updatedAt": now_ms(),
+            "createdAt": now,
+            "updatedAt": now,
             "handoffs": [],
             "log": ["ผู้บริหารมอบหมาย" if input.by_executive else "ผู้ใช้มอบหมายโดยตรง"],
             "projectId": input.project_id,
@@ -9089,8 +9101,13 @@ async def assign_task(input: AssignTaskInput) -> dict[str, Any]:
             "deadlineAt": input.deadline_at,
             "result": None,
         }
+        interval_ms = normalize_review_interval_ms(input.review_interval_ms)
+        apply_task_review_schedule(task, interval_ms, now)
+        if interval_ms:
+            task["log"].append(f"ตั้งรอบปลุกผู้บริหารตรวจงานทุก {review_interval_label(interval_ms)}")
         await _link_child_task(repo, input.parent_task_id, task["id"])
         await repo.save_task(task)
+        await enqueue_task_review_reminder(repo, task, now=now)
         await repo.add_activity(_activity(
             f"งานใหม่ “{task['title']}” → ฝ่าย{dept['name']}",
             type_="task_created",
@@ -9135,6 +9152,42 @@ async def get_task(task_id: str) -> dict[str, Any]:
         task = await Repo(s).get_task(task_id)
     if not task:
         raise HTTPException(status_code=404, detail="task not found")
+    return task
+
+
+@app.patch("/api/tasks/{task_id}/review-schedule", response_model=Task)
+async def update_task_review_schedule(task_id: str, input: UpdateTaskReviewScheduleInput) -> dict[str, Any]:
+    now = now_ms()
+    async with session_scope() as s:
+        repo = Repo(s)
+        task = await repo.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="task not found")
+        if task.get("status") in {"done", "cancelled"}:
+            raise HTTPException(status_code=409, detail="completed task cannot schedule review reminders")
+        interval_ms = normalize_review_interval_ms(input.review_interval_ms)
+        apply_task_review_schedule(task, interval_ms, now)
+        task["updatedAt"] = now
+        label = review_interval_label(interval_ms)
+        task.setdefault("log", []).append(
+            f"ผู้บริหารแก้รอบปลุกตรวจงานเป็น {label}" if interval_ms else "ผู้บริหารปิดรอบปลุกตรวจงาน"
+        )
+        await repo.save_task(task)
+        await enqueue_task_review_reminder(repo, task, now=now)
+        dept = await repo.get_department(task.get("departmentId")) if task.get("departmentId") else None
+        await repo.add_activity(_activity(
+            (
+                f"ตั้งรอบตรวจงาน “{task['title']}” ทุก {label}"
+                if interval_ms
+                else f"ปิดรอบตรวจงาน “{task['title']}”"
+            ),
+            type_="task_progress",
+            department_id=(dept or {}).get("id") or task.get("departmentId"),
+            severity="info",
+            ts=now,
+        ))
+    hub.pulse({"kind": "state", "departmentId": task.get("departmentId"), "taskId": task["id"]})
+    hub.mark_dirty()
     return task
 
 

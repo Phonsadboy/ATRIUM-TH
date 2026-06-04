@@ -250,6 +250,13 @@ function routeLabel(m: ChatMessage, deptNameById: Map<string, string>): string |
   return name ? `ถึงฝ่าย${name}` : `ถึง ${target}`
 }
 
+function liveStatusLabel(m: ChatMessage): string {
+  if (m.toolRuns?.some((r) => r.status === 'running')) return 'กำลังใช้เครื่องมือ'
+  if (m.status === 'queued') return 'อยู่ในคิว กำลังเตรียมบริบท'
+  if (m.streaming) return 'กำลังคิดและส่งคำตอบแบบสด'
+  return 'กำลังคิดและเตรียมคำตอบ'
+}
+
 function toolNameFromActivity(text: string): string {
   return (
     /ใช้ tool\s+([^:]+):/i.exec(text)?.[1] ??
@@ -690,7 +697,7 @@ function MessageRow({
             ))}
 
           {m.pending ? (
-            <TypingDots color={ACCENT_HEX[accent]} />
+            <TypingDots color={ACCENT_HEX[accent]} label={liveStatusLabel(m)} />
           ) : !mine || m.contentFormat === 'markdown' || m.render?.format === 'markdown' ? (
             // Assistant output is always treated as markdown (matching the
             // backend, which flags agent/executive turns as markdown) so fenced

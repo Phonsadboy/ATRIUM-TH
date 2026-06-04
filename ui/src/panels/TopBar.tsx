@@ -10,6 +10,7 @@ import { ModeSwitch } from './ModeSwitch'
 import { clockSeconds, money } from '../lib/format'
 import { ACCENT_HEX } from '../lib/visuals'
 import { EXEC_ID } from '../lib/threads'
+import { isHumanApproval } from '../lib/approvals'
 
 function budgetColor(ratio: number): string {
   if (ratio >= 0.9) return ACCENT_HEX.coral
@@ -22,7 +23,10 @@ export function TopBar() {
   const running = useSelector((s) => s.running)
   const budget = useSelector((s) => s.budget)
   const pending = useSelector(
-    (s) => s.approvals.filter((a) => a.status === 'pending').length,
+    (s) => s.approvals.filter((a) => a.status === 'pending' && isHumanApproval(a)).length,
+  )
+  const queueCount = useSelector(
+    (s) => s.executiveQueue.filter((item) => item.status === 'queued' || item.status === 'running').length,
   )
   // exclude the executive so this matches LeftRail's แผนก ({rest.length}) count
   const deptCount = useSelector(
@@ -34,6 +38,8 @@ export function TopBar() {
   const toggleTaskBoard = useUI((s) => s.toggleTaskBoard)
   const openFinance = useUI((s) => s.openFinance)
   const openConsole = useUI((s) => s.openConsole)
+  const select = useUI((s) => s.select)
+  const setRightTab = useUI((s) => s.setRightTab)
 
   // the `now` selector above re-renders TopBar on every client bump, so this
   // plain getter read stays in sync with the notification inbox
@@ -135,6 +141,33 @@ export function TopBar() {
         style={{ borderColor: 'var(--color-line-soft)' }}
       >
         <Icon name="archive" size={14} />
+      </button>
+
+      {/* executive queue */}
+      <button
+        type="button"
+        onClick={() => {
+          select(EXEC_ID)
+          setRightTab('watch')
+        }}
+        className="relative flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-medium transition-colors"
+        style={{
+          borderColor: queueCount
+            ? withAlpha(ACCENT_HEX.lavender, 0.45)
+            : 'var(--color-line-soft)',
+          color: queueCount ? ACCENT_HEX.lavender : 'var(--color-cream-dim)',
+          background: queueCount ? withAlpha(ACCENT_HEX.lavender, 0.1) : 'transparent',
+        }}
+      >
+        <Icon name="tasks" size={14} /> คิว
+        {queueCount > 0 && (
+          <span
+            className="ml-1.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-bold text-black"
+            style={{ background: ACCENT_HEX.lavender }}
+          >
+            {queueCount}
+          </span>
+        )}
       </button>
 
       {/* notifications */}

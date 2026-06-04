@@ -78,6 +78,7 @@ export interface AssignTaskInput {
   watchers?: ID[]
   parentTaskId?: ID | null
   deadlineAt?: number | null
+  reviewIntervalMs?: number | null
 }
 
 export interface ReassignTaskInput {
@@ -106,6 +107,7 @@ export interface CompanyClient {
   createDepartment(input: CreateDepartmentInput): Department
   assignTask(input: AssignTaskInput): Task
   reassignTask(taskId: ID, input: ReassignTaskInput): Promise<Task>
+  updateTaskReviewSchedule(taskId: ID, reviewIntervalMs: number | null): Promise<Task>
 
   setRunning(running: boolean): void
   setDepartmentProvider(departmentId: ID, providerId: AiProviderId): void

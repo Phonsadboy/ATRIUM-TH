@@ -354,6 +354,14 @@ class Settings(BaseSettings):
     engine_job_timeout_s: float = 1800.0
     engine_tick_timeout_s: float = 1800.0
     engine_stale_after_s: float = 600.0
+    chat_reply_worker_concurrency: int = Field(
+        default=5,
+        validation_alias=AliasChoices("ATRIUM_CHAT_REPLY_WORKER_CONCURRENCY", "CHAT_REPLY_WORKER_CONCURRENCY"),
+    )
+    department_worker_concurrency: int = Field(
+        default=5,
+        validation_alias=AliasChoices("ATRIUM_DEPARTMENT_WORKER_CONCURRENCY", "DEPARTMENT_WORKER_CONCURRENCY"),
+    )
     max_handoff_depth: int = 5
     max_consult_rounds: int = 3
     max_handoff_rejects: int = 2

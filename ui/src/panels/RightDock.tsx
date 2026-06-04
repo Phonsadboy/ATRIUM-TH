@@ -7,6 +7,7 @@ import { Avatar, Dot, withAlpha } from '../components/primitives'
 import { Icon } from '../components/Icon'
 import { ChatPanel } from './ChatPanel'
 import { DeptTasks } from './DeptTasks'
+import { ExecutiveWorkMonitor } from './ExecutiveWorkMonitor'
 import { MemoryViewer } from './MemoryViewer'
 import { ACCENT_HEX, STATE_HEX, STATE_LABEL } from '../lib/visuals'
 import {
@@ -28,6 +29,7 @@ import type { AiProviderId, ModelId, ProviderAuthReferenceResponse, ProviderAuth
 
 const TABS: { id: RightTab; label: string }[] = [
   { id: 'chat', label: 'สนทนา' },
+  { id: 'watch', label: 'ติดตาม' },
   { id: 'tasks', label: 'งาน' },
   { id: 'memory', label: 'ความจำ' },
 ]
@@ -159,6 +161,11 @@ export function RightDock() {
     }
   }
 
+  const targetIsExec = isExec(targetId)
+  useEffect(() => {
+    if (!targetIsExec && rightTab === 'watch') setRightTab('chat')
+  }, [rightTab, setRightTab, targetIsExec])
+
   if (isDesktop && dockCollapsed) {
     return <PanelStrip label="สนทนา" dir="open-left" onExpand={() => toggleDock(false)} />
   }
@@ -178,6 +185,7 @@ export function RightDock() {
 
   const accentHex = ACCENT_HEX[dept.accent]
   const exec = isExec(dept.id)
+  const tabs = exec ? TABS : TABS.filter((tab) => tab.id !== 'watch')
   const provider = AI_PROVIDERS[dept.providerId]
   const model = MODELS[dept.model]
   const thinkingEffort = THINKING_EFFORTS[dept.thinkingEffort]
@@ -488,7 +496,7 @@ export function RightDock() {
           className="flex gap-1 rounded-xl p-1"
           style={{ background: 'var(--color-surface)', border: '1px solid var(--color-line-soft)' }}
         >
-          {TABS.map((t) => {
+          {tabs.map((t) => {
             const on = rightTab === t.id
             return (
               <button
@@ -524,6 +532,7 @@ export function RightDock() {
             placeholder={placeholder}
           />
         )}
+        {rightTab === 'watch' && exec && <ExecutiveWorkMonitor />}
         {rightTab === 'tasks' && <DeptTasks deptId={exec ? null : dept.id} />}
         {rightTab === 'memory' && <MemoryViewer deptId={dept.id} accent={dept.accent} />}
       </div>

@@ -158,6 +158,7 @@ const EMPTY_STATE: CompanyState = {
   activity: [],
   approvals: [],
   objectives: [],
+  executiveQueue: [],
   budget: { dailyCapUsd: 500, spentTodayUsd: 0 },
 }
 
@@ -536,6 +537,9 @@ export class ApiClient implements CompanyClient {
   assignTask = (input: AssignTaskInput): Task => {
     const id = input.id ?? uid('task')
     const now = Date.now()
+    const reviewIntervalMs = input.reviewIntervalMs && input.reviewIntervalMs > 0
+      ? Math.max(60_000, input.reviewIntervalMs)
+      : null
     const task: Task = {
       id,
       title: input.title,
@@ -556,9 +560,24 @@ export class ApiClient implements CompanyClient {
       subTaskIds: [],
       deadlineAt: input.deadlineAt ?? null,
       result: null,
+      reviewIntervalMs,
+      nextReviewAt: reviewIntervalMs ? now + reviewIntervalMs : null,
+      lastReviewReminderAt: null,
+      reviewReminderCount: 0,
+      reviewScheduleToken: reviewIntervalMs ? uid('rev') : null,
     }
     this.setState({ ...this.state, tasks: [...this.state.tasks, task], now })
     this.command(() => this.request('/api/tasks', 'POST', { ...input, id }))
+    return task
+  }
+
+  updateTaskReviewSchedule = async (taskId: string, reviewIntervalMs: number | null): Promise<Task> => {
+    const task = await this.request<Task>(
+      `/api/tasks/${encodeURIComponent(taskId)}/review-schedule`,
+      'PATCH',
+      { reviewIntervalMs },
+    )
+    await this.refresh()
     return task
   }
 
@@ -1214,7 +1233,7 @@ export class ApiClient implements CompanyClient {
       const arr = this.serverThreads[m.threadId] ?? []
       return !arr.some((x) => !!m.clientMessageId && x.clientMessageId === m.clientMessageId)
     })
-    this.setState({ ...server, threads: this.mergedThreads() })
+    this.setState({ ...server, executiveQueue: server.executiveQueue ?? [], threads: this.mergedThreads() })
   }
 
   private patchDeptLocal(departmentId: string, patch: EditDepartmentInput): void {

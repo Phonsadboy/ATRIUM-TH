@@ -96,12 +96,20 @@ from .provider.base import LLMMessage, LLMResult, LLMStreamEvent, LLMToolCall
 from .provider.registry import get_provider
 from .scheduling import cadence_interval_ms, repair_trigger_schedule
 from .seed import EXEC_ID
-from .threads import is_exec, thread_id_for
+from .task_review import (
+    TASK_REVIEW_REMINDER_KIND,
+    TASK_TERMINAL_STATUSES,
+    enqueue_task_review_reminder,
+    normalize_review_interval_ms,
+    review_interval_label,
+)
+from .threads import EXEC_THREAD, is_exec, thread_id_for
 
 MAX_ACTIVITY = 80
 MAX_TRIGGER_CATCH_UP_RUNS = 8
 _TRIGGER_ENQUEUE_LOCK = asyncio.Lock()
 DEDICATED_WORKER_JOB_KINDS = {"image_generation", "trigger_run"}
+CHAT_REPLY_DEFER_COLLISION_MS = 750
 BUDGET_NEAR_CAP_RATIO = 0.8
 EXECUTIVE_SUMMARY_INTERVAL_MS = 60 * 60_000
 EXECUTIVE_SUMMARY_JITTER_MS = 15 * 60_000
@@ -169,6 +177,20 @@ _ENGINE_RUNTIME: dict[str, Any] = {
     "lastTickStats": None,
     "lastError": None,
     "lastErrorAt": None,
+}
+_CHAT_REPLY_WORKER_RUNTIME: dict[str, Any] = {
+    "concurrency": 0,
+    "inFlight": 0,
+    "lastStartedAt": None,
+    "lastFinishedAt": None,
+    "lastBatchStarted": 0,
+}
+_DEPARTMENT_WORKER_RUNTIME: dict[str, Any] = {
+    "concurrency": 0,
+    "inFlight": 0,
+    "lastStartedAt": None,
+    "lastFinishedAt": None,
+    "lastBatchStarted": 0,
 }
 
 
@@ -244,6 +266,22 @@ def engine_runtime_snapshot(settings: Settings | None = None) -> dict[str, Any]:
         "tickSeconds": settings.tick_seconds,
         "jobTimeoutS": settings.engine_job_timeout_s,
         "tickTimeoutS": settings.engine_tick_timeout_s,
+        "chatReplyWorker": {
+            **_CHAT_REPLY_WORKER_RUNTIME,
+            "configuredConcurrency": _bounded_worker_concurrency(
+                getattr(settings, "chat_reply_worker_concurrency", 1),
+                default=1,
+                ceiling=20,
+            ),
+        },
+        "departmentWorker": {
+            **_DEPARTMENT_WORKER_RUNTIME,
+            "configuredConcurrency": _bounded_worker_concurrency(
+                getattr(settings, "department_worker_concurrency", 1),
+                default=1,
+                ceiling=20,
+            ),
+        },
     }
 
 AUTONOMY_IDEAS: dict[str, list[str]] = {
@@ -507,7 +545,9 @@ def _department_system(dept: dict[str, Any], purpose: str, memory_context: str =
         base = (
             f"คุณคือ {dept['agentName']} ผู้บริหารของบริษัท AI ATRIUM. "
             "คุณขับเคลื่อนบริษัทแบบ always-on: แตกงาน มอบหมาย ตรวจคุณภาพ จัดลำดับความเสี่ยง "
-            "และสรุปความคืบหน้าอย่างตรวจสอบย้อนหลังได้."
+            "และสรุปความคืบหน้าอย่างตรวจสอบย้อนหลังได้. "
+            "ในการคุยจริงครั้งแรกกับเจ้าของ ให้ถามว่าอยากให้ผู้บริหารคนนี้ชื่ออะไร; "
+            "เมื่อเจ้าของบอกชื่อ ให้ใช้ tool rename_self เพื่อบันทึกชื่อนั้นเป็นชื่อของตัวเองก่อนทำงานต่อ."
         )
     else:
         base = (
@@ -1054,7 +1094,9 @@ def _chat_system_prompt(dept: dict[str, Any], memory_context: str = "") -> str:
         base = (
             f"คุณคือ {dept['agentName']} ผู้บริหารของบริษัท AI ATRIUM. "
             "หน้าที่คือรับโจทย์จากผู้ใช้ แตกงาน มอบหมายงาน ตรวจคุณภาพ และสรุปกลับเป็นภาษาไทยที่ชัดเจน. "
-            "ตอบให้กระชับ มีเหตุผล และพร้อมนำไปปฏิบัติ."
+            "ตอบให้กระชับ มีเหตุผล และพร้อมนำไปปฏิบัติ. "
+            "ในการคุยจริงครั้งแรกกับเจ้าของ ให้ถามว่าอยากให้ผู้บริหารคนนี้ชื่ออะไร; "
+            "เมื่อเจ้าของบอกชื่อ ให้ใช้ tool rename_self เพื่อบันทึกชื่อนั้นเป็นชื่อของตัวเองก่อนทำงานต่อ."
         )
     else:
         base = (
@@ -1185,6 +1227,86 @@ async def _add_chat_system_line(
         "message": msg,
     })
     return msg
+
+
+def _task_watch_flow(dept: dict[str, Any], task: dict[str, Any], event: str) -> dict[str, Any]:
+    return {
+        "kind": "department_work",
+        "title": f"ฝ่าย{dept.get('name', dept.get('id'))}: {task.get('title')}",
+        "steps": [
+            {
+                "kind": event,
+                "label": event.replace("_", " "),
+                "departmentId": dept.get("id"),
+                "taskId": task.get("id"),
+            }
+        ],
+        "refs": {
+            "departmentId": dept.get("id"),
+            "threadId": thread_id_for(str(dept.get("id") or "")),
+            "taskId": task.get("id"),
+            "status": task.get("status"),
+            "progress": task.get("progress"),
+        },
+    }
+
+
+async def _add_executive_watch_line(
+    repo: Repo,
+    dept: dict[str, Any],
+    task: dict[str, Any] | None,
+    text: str,
+    *,
+    event: str,
+    severity: str = "info",
+    now: int | None = None,
+) -> None:
+    if is_exec(str(dept.get("id") or "")):
+        return
+    flow = _task_watch_flow(dept, task, event) if task else {
+        "kind": "department_work",
+        "title": f"ฝ่าย{dept.get('name', dept.get('id'))}",
+        "steps": [{"kind": event, "label": event.replace("_", " "), "departmentId": dept.get("id")}],
+        "refs": {"departmentId": dept.get("id"), "threadId": thread_id_for(str(dept.get("id") or ""))},
+    }
+    await _add_chat_system_line(
+        repo,
+        EXEC_THREAD,
+        text,
+        department_id=str(dept.get("id") or ""),
+        flow=flow,
+        severity=severity,
+    )
+
+
+async def _add_executive_department_reply_line(
+    repo: Repo,
+    dept: dict[str, Any],
+    reply: dict[str, Any],
+    *,
+    task: dict[str, Any] | None = None,
+    now: int | None = None,
+) -> None:
+    status = str(reply.get("status") or "sent")
+    if status == "sent":
+        label = "ตอบกลับแล้ว"
+        severity = "good"
+    elif status in {"failed", "blocked", "cancelled"}:
+        label = "ตอบกลับไม่สำเร็จ"
+        severity = "warn"
+    else:
+        label = f"อัปเดตสถานะ {status}"
+        severity = "info"
+    text = _clip_text(str(reply.get("text") or ""), 360) or "-"
+    await _add_executive_watch_line(
+        repo,
+        dept,
+        task,
+        f"ฝ่าย{dept.get('name', dept.get('id'))} {label}ในห้องแผนก: {text}",
+        event="department_reply",
+        severity=severity,
+        now=now,
+    )
 
 
 async def _tool_activity_lines(
@@ -1653,7 +1775,7 @@ async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int)
         result = None
         runtime_system = (
             f"{system}\n\n{chat_tool_system_instructions(departments, turn_dept)}"
-            if runtime_tools and (deferred_wake or likely_needs_chat_tools(str(user_msg.get("text") or "")))
+            if runtime_tools
             else system
         )
         use_agent_runtime = _uses_agent_runtime_for_chat(settings, turn_dept)
@@ -1787,6 +1909,9 @@ async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int)
     reply, summary = await _apply_thread_cost(repo, thread_id, reply)
     usage["threadUsd"] = summary["totalUsd"]
     await repo.update_message(reply)
+    if not is_exec(dept["id"]):
+        current_task = await repo.get_task(str(dept.get("currentTaskId"))) if dept.get("currentTaskId") else None
+        await _add_executive_department_reply_line(repo, dept, reply, task=current_task, now=now)
     if deferred_wake and deferred_wake.get("id"):
         await repo.put_entity(
             "deferred_chat_wake",
@@ -2149,6 +2274,69 @@ async def _enqueue_due_triggers(repo: Repo, now: int) -> int:
         return count
 
 
+async def _process_task_review_reminder_job(repo: Repo, payload: dict[str, Any], now: int) -> None:
+    task_id = str(payload.get("taskId") or "").strip()
+    if not task_id:
+        return
+    task = await repo.get_task(task_id)
+    if not task or task.get("status") in TASK_TERMINAL_STATUSES:
+        return
+    token = str(payload.get("reviewScheduleToken") or "").strip()
+    if token != str(task.get("reviewScheduleToken") or "").strip():
+        return
+    interval_ms = normalize_review_interval_ms(task.get("reviewIntervalMs"))
+    if not interval_ms:
+        return
+    next_review_at = int(task.get("nextReviewAt") or 0)
+    if next_review_at > now + 5_000:
+        await enqueue_task_review_reminder(repo, task, now=now)
+        return
+
+    dept = await repo.get_department(str(task.get("departmentId") or ""))
+    if not dept:
+        return
+    progress = max(0.0, min(1.0, float(task.get("progress") or 0.0)))
+    status = str(task.get("status") or "assigned")
+    label = review_interval_label(interval_ms)
+    text = (
+        f"ถึงรอบตรวจงานทุก {label}: ฝ่าย{dept.get('name')}ยังมีงาน “{task.get('title')}” "
+        f"สถานะ {status} คืบหน้า {round(progress * 100)}% ผู้บริหารควรเปิดดูและสานงานต่อถ้าจำเป็น"
+    )
+    await _add_executive_watch_line(
+        repo,
+        dept,
+        task,
+        text,
+        event="task_review_reminder",
+        severity="warn" if status in {"blocked", "review"} else "info",
+        now=now,
+    )
+    await _notify(
+        repo,
+        type_="digest",
+        severity="warn" if status in {"blocked", "review"} else "info",
+        title=f"ถึงรอบตรวจงาน: {task.get('title')}",
+        body=text,
+        now=now,
+        links=[f"atrium://task/{task_id}", f"atrium://department/{dept['id']}"],
+    )
+    task["lastReviewReminderAt"] = now
+    task["reviewReminderCount"] = int(task.get("reviewReminderCount") or 0) + 1
+    task["nextReviewAt"] = now + interval_ms
+    task["updatedAt"] = now
+    task.setdefault("log", []).append(f"ปลุกผู้บริหารตรวจงานตามรอบ {label}")
+    await repo.save_task(task)
+    await repo.add_activity(_activity(
+        f"ปลุกผู้บริหารตรวจงาน “{task.get('title')}” ของฝ่าย{dept.get('name')}",
+        type_="task_progress",
+        department_id=dept["id"],
+        severity="warn" if status in {"blocked", "review"} else "info",
+        ts=now,
+    ))
+    await enqueue_task_review_reminder(repo, task, now=now)
+    hub.pulse({"kind": "state", "departmentId": dept["id"], "taskId": task_id})
+
+
 async def _process_due_job(repo: Repo, job, now: int) -> None:
     if job.kind == "objective_run":
         payload = job.payload or {}
@@ -2311,6 +2499,8 @@ async def _process_due_job(repo: Repo, job, now: int) -> None:
             await enqueue_org_lifecycle(repo, run_after=now + delay_ms)
     elif job.kind == "chat_reply":
         await _process_chat_reply_job(repo, job.payload or {}, now)
+    elif job.kind == TASK_REVIEW_REMINDER_KIND:
+        await _process_task_review_reminder_job(repo, job.payload or {}, now)
     elif job.kind == "telegram_outbound":
         from .telegram_gateway import process_telegram_outbound_job
 
@@ -2336,12 +2526,153 @@ async def _claim_due_jobs(
     exclude_kinds: set[str] | None = None,
 ) -> list[Any]:
     async with _JOB_CLAIM_LOCK:
-        jobs = await repo.due_jobs(now, limit=limit, kind=kind, exclude_kinds=exclude_kinds)
-        for job in jobs:
-            await repo.mark_job(job.id, "running")
+        claim_due_jobs = getattr(repo, "claim_due_jobs", None)
+        if callable(claim_due_jobs):
+            jobs = await claim_due_jobs(now, limit=limit, kind=kind, exclude_kinds=exclude_kinds)
+        else:
+            jobs = await repo.due_jobs(now, limit=limit, kind=kind, exclude_kinds=exclude_kinds)
+            for job in jobs:
+                await repo.mark_job(job.id, "running")
         if jobs:
             await commit_and_release(repo.s)
         return jobs
+
+
+def _bounded_worker_concurrency(value: Any, *, default: int, ceiling: int) -> int:
+    try:
+        raw = int(value)
+    except (TypeError, ValueError):
+        raw = default
+    return max(1, min(ceiling, raw or default))
+
+
+def _job_record(job: Any) -> SimpleNamespace:
+    return SimpleNamespace(
+        id=str(getattr(job, "id", "")),
+        kind=str(getattr(job, "kind", "")),
+        payload=dict(getattr(job, "payload", None) or {}),
+    )
+
+
+def _chat_job_department_id(job: Any) -> str:
+    payload = dict(getattr(job, "payload", None) or {})
+    return str(payload.get("departmentId") or EXEC_ID)
+
+
+def _partition_parallel_chat_jobs(
+    jobs: list[SimpleNamespace],
+    *,
+    limit: int,
+    busy_department_ids: set[str] | None = None,
+) -> tuple[list[SimpleNamespace], list[SimpleNamespace]]:
+    busy = set(busy_department_ids or set())
+    runnable: list[SimpleNamespace] = []
+    deferred: list[SimpleNamespace] = []
+    for job in jobs:
+        dept_id = _chat_job_department_id(job)
+        if len(runnable) >= limit or dept_id in busy:
+            deferred.append(job)
+            continue
+        runnable.append(job)
+        busy.add(dept_id)
+    return runnable, deferred
+
+
+async def _claim_due_job_records(
+    now: int,
+    *,
+    kind: str,
+    limit: int,
+    exclude_kinds: set[str] | None = None,
+) -> list[SimpleNamespace]:
+    async with session_scope() as s:
+        repo = Repo(s)
+        jobs = await _claim_due_jobs(repo, now, limit=limit, kind=kind, exclude_kinds=exclude_kinds)
+        return [_job_record(job) for job in jobs]
+
+
+async def _requeue_claimed_job_records(records: list[SimpleNamespace], *, delay_ms: int) -> None:
+    if not records:
+        return
+    run_after = now_ms() + max(1, int(delay_ms))
+    async with session_scope() as s:
+        repo = Repo(s)
+        for job in records:
+            await repo.mark_job(job.id, "queued", run_after=run_after)
+
+
+async def _running_chat_reply_department_ids() -> set[str]:
+    async with session_scope() as s:
+        repo = Repo(s)
+        jobs = await repo.active_jobs(limit=500)
+    return {
+        str((job.get("payload") or {}).get("departmentId") or EXEC_ID)
+        for job in jobs
+        if job.get("kind") == "chat_reply" and job.get("status") == "running"
+    }
+
+
+async def _process_claimed_job_record(job: SimpleNamespace, settings: Settings | None = None) -> int:
+    settings = settings or get_settings()
+    timeout_s = max(1.0, float(settings.engine_job_timeout_s))
+    async with session_scope() as s:
+        repo = Repo(s)
+        try:
+            await asyncio.wait_for(_process_due_job(repo, job, now_ms()), timeout=timeout_s)
+            await repo.mark_job(job.id, "done")
+            return 1
+        except _RetryJobLater as exc:
+            await repo.mark_job(job.id, "queued", error=exc.reason, run_after=now_ms() + exc.delay_ms)
+        except asyncio.TimeoutError:
+            await repo.mark_job(job.id, "failed", error=f"TimeoutError: job exceeded {timeout_s:g}s")
+        except Exception as exc:  # pragma: no cover - defensive runtime path
+            await repo.mark_job(job.id, "failed", error=f"{type(exc).__name__}: {exc}")
+    return 0
+
+
+async def _start_available_chat_reply_jobs(
+    in_flight: dict[asyncio.Task[int], SimpleNamespace],
+    settings: Settings,
+) -> int:
+    concurrency = _bounded_worker_concurrency(
+        getattr(settings, "chat_reply_worker_concurrency", 1),
+        default=1,
+        ceiling=20,
+    )
+    available = max(0, concurrency - len(in_flight))
+    started = 0
+    if available:
+        busy_department_ids = {
+            *{_chat_job_department_id(job) for job in in_flight.values()},
+            *await _running_chat_reply_department_ids(),
+        }
+        claim_limit = max(available, available * 3)
+        claimed = await _claim_due_job_records(
+            now_ms(),
+            kind="chat_reply",
+            limit=claim_limit,
+        )
+        runnable, deferred = _partition_parallel_chat_jobs(
+            claimed,
+            limit=available,
+            busy_department_ids=busy_department_ids,
+        )
+        await _requeue_claimed_job_records(
+            deferred,
+            delay_ms=CHAT_REPLY_DEFER_COLLISION_MS,
+        )
+        for job in runnable:
+            task = asyncio.create_task(_process_claimed_job_record(job, settings))
+            in_flight[task] = job
+        started = len(runnable)
+
+    _CHAT_REPLY_WORKER_RUNTIME.update({
+        "concurrency": concurrency,
+        "inFlight": len(in_flight),
+        "lastStartedAt": now_ms() if started else _CHAT_REPLY_WORKER_RUNTIME.get("lastStartedAt"),
+        "lastBatchStarted": started,
+    })
+    return started
 
 
 async def _process_due_jobs(
@@ -2372,41 +2703,60 @@ async def _process_due_jobs(
 
 
 async def run_chat_reply_loop(settings: Settings | None = None) -> None:
-    while True:
-        await _engine_sleep(0.5)
-        try:
-            settings = get_settings()
-            async with session_scope() as s:
-                repo = Repo(s)
-                # Explicit chat replies should not freeze just because the
-                # autonomous company engine is paused from the UI.
-                processed = await _process_due_jobs(
-                    repo,
-                    now_ms(),
-                    settings,
-                    kind="chat_reply",
-                    limit=3,
-                )
-                processed += await _process_due_jobs(
-                    repo,
-                    now_ms(),
-                    settings,
-                    kind="telegram_outbound",
-                    limit=6,
-                )
-                processed += await _process_due_jobs(
-                    repo,
-                    now_ms(),
-                    settings,
-                    kind="telegram_progress",
-                    limit=6,
-                )
-                if processed:
-                    hub.mark_dirty()
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            await _record_engine_loop_error(exc, now_ms())
+    in_flight: dict[asyncio.Task[int], SimpleNamespace] = {}
+    try:
+        while True:
+            await _engine_sleep(0.5)
+            try:
+                settings = get_settings()
+                finished = 0
+                for task in [task for task in in_flight if task.done()]:
+                    in_flight.pop(task, None)
+                    try:
+                        finished += int(task.result() or 0)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:  # pragma: no cover - defensive runtime path
+                        await _record_engine_loop_error(exc, now_ms())
+
+                started = await _start_available_chat_reply_jobs(in_flight, settings)
+                if finished:
+                    _CHAT_REPLY_WORKER_RUNTIME.update({
+                        "inFlight": len(in_flight),
+                        "lastFinishedAt": now_ms(),
+                    })
+
+                async with session_scope() as s:
+                    repo = Repo(s)
+                    # Explicit chat replies should not freeze just because the
+                    # autonomous company engine is paused from the UI.
+                    processed = finished
+                    processed += await _process_due_jobs(
+                        repo,
+                        now_ms(),
+                        settings,
+                        kind="telegram_outbound",
+                        limit=6,
+                    )
+                    processed += await _process_due_jobs(
+                        repo,
+                        now_ms(),
+                        settings,
+                        kind="telegram_progress",
+                        limit=6,
+                    )
+                    if processed or started:
+                        hub.mark_dirty()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                await _record_engine_loop_error(exc, now_ms())
+    finally:
+        for task in in_flight:
+            task.cancel()
+        if in_flight:
+            await asyncio.gather(*in_flight.keys(), return_exceptions=True)
+        _CHAT_REPLY_WORKER_RUNTIME.update({"inFlight": 0})
 
 
 def _image_generation_timeout_s(settings: Settings) -> float | None:
@@ -3071,6 +3421,15 @@ async def approve_task_close_request(
         severity="good",
         ts=now,
     ))
+    await _add_executive_watch_line(
+        repo,
+        dept,
+        task,
+        f"ฝ่าย{dept.get('name', dept['id'])}ปิดงานสำเร็จ: “{task['title']}”",
+        event="task_done",
+        severity="good",
+        now=now,
+    )
     hub.pulse({"kind": "done", "departmentId": dept["id"]})
     return True
 
@@ -3127,6 +3486,15 @@ async def reject_task_close_request(
         severity="warn",
         ts=now,
     ))
+    await _add_executive_watch_line(
+        repo,
+        dept,
+        task,
+        f"ผู้บริหารส่งงานกลับให้ฝ่าย{dept.get('name', dept['id'])}แก้ต่อ: “{task['title']}” · {note}",
+        event="task_revising",
+        severity="warn",
+        now=now,
+    )
     hub.pulse({"kind": "state", "departmentId": dept["id"]})
     return True
 
@@ -3660,6 +4028,15 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
                 severity="warn",
                 ts=now,
             ))
+            await _add_executive_watch_line(
+                repo,
+                dept,
+                task,
+                f"ฝ่าย{dept.get('name', dept['id'])}ติดปัญหาในงาน “{task['title']}”: {log_line}",
+                event="task_blocked",
+                severity="warn",
+                now=now,
+            )
             hub.pulse({"kind": "state", "departmentId": dept["id"]})
             return True
         task["status"] = "review" if task["progress"] >= 1 or status == "review" else "in_progress"
@@ -3667,6 +4044,15 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
         if task["status"] == "review":
             dept["state"] = "review"
             await repo.add_activity(_activity(f"“{task['title']}” พร้อมตรวจแล้ว", type_="task_progress", department_id=dept["id"], ts=now))
+            await _add_executive_watch_line(
+                repo,
+                dept,
+                task,
+                f"ฝ่าย{dept.get('name', dept['id'])}ทำงาน “{task['title']}” ถึงจุดรอตรวจแล้ว: {log_line}",
+                event="task_review",
+                severity="good",
+                now=now,
+            )
             hub.pulse({"kind": "state", "departmentId": dept["id"]})
         else:
             await repo.add_activity(_activity(
@@ -3675,6 +4061,15 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
                 department_id=dept["id"],
                 ts=now,
             ))
+            await _add_executive_watch_line(
+                repo,
+                dept,
+                task,
+                f"ฝ่าย{dept.get('name', dept['id'])}คืบหน้า {round(task['progress'] * 100)}% ในงาน “{task['title']}”: {log_line}",
+                event="task_progress",
+                severity="info",
+                now=now,
+            )
         dept["mood"] = _clamp(float(dept.get("mood", 0.7)) - 0.004, 0.15, 1)
         await repo.save_department(dept)
         return True
@@ -3795,6 +4190,15 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
             department_id=dept["id"],
             ts=now,
         ))
+        await _add_executive_watch_line(
+            repo,
+            dept,
+            open_task,
+            f"ฝ่าย{dept.get('name', dept['id'])}เริ่มทำงาน “{open_task['title']}”",
+            event="task_started",
+            severity="good",
+            now=now,
+        )
         hub.pulse({"kind": "state", "departmentId": dept["id"]})
         return True
 
@@ -3833,6 +4237,15 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
             severity="good",
             ts=now,
         ))
+        await _add_executive_watch_line(
+            repo,
+            dept,
+            task,
+            f"ฝ่าย{dept.get('name', dept['id'])}ริเริ่มงานเอง: “{task['title']}”",
+            event="task_autonomous",
+            severity="good",
+            now=now,
+        )
         hub.pulse({"kind": "autonomous", "departmentId": dept["id"]})
         return True
 
@@ -3841,6 +4254,76 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
         await repo.save_department(dept)
         return True
 
+    return changed
+
+
+async def _advance_department_in_session(
+    dept_id: str,
+    *,
+    departments: list[dict[str, Any]],
+    now: int,
+) -> bool:
+    async with session_scope() as s:
+        repo = Repo(s)
+        dept = await repo.get_department(dept_id)
+        if not dept or is_exec(str(dept.get("id") or "")):
+            return False
+        tasks = await repo.list_active_tasks(limit=1000)
+        return await _advance_department(repo, dept, tasks, departments, now)
+
+
+async def _advance_departments_parallel(
+    departments: list[dict[str, Any]],
+    now: int,
+    settings: Settings | None = None,
+) -> int:
+    settings = settings or get_settings()
+    targets = [dept for dept in departments if not is_exec(str(dept.get("id") or ""))]
+    if not targets:
+        _DEPARTMENT_WORKER_RUNTIME.update({
+            "concurrency": _bounded_worker_concurrency(
+                getattr(settings, "department_worker_concurrency", 1),
+                default=1,
+                ceiling=20,
+            ),
+            "inFlight": 0,
+            "lastBatchStarted": 0,
+        })
+        return 0
+    concurrency = _bounded_worker_concurrency(
+        getattr(settings, "department_worker_concurrency", 1),
+        default=1,
+        ceiling=20,
+    )
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def run_one(dept: dict[str, Any]) -> bool:
+        async with semaphore:
+            return await _advance_department_in_session(str(dept["id"]), departments=departments, now=now)
+
+    started_at = now_ms()
+    _DEPARTMENT_WORKER_RUNTIME.update({
+        "concurrency": concurrency,
+        "inFlight": len(targets),
+        "lastStartedAt": started_at,
+        "lastBatchStarted": len(targets),
+    })
+    try:
+        results = await asyncio.gather(*(run_one(dept) for dept in targets), return_exceptions=True)
+    finally:
+        _DEPARTMENT_WORKER_RUNTIME.update({
+            "inFlight": 0,
+            "lastFinishedAt": now_ms(),
+        })
+    changed = 0
+    for result in results:
+        if isinstance(result, asyncio.CancelledError):
+            raise result
+        if isinstance(result, Exception):
+            await _record_engine_loop_error(result, now_ms())
+            continue
+        if result:
+            changed += 1
     return changed
 
 
@@ -3968,18 +4451,10 @@ async def run_engine_tick(
             changed = changed or bool(stats["objectiveJobs"] or stats["triggerJobs"] or stats["jobs"])
 
             departments = await repo.list_departments()
-            tasks = await repo.list_active_tasks(limit=1000)
-            for dept in departments:
-                if is_exec(dept["id"]):
-                    continue
-                _set_engine_phase(
-                    "advance_department",
-                    dept=dept,
-                    task=_task_by_id(tasks, dept.get("currentTaskId")),
-                )
-                if await _advance_department(repo, dept, tasks, departments, now):
-                    stats["departments"] += 1
-                    changed = True
+            _set_engine_phase("advance_departments_parallel")
+            await commit_and_release(repo.s)
+            stats["departments"] = await _advance_departments_parallel(departments, now, settings)
+            changed = changed or bool(stats["departments"])
 
             _set_engine_phase("knowledge_debt")
             if await _record_knowledge_debt_notifications(repo, departments, now):

@@ -280,6 +280,17 @@ class TelegramChannelGatewayTest(unittest.IsolatedAsyncioTestCase):
                 },
             }
             repo.messages[reply["id"]] = reply
+            await repo.put_entity(
+                "telegram_progress_message",
+                {
+                    "id": reply["id"],
+                    "replyMessageId": reply["id"],
+                    "threadId": "executive",
+                    "chatId": "555",
+                    "progressMessageId": "100",
+                    "updatedAt": 2,
+                },
+            )
             sent_payloads: list[dict] = []
 
             async def fake_sender(bot_token, payload, settings):
@@ -303,8 +314,10 @@ class TelegramChannelGatewayTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(first["status"], "sent")
             self.assertEqual(second["status"], "duplicate")
             self.assertEqual(len(sent_payloads), 1)
+            self.assertEqual(sent_payloads[0]["payload"]["channelReply"]["progressMessageId"], "100")
             updated = repo.messages[reply["id"]]
             self.assertEqual(updated["channelReply"]["status"], "sent")
+            self.assertEqual(updated["channelReply"]["progressMessageId"], "100")
 
     async def test_outbound_failure_records_receipt_and_queues_retry(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -399,14 +412,20 @@ class TelegramChannelGatewayTest(unittest.IsolatedAsyncioTestCase):
                 },
             }
             repo.messages[reply["id"]] = reply
+            api_calls: list[tuple[str, dict]] = []
+
+            def fake_api(bot_token, method, body):
+                del bot_token
+                api_calls.append((method, body))
+                return {"ok": True, "result": {"message_id": 100}}
 
             with (
                 mock.patch.object(telegram_gateway, "get_settings", return_value=settings),
                 mock.patch.object(
                     telegram_gateway,
                     "_telegram_api_request",
-                    return_value={"ok": True, "result": {"message_id": 100}},
-                ) as sent,
+                    side_effect=fake_api,
+                ),
             ):
                 result = await telegram_gateway.process_telegram_progress_job(
                     repo,
@@ -419,9 +438,86 @@ class TelegramChannelGatewayTest(unittest.IsolatedAsyncioTestCase):
                 )
 
             self.assertEqual(result["status"], "typing_rescheduled")
-            self.assertEqual(sent.call_args.args[1], "sendChatAction")
-            self.assertEqual(sent.call_args.args[2]["action"], "typing")
+            self.assertEqual([method for method, _ in api_calls], ["sendChatAction", "sendMessage"])
+            self.assertEqual(api_calls[0][1]["action"], "typing")
+            self.assertIn("ATRIUM กำลังทำงาน", api_calls[1][1]["text"])
+            self.assertEqual(repo.messages[reply["id"]]["channelReply"]["progressMessageId"], "100")
+            self.assertEqual(repo.entities[("telegram_progress_message", reply["id"])]["progressMessageId"], "100")
             self.assertEqual(repo.jobs[-1]["kind"], "telegram_progress")
+            self.assertEqual(repo.jobs[-1]["payload"]["channelReply"]["progressMessageId"], "100")
+
+    async def test_progress_job_edits_existing_progress_message_with_partial_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FakeRepo()
+            settings = _settings(tmp)
+            reply = {
+                "id": "msg_reply",
+                "threadId": "executive",
+                "pending": True,
+                "status": "sending",
+                "text": "กำลังร่างคำตอบส่วนแรก",
+                "channelReply": {
+                    "provider": "telegram",
+                    "chatId": "555",
+                    "replyToTelegramMessageId": "42",
+                    "progressMessageId": "100",
+                },
+            }
+            repo.messages[reply["id"]] = reply
+            api_calls: list[tuple[str, dict]] = []
+
+            def fake_api(bot_token, method, body):
+                del bot_token
+                api_calls.append((method, body))
+                return {"ok": True, "result": {"message_id": 100}}
+
+            with (
+                mock.patch.object(telegram_gateway, "get_settings", return_value=settings),
+                mock.patch.object(telegram_gateway, "_telegram_api_request", side_effect=fake_api),
+            ):
+                result = await telegram_gateway.process_telegram_progress_job(
+                    repo,
+                    {
+                        "replyMessageId": reply["id"],
+                        "threadId": "executive",
+                        "expiresAt": 20_000,
+                    },
+                    10_000,
+                )
+
+            self.assertEqual(result["status"], "typing_rescheduled")
+            self.assertEqual([method for method, _ in api_calls], ["sendChatAction", "editMessageText"])
+            self.assertEqual(api_calls[1][1]["message_id"], 100)
+            self.assertIn("กำลังร่างคำตอบส่วนแรก", api_calls[1][1]["text"])
+            self.assertEqual(repo.jobs[-1]["payload"]["channelReply"]["progressMessageId"], "100")
+
+    async def test_send_telegram_payload_edits_progress_message_into_final_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = _settings(tmp)
+            payload = {
+                "text": "คำตอบสุดท้าย",
+                "attachments": [],
+                "channelReply": {
+                    "provider": "telegram",
+                    "chatId": "555",
+                    "replyToTelegramMessageId": "42",
+                    "progressMessageId": "100",
+                },
+            }
+            api_calls: list[tuple[str, dict]] = []
+
+            def fake_api(bot_token, method, body):
+                del bot_token
+                api_calls.append((method, body))
+                return {"ok": True, "result": {"message_id": 100}}
+
+            with mock.patch.object(telegram_gateway, "_telegram_api_request", side_effect=fake_api):
+                result = await telegram_gateway.send_telegram_payload("123:test-token", payload, settings)
+
+            self.assertTrue(result["ok"])
+            self.assertEqual([method for method, _ in api_calls], ["sendChatAction", "editMessageText"])
+            self.assertEqual(api_calls[1][1]["message_id"], 100)
+            self.assertEqual(api_calls[1][1]["text"], "คำตอบสุดท้าย")
 
 
 if __name__ == "__main__":

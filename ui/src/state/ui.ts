@@ -4,7 +4,7 @@ import {
   type OfficeBackgroundId,
 } from '../office/backgrounds'
 
-export type RightTab = 'chat' | 'tasks' | 'memory'
+export type RightTab = 'chat' | 'watch' | 'tasks' | 'memory'
 export type MobileSection = 'depts' | 'office' | 'detail'
 
 /** Sections of the operations Console (the big workspace overlay). */

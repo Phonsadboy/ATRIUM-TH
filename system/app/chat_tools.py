@@ -54,7 +54,7 @@ from .mcp_local import (
 from .provider.base import LLMMessage, LLMResult, LLMToolCall
 from .schema import Artifact, ArtifactVersion, Decision, Meeting, Notification, Trigger
 from .scheduling import cadence_from_schedule_object, next_run_for_cadence, resolve_trigger_cadence
-from .threads import EXEC_ID, dept_id_from_thread, is_exec, thread_id_for
+from .threads import EXEC_ID, EXEC_THREAD, dept_id_from_thread, is_exec, thread_id_for
 from .tools.foundry import custom_tool_catalog_row, execute_custom_tool
 from .tools.host_bridge import HostBridge
 from .tools.visual_bridge import (
@@ -181,6 +181,10 @@ ACTION_KEYWORDS = (
     "playbook",
     "lesson",
     "preference",
+    "name",
+    "rename",
+    "display name",
+    "agent name",
     "evidence",
     "critique",
     "shell",
@@ -238,6 +242,10 @@ ACTION_KEYWORDS = (
     "เพลย์บุ๊ก",
     "บทเรียน",
     "ความชอบ",
+    "ชื่อ",
+    "ตั้งชื่อ",
+    "เปลี่ยนชื่อ",
+    "เรียกชื่อ",
     "ตั้งเวลา",
     "รอ",
     "พัก",
@@ -448,6 +456,8 @@ def chat_tool_system_instructions(departments: list[dict[str, Any]], active_dept
         "If the owner asks to change Telegram defaults, ask concise setup choices before calling the tool. "
         "Prefer storing Telegram channel policy through connect_telegram_gateway instead of asking the user to edit .env. "
         "If a Telegram gateway URL is configured or provided, connect it; otherwise verify and store the token as local gateway auth. "
+        "For the executive's first real conversation, ask what name the owner wants you to use for yourself. "
+        "When the owner gives or changes that executive name, call rename_self so your durable agentName is updated before continuing. "
         "Executive and departments each have separate user-visible chat rooms. Do not assume another room's transcript is in your prompt. "
         "Before deciding whether another agent is idle, busy, processing, or blocked, call list_agent_statuses. "
         "To wake, ping, or casually talk to another department/executive agent, call nudge_agent; it writes a visible message into that agent's room and can queue the target to answer when the engine is enabled. "
@@ -550,6 +560,27 @@ def chat_tool_definitions(departments: list[dict[str, Any]], active_dept: dict[s
     if provider_env_keys:
         provider_env_key_schema["enum"] = provider_env_keys
     return [
+        *([{
+            "name": "rename_self",
+            "description": (
+                "Executive-only tool to change the executive agent's own durable display name. "
+                "Use after the owner says what they want to call the executive, especially during the first conversation."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": "New executive agent display name requested by the owner.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Short reason or owner instruction that triggered the rename.",
+                    },
+                },
+                "required": ["name"],
+            },
+        }] if is_exec(active_dept["id"]) else []),
         {
             "name": "propose_org_plan",
             "description": "Create an onboarding org chart and apply it immediately in Full Auto with audit records.",
@@ -2656,6 +2687,8 @@ async def _dispatch_chat_tool(
     thread_id: str,
     requested_by: str,
 ) -> dict[str, Any]:
+    if tool == "rename_self":
+        return await _rename_self_tool(repo, args, active_dept)
     if tool == "propose_org_plan":
         return await _propose_org_plan_tool(repo, args, active_dept)
     if tool == "create_department":
@@ -6175,6 +6208,61 @@ async def _run_owner_tool_tool(repo: Repo, args: dict[str, Any], active_dept: di
     }
 
 
+def _normalize_agent_display_name(raw: Any) -> str:
+    name = re.sub(r"\s+", " ", str(raw or "")).strip()
+    if not name:
+        raise ValueError("name is required")
+    if len(name) > 120:
+        raise ValueError("name must be 120 characters or fewer")
+    return name
+
+
+async def _rename_self_tool(repo: Repo, args: dict[str, Any], active_dept: dict[str, Any]) -> dict[str, Any]:
+    if not is_exec(active_dept["id"]):
+        raise ValueError("rename_self is only available to the executive agent")
+    new_name = _normalize_agent_display_name(
+        args.get("name")
+        or args.get("agentName")
+        or args.get("agent_name")
+        or args.get("newName")
+        or args.get("new_name")
+    )
+    dept = await repo.get_department(active_dept["id"])
+    if not dept:
+        raise ValueError("executive department not found")
+    previous_name = str(dept.get("agentName") or dept.get("name") or dept["id"])
+    if previous_name == new_name:
+        return {
+            "ok": True,
+            "tool": "rename_self",
+            "summary": f"executive name is already {new_name}",
+            "previousName": previous_name,
+            "newName": new_name,
+            "changed": False,
+            "department": dept,
+        }
+    dept["agentName"] = new_name
+    active_dept["agentName"] = new_name
+    await repo.save_department(dept)
+    await repo.add_activity(_activity(
+        f"tool rename_self: ผู้บริหารเปลี่ยนชื่อจาก {previous_name} เป็น {new_name}",
+        type_="system",
+        department_id=dept["id"],
+        severity="good",
+    ))
+    hub.pulse({"kind": "state", "departmentId": dept["id"], "reason": "rename_self"})
+    hub.mark_dirty()
+    return {
+        "ok": True,
+        "tool": "rename_self",
+        "summary": f"renamed executive from {previous_name} to {new_name}",
+        "previousName": previous_name,
+        "newName": new_name,
+        "changed": True,
+        "department": dept,
+    }
+
+
 async def _create_department_tool(repo: Repo, args: dict[str, Any], active_dept: dict[str, Any]) -> dict[str, Any]:
     name = str(args.get("name") or "").strip()[:120]
     role = str(args.get("role") or "").strip()[:240]
@@ -6385,6 +6473,39 @@ async def _wake_department_for_new_task(
         severity="good",
         ts=now,
     ))
+    if (task.get("origin") or {}).get("kind") == "executive":
+        msg = system_chat_message(
+            EXEC_THREAD,
+            f"ฝ่าย{dept.get('name', dept['id'])}เริ่มทำงานทันทีหลังรับมอบหมาย: “{task['title']}”",
+            department_id=dept["id"],
+            flow={
+                "kind": "department_work",
+                "title": f"ฝ่าย{dept.get('name', dept.get('id'))}: {task.get('title')}",
+                "steps": [{
+                    "kind": "task_started",
+                    "label": "task started",
+                    "departmentId": dept.get("id"),
+                    "taskId": task.get("id"),
+                }],
+                "refs": {
+                    "departmentId": dept.get("id"),
+                    "threadId": thread_id_for(str(dept.get("id") or "")),
+                    "taskId": task.get("id"),
+                    "status": task.get("status"),
+                    "progress": task.get("progress"),
+                },
+            },
+            severity="good",
+            ts=now,
+        )
+        await repo.add_message(msg)
+        hub.pulse({
+            "kind": "chat_activity",
+            "threadId": EXEC_THREAD,
+            "msgId": msg["id"],
+            "departmentId": dept["id"],
+            "message": msg,
+        })
     return True
 
 

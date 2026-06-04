@@ -11,6 +11,7 @@ import math
 from typing import Any, Optional
 
 from sqlalchemy import case, delete, func, select, text, update
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..atrium_domain import system_chat_message
@@ -26,6 +27,7 @@ from ..chat_rendering import ensure_rendering_metadata
 from ..config import get_settings
 from ..ids import uid
 from ..memory.graph_store import get_graph_mirror
+from ..task_review import TASK_REVIEW_REMINDER_KIND
 from ..threads import EXEC_ID, EXEC_THREAD, thread_id_for
 from . import tables as T
 
@@ -43,6 +45,7 @@ CHAT_VISIBLE_ACTIVITY_TYPES = {
     "task_done",
     "task_progress",
 }
+EXECUTIVE_QUEUE_KINDS = {"chat_reply", TASK_REVIEW_REMINDER_KIND, "objective_run", "trigger_run"}
 
 
 def _canonical_chat_thread_id(thread_id: str) -> str:
@@ -83,6 +86,77 @@ def _compact_task_for_snapshot(task: dict[str, Any]) -> dict[str, Any]:
             if key in result
         }
     return out
+
+
+def _job_queue_title(kind: str, payload: dict[str, Any]) -> str:
+    if payload.get("queueTitle"):
+        return _clip_snapshot_text(payload.get("queueTitle"), 160)
+    if kind == "chat_reply":
+        dept_id = str(payload.get("departmentId") or EXEC_ID)
+        target = "ผู้บริหาร" if dept_id == EXEC_ID else f"ฝ่าย {dept_id}"
+        return f"ตอบแชต: {target}"
+    if kind == TASK_REVIEW_REMINDER_KIND:
+        return f"ปลุกตรวจงาน: {payload.get('taskTitle') or payload.get('taskId') or 'งาน'}"
+    if kind == "objective_run":
+        return f"Objective: {payload.get('title') or payload.get('objectiveId') or 'งานตามรอบ'}"
+    if kind == "trigger_run":
+        event = payload.get("event")
+        return f"Trigger{f' {event}' if event else ''}: {payload.get('title') or payload.get('triggerId') or 'งานอัตโนมัติ'}"
+    return kind
+
+
+def _job_queue_detail(kind: str, payload: dict[str, Any]) -> str | None:
+    if kind == "chat_reply":
+        return _clip_snapshot_text(payload.get("text"), 220)
+    if kind == TASK_REVIEW_REMINDER_KIND:
+        return _clip_snapshot_text(payload.get("taskTitle"), 220)
+    detail = payload.get("detail") or payload.get("event") or payload.get("target")
+    return _clip_snapshot_text(detail, 220) if detail else None
+
+
+def _queue_item_from_job(row: T.Job) -> dict[str, Any]:
+    payload = dict(row.payload or {})
+    return {
+        "id": row.id,
+        "kind": row.kind,
+        "status": row.status,
+        "title": _job_queue_title(row.kind, payload),
+        "detail": _job_queue_detail(row.kind, payload),
+        "departmentId": payload.get("departmentId"),
+        "threadId": payload.get("threadId"),
+        "taskId": payload.get("taskId"),
+        "userMessageId": payload.get("userMessageId"),
+        "replyMessageId": payload.get("replyMessageId"),
+        "runAfter": row.run_after,
+        "priority": row.priority,
+        "attempts": row.attempts,
+        "lastError": row.last_error,
+        "createdAt": row.created_at,
+        "updatedAt": row.updated_at,
+    }
+
+
+def _queue_item_from_close_approval(approval: dict[str, Any]) -> dict[str, Any]:
+    action = approval.get("action") if isinstance(approval.get("action"), dict) else {}
+    title = str(approval.get("title") or "ตรวจปิดงาน").replace("อนุมัติปิดงาน:", "ตรวจปิดงาน:")
+    return {
+        "id": approval.get("id"),
+        "kind": "task_close_review",
+        "status": "queued",
+        "title": _clip_snapshot_text(title, 160),
+        "detail": _clip_snapshot_text(approval.get("detail"), 220),
+        "departmentId": approval.get("departmentId") or action.get("departmentId"),
+        "threadId": thread_id_for(EXEC_ID),
+        "taskId": action.get("taskId"),
+        "userMessageId": None,
+        "replyMessageId": None,
+        "runAfter": int(approval.get("ts") or now_ms()),
+        "priority": 15,
+        "attempts": 0,
+        "lastError": None,
+        "createdAt": int(approval.get("ts") or now_ms()),
+        "updatedAt": int(approval.get("ts") or now_ms()),
+    }
 
 
 def _compact_handoff_for_snapshot(handoff: dict[str, Any]) -> dict[str, Any]:
@@ -1939,6 +2013,44 @@ class Repo:
         rows = (await self.s.execute(q)).scalars().all()
         return list(rows)
 
+    async def claim_due_jobs(
+        self,
+        now: int,
+        limit: int = 8,
+        kind: str | None = None,
+        exclude_kinds: set[str] | None = None,
+    ) -> list[T.Job]:
+        """Atomically move due queued jobs to running and return the claimed rows."""
+        q = (
+            select(T.Job.id)
+            .where(T.Job.status == "queued", T.Job.run_after <= now)
+            .order_by(T.Job.priority, T.Job.run_after)
+            .limit(limit)
+        )
+        if kind:
+            q = q.where(T.Job.kind == kind)
+        if exclude_kinds:
+            q = q.where(T.Job.kind.not_in(sorted(exclude_kinds)))
+        if get_settings().is_postgres:
+            q = q.with_for_update(skip_locked=True)
+        ids = [str(row_id) for row_id in (await self.s.execute(q)).scalars().all()]
+        if not ids:
+            return []
+        claimed: list[T.Job] = []
+        claim_now = now_ms()
+        for job_id in ids:
+            result = await self.s.execute(
+                update(T.Job)
+                .where(T.Job.id == job_id, T.Job.status == "queued")
+                .values(status="running", updated_at=claim_now)
+            )
+            if int(result.rowcount or 0) != 1:
+                continue
+            row = await self.s.get(T.Job, job_id)
+            if row:
+                claimed.append(row)
+        return claimed
+
     async def mark_job(self, job_id: str, status: str, error: Optional[str] = None, run_after: Optional[int] = None) -> None:
         row = await self.s.get(T.Job, job_id)
         if not row:
@@ -2031,6 +2143,37 @@ class Repo:
             }
             for row in rows
         ]
+
+    async def executive_queue(self, limit: int = 30) -> list[dict[str, Any]]:
+        rows = (
+            await self.s.execute(
+                select(T.Job)
+                .where(T.Job.status.in_(("queued", "running")), T.Job.kind.in_(sorted(EXECUTIVE_QUEUE_KINDS)))
+                .order_by(T.Job.status.desc(), T.Job.priority, T.Job.run_after, T.Job.created_at)
+                .limit(limit)
+            )
+        ).scalars().all()
+        approval_rows = (
+            await self.s.execute(
+                select(T.Approval)
+                .where(T.Approval.status == "pending")
+                .order_by(T.Approval.ts)
+                .limit(limit)
+            )
+        ).scalars().all()
+        approval_items = [
+            _queue_item_from_close_approval(row.data or {})
+            for row in approval_rows
+            if ((row.data or {}).get("action") or {}).get("action") == "close_task"
+        ]
+        items = [*[_queue_item_from_job(row) for row in rows], *approval_items]
+        items.sort(key=lambda item: (
+            0 if item.get("status") == "running" else 1,
+            int(item.get("priority") or 0),
+            int(item.get("runAfter") or 0),
+            int(item.get("createdAt") or 0),
+        ))
+        return items[:limit]
 
     async def get_job(self, job_id: str) -> dict[str, Any] | None:
         row = await self.s.get(T.Job, job_id)
@@ -2141,7 +2284,12 @@ class Repo:
     # ---------- snapshot ----------
 
     async def snapshot(self) -> dict:
-        await self.reconcile_chat_reply_placeholders(limit=200)
+        try:
+            await self.reconcile_chat_reply_placeholders(limit=200)
+        except OperationalError as exc:
+            if "database is locked" not in str(exc).lower():
+                raise
+            await self.s.rollback()
         settings = get_settings()
         company = await self.get_company()
         departments = await self.list_departments()
@@ -2162,6 +2310,7 @@ class Repo:
             "activity": await self.recent_activity(),
             "approvals": await self.snapshot_approvals(settings.state_approval_count_limit),
             "objectives": await self.list_objectives(),
+            "executiveQueue": await self.executive_queue(limit=30),
             "budget": await self.get_budget(),
             "permissionPolicy": await self.get_permission_policy(),
         }

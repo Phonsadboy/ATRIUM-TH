@@ -118,6 +118,10 @@ https://github.com/Phonsadboy/ATRIUM-TH.git
 5. สร้าง system/.env สำหรับ full stack
    - เข้า ~/Projects/ai-company/system
    - ถ้า system/.env ยังไม่มี ให้ copy จาก template: cp .env.example .env
+   - ก่อนตั้งค่า concurrency ให้ถามผู้ใช้ว่าอยากให้ ATRIUM รันงานพร้อมกันกี่งาน พร้อมอธิบายว่า:
+     ATRIUM_CHAT_REPLY_WORKER_CONCURRENCY คือจำนวน reply จากห้องแผนกที่รันพร้อมกันได้
+     ATRIUM_DEPARTMENT_WORKER_CONCURRENCY คือจำนวนงาน/review step อัตโนมัติของแผนกที่ engine ทำพร้อมกันในแต่ละ tick
+     ถ้าไม่แน่ใจให้ใช้ค่า default 5; ถ้า Mac สเปคแรงอาจเลือก 10-20 ได้ตามสมควร แต่จะใช้ CPU, RAM และ provider quota/API มากขึ้น
    - แก้หรือเติมค่า full stack เหล่านี้:
      ATRIUM_AGENT_BACKEND=letta
      ATRIUM_DATABASE_URL=postgresql+asyncpg://atrium:atrium@127.0.0.1:5432/atrium
@@ -132,6 +136,8 @@ https://github.com/Phonsadboy/ATRIUM-TH.git
      ATRIUM_LETTA_BASE_URL=http://127.0.0.1:8283
      ATRIUM_OBJECT_STORE_ENABLED=true
      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+     ATRIUM_CHAT_REPLY_WORKER_CONCURRENCY=5
+     ATRIUM_DEPARTMENT_WORKER_CONCURRENCY=5
    - ถ้ามี OpenAI Platform API key ให้ผู้ใช้ใส่เอง:
      ATRIUM_OPENAI_API_KEY=...
      ATRIUM_OPENAI_BASE_URL=https://api.openai.com/v1
@@ -344,6 +350,10 @@ Install steps:
 5. Create system/.env for full stack
    - Go to ~/Projects/ai-company/system
    - If system/.env does not exist, run: cp .env.example .env
+   - Before setting concurrency, ask the user how many ATRIUM jobs they want to run at the same time and explain:
+     ATRIUM_CHAT_REPLY_WORKER_CONCURRENCY is the number of department chat replies that may run concurrently
+     ATRIUM_DEPARTMENT_WORKER_CONCURRENCY is the number of autonomous department work/review steps the engine may run concurrently per tick
+     If unsure, use the default 5; a stronger Mac may reasonably use 10-20, but higher values consume more CPU, RAM, and provider quota/API capacity
    - Add or update these full-stack settings:
      ATRIUM_AGENT_BACKEND=letta
      ATRIUM_DATABASE_URL=postgresql+asyncpg://atrium:atrium@127.0.0.1:5432/atrium
@@ -358,6 +368,8 @@ Install steps:
      ATRIUM_LETTA_BASE_URL=http://127.0.0.1:8283
      ATRIUM_OBJECT_STORE_ENABLED=true
      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+     ATRIUM_CHAT_REPLY_WORKER_CONCURRENCY=5
+     ATRIUM_DEPARTMENT_WORKER_CONCURRENCY=5
    - If using OpenAI Platform API key, ask the user to enter:
      ATRIUM_OPENAI_API_KEY=...
      ATRIUM_OPENAI_BASE_URL=https://api.openai.com/v1

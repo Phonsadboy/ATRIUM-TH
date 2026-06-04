@@ -466,6 +466,128 @@ def _tool_call_input(raw: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _loose_string_value(raw: str, key: str, *, terminator_keys: tuple[str, ...] = ()) -> str | None:
+    marker = re.search(rf'"{re.escape(key)}"\s*:\s*"', raw)
+    if not marker:
+        return None
+    start = marker.end()
+    end: int | None = None
+    if terminator_keys:
+        keys = "|".join(re.escape(item) for item in terminator_keys)
+        terminator = re.search(rf'"\s*,\s*"(?:{keys})"\s*:', raw[start:], flags=re.DOTALL)
+        if terminator:
+            end = start + terminator.start()
+    if end is None:
+        idx = start
+        escaped = False
+        while idx < len(raw):
+            char = raw[idx]
+            if char == "\\" and not escaped:
+                escaped = True
+                idx += 1
+                continue
+            if char == '"' and not escaped:
+                end = idx
+                break
+            escaped = False
+            idx += 1
+    if end is None:
+        return None
+    value = raw[start:end]
+    with contextlib.suppress(Exception):
+        parsed = json.loads(f'"{value}"')
+        if isinstance(parsed, str):
+            return parsed
+    return (
+        value
+        .replace("\\n", "\n")
+        .replace("\\r", "\r")
+        .replace("\\t", "\t")
+        .replace('\\"', '"')
+        .replace("\\/", "/")
+        .replace("\\\\", "\\")
+    )
+
+
+def _extract_loose_tool_calls(text: str, tools: list[dict[str, Any]] | None) -> list[LLMToolCall]:
+    allowed = _available_tool_names(tools)
+    if not allowed or not any(marker in text for marker in ('"tool_calls"', '"toolCalls"', '"function_calls"', '"functionCalls"')):
+        return []
+    matches = [
+        match
+        for match in re.finditer(r'"name"\s*:\s*"([^"]+)"', text)
+        if match.group(1).strip() in allowed
+    ]
+    calls: list[LLMToolCall] = []
+    seen: set[tuple[str, str]] = set()
+    terminators = (
+        "targetDepartmentId",
+        "target_department_id",
+        "departmentId",
+        "department_id",
+        "threadId",
+        "thread_id",
+        "authorName",
+        "requestedBy",
+        "message",
+        "title",
+        "detail",
+        "kind",
+    )
+    scalar_keys = (
+        "targetDepartmentId",
+        "target_department_id",
+        "departmentId",
+        "department_id",
+        "threadId",
+        "thread_id",
+        "method",
+        "path",
+        "query",
+        "title",
+        "kind",
+        "name",
+        "reason",
+    )
+    for idx, match in enumerate(matches):
+        name = match.group(1).strip()
+        start = text.rfind("{", 0, match.start())
+        if start < 0:
+            start = match.start()
+        next_start = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+        segment = text[start:next_start]
+        before_name = text[start:match.start()]
+        call_id = _loose_string_value(before_name, "id") or _loose_string_value(before_name, "tool_call_id")
+        if not call_id:
+            call_id = f"claude_code_call_{len(calls) + 1}"
+        input_start = segment.find('"input"')
+        input_segment = segment[input_start:] if input_start >= 0 else segment
+        input_data: dict[str, Any] = {}
+        message_text = _loose_string_value(input_segment, "text", terminator_keys=terminators)
+        if message_text is not None:
+            input_data["text"] = message_text.strip()
+        content = _loose_string_value(input_segment, "content", terminator_keys=terminators)
+        if content is not None:
+            input_data["content"] = content.strip()
+        detail = _loose_string_value(input_segment, "detail", terminator_keys=terminators)
+        if detail is not None:
+            input_data["detail"] = detail.strip()
+        for key in scalar_keys:
+            if key in input_data:
+                continue
+            value = _loose_string_value(input_segment, key)
+            if value is not None:
+                input_data[key] = value.strip()
+        if not input_data:
+            continue
+        dedupe = (call_id, name)
+        if dedupe in seen:
+            continue
+        seen.add(dedupe)
+        calls.append(LLMToolCall(id=call_id, name=name, input=input_data))
+    return calls
+
+
 def _extract_tool_calls(text: str, tools: list[dict[str, Any]] | None) -> list[LLMToolCall]:
     allowed = _available_tool_names(tools)
     if not allowed:
@@ -483,7 +605,7 @@ def _extract_tool_calls(text: str, tools: list[dict[str, Any]] | None) -> list[L
                 continue
             seen.add(key)
             calls.append(LLMToolCall(id=call_id, name=name, input=_tool_call_input(item)))
-    return calls
+    return calls or _extract_loose_tool_calls(text, tools)
 
 
 class ClaudeCodeCliProvider:

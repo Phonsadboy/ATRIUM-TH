@@ -391,14 +391,10 @@ function VideoJobCard({ job }: { job: VideoJobSummary }) {
   const [latest, setLatest] = useState<VideoJobRecord | null>(null)
   const [refreshing, setRefreshing] = useState(false)
   const [refreshError, setRefreshError] = useState('')
-  const displayed = useMemo(() => (latest ? videoJobSummaryFromRecord(job, latest) : job), [job, latest])
+  const latestForJob = latest?.id === job.jobId ? latest : null
+  const displayed = useMemo(() => (latestForJob ? videoJobSummaryFromRecord(job, latestForJob) : job), [job, latestForJob])
   const color = videoJobStatusColor(displayed.status)
   const active = Boolean(displayed.jobId && !isVideoJobTerminal(displayed.status))
-
-  useEffect(() => {
-    setLatest(null)
-    setRefreshError('')
-  }, [job.jobId])
 
   useEffect(() => {
     if (!job.jobId || isVideoJobTerminal(displayed.status)) return undefined
@@ -850,9 +846,11 @@ export function QuotePreview({ m }: { m: ChatMessage }) {
 
 /* ============================ Typing dots ============================ */
 
-export function TypingDots({ color }: { color: string }) {
+export function TypingDots({ color, label = 'กำลังคิดและเตรียมคำตอบ' }: { color: string; label?: string }) {
   return (
-    <span className="inline-flex items-center gap-1 py-1">
+    <span className="inline-flex max-w-full items-center gap-2 py-1 text-[13px] text-[var(--color-cream-dim)]">
+      <span className="min-w-0 truncate">{label}</span>
+      <span className="inline-flex shrink-0 items-center gap-1">
       {[0, 1, 2].map((i) => (
         <motion.span
           key={i}
@@ -862,6 +860,7 @@ export function TypingDots({ color }: { color: string }) {
           transition={{ duration: 0.9, repeat: Infinity, delay: i * 0.15 }}
         />
       ))}
+      </span>
     </span>
   )
 }
