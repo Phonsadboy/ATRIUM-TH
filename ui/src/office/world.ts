@@ -33,7 +33,7 @@ export const ROOM_INSET = 26 // wall padding inside a room
 const SLOT_COLS = 5
 const SLOT_ROWS = 2
 
-const OPEN_TASK_STATUSES = new Set(['backlog', 'assigned', 'in_progress', 'review', 'revising', 'blocked'])
+const OPEN_TASK_STATUSES = new Set(['backlog', 'assigned', 'in_progress', 'review', 'revising', 'waiting', 'blocked'])
 
 export interface DeptSprite {
   id: string

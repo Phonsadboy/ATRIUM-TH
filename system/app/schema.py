@@ -51,10 +51,24 @@ ThinkingEffort = Literal["off", "low", "medium", "high", "xhigh", "max"]
 ModelSpeed = Literal["standard", "fast"]
 
 TaskStatus = Literal[
-    "backlog", "assigned", "in_progress", "review", "revising", "done", "blocked", "cancelled"
+    "backlog", "assigned", "in_progress", "review", "revising", "waiting", "done", "blocked", "cancelled"
 ]
 Priority = Literal["low", "normal", "high", "urgent"]
 HandoffKind = Literal["delegate", "consult", "collaborate", "return"]
+HandoffStatus = Literal[
+    "draft",
+    "requested",
+    "accepted",
+    "in_progress",
+    "clarification_requested",
+    "missing_file",
+    "delivered",
+    "returned",
+    "rejected",
+    "escalated",
+    "closed",
+    "cancelled",
+]
 ChatRole = Literal["user", "executive", "agent", "system"]
 MessageRenderFormat = Literal["plain", "markdown"]
 MessageRenderNotice = Literal[
@@ -299,9 +313,22 @@ class Handoff(Schema):
     ts: int
     reason: str
     kind: HandoffKind
-    status: Optional[str] = None
+    status: Optional[HandoffStatus | str] = None
     depth: int = 0
+    chain_id: Optional[str] = None
+    parent_handoff_id: Optional[str] = None
+    reply_to_handoff_id: Optional[str] = None
+    last_action_at: Optional[int] = None
+    deadline_at: Optional[int] = None
+    closed_at: Optional[int] = None
+    closed_by: Optional[str] = None
+    status_reason: Optional[str] = None
+    deliverable_artifact_ids: list[str] = Field(default_factory=list)
     context_packet_ref: Optional[str] = None
+    context_packet_artifact_id: Optional[str] = None
+    context_packet_artifact_version: Optional[int] = None
+    context_packet_filename: Optional[str] = None
+    context_packet_uri: Optional[str] = None
     source_task_id: Optional[str] = None
     target_task_id: Optional[str] = None
     war_room_id: Optional[str] = None
@@ -322,6 +349,10 @@ class Task(Schema):
     handoffs: list[Handoff] = Field(default_factory=list)
     log: list[str] = Field(default_factory=list)
     waiting_on: Optional[dict[str, Any]] = None  # {dept, handoffId}
+    blocked_retry_count: Optional[int] = None
+    blocked_retry_guard: Optional[dict[str, Any]] = None
+    last_unblock_attempt_at: Optional[int] = None
+    handoff_chain_id: Optional[str] = None
     # v0.4 extension fields (additive; UI ignores unknown keys)
     project_id: Optional[str] = None
     deliverables: list[str] = Field(default_factory=list)
@@ -972,8 +1003,8 @@ class EditKnowledgeInput(Schema):
 
 ArtifactKind = Literal["file", "doc", "code", "report", "link", "memo", "dataset", "image"]
 ArtifactStatus = Literal["draft", "in_review", "approved", "published", "superseded", "archived"]
-HandoffStatus = Literal["open", "accepted", "rejected", "clarifying", "delivered", "escalated"]
-HandoffAct = Literal["request", "accept", "reject", "clarify", "reply", "deliver"]
+LegacyHandoffStatus = Literal["open", "accepted", "rejected", "clarifying", "delivered", "escalated"]
+HandoffAct = Literal["request", "accept", "reject", "clarify", "reply", "deliver", "return"]
 DecisionStatus = Literal["proposed", "approved", "rejected", "superseded"]
 NotifType = Literal[
     "approval", "budget", "blocked", "task_done", "digest", "crash", "knowledge_debt", "security"
@@ -1065,7 +1096,7 @@ class Artifact(Schema):
     created_by: str
     updated_at: int
     updated_by: str
-    approval_tier: Optional[Literal["department", "user"]] = None
+    approval_tier: Optional[Literal["department", "executive", "full_auto", "user"]] = None
     approved_by: Optional[str] = None
     approved_at: Optional[int] = None
     review_gate: Optional[dict[str, Any]] = None

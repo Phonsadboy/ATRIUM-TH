@@ -170,7 +170,20 @@ def _compact_handoff_for_snapshot(handoff: dict[str, Any]) -> dict[str, Any]:
         "kind": handoff.get("kind") or "consult",
         "status": handoff.get("status"),
         "depth": handoff.get("depth") or 0,
+        "chainId": handoff.get("chainId"),
+        "parentHandoffId": handoff.get("parentHandoffId"),
+        "replyToHandoffId": handoff.get("replyToHandoffId"),
+        "lastActionAt": handoff.get("lastActionAt"),
+        "deadlineAt": handoff.get("deadlineAt"),
+        "closedAt": handoff.get("closedAt"),
+        "closedBy": handoff.get("closedBy"),
+        "statusReason": handoff.get("statusReason"),
+        "deliverableArtifactIds": list(handoff.get("deliverableArtifactIds") or []),
         "contextPacketRef": handoff.get("contextPacketRef"),
+        "contextPacketArtifactId": handoff.get("contextPacketArtifactId"),
+        "contextPacketArtifactVersion": handoff.get("contextPacketArtifactVersion"),
+        "contextPacketFilename": handoff.get("contextPacketFilename"),
+        "contextPacketUri": handoff.get("contextPacketUri"),
         "sourceTaskId": handoff.get("sourceTaskId"),
         "targetTaskId": handoff.get("targetTaskId"),
         "warRoomId": handoff.get("warRoomId"),
@@ -322,6 +335,8 @@ def _default_tool_output_schema(name: str) -> dict[str, Any]:
         return {"type": "object", "properties": {"id": "string", "ts": "number", "author": "string?"}}
     if name == "image.generate":
         return {"type": "object", "properties": {"status": "string?", "jobId": "string?", "runId": "string?", "statusUrl": "string?", "artifact": "object?", "artifacts": "array", "locations": "array", "usage": "object?"}}
+    if name == "audio.transcribe":
+        return {"type": "object", "properties": {"status": "string", "text": "string", "textTruncated": "boolean?", "transcription": "object", "artifact": "object", "sourceArtifactId": "string?", "source": "string?"}}
     return {"type": "object", "additionalProperties": True}
 
 
@@ -424,6 +439,7 @@ TOOL_CATALOG = [
     _tool("scheduler.create", "privileged", mutates=True, executor="scheduler", description="Create a durable ATRIUM trigger; cron triggers require target plus cadence (for example every 5 minutes or ทุก 5 นาที), schedule.every/unit, or oneShotAt.", schema={"title": "string", "kind": "cron|event", "target": "string required", "cadence": "string?", "schedule": {"every": "number", "unit": "minutes|hours|days|weeks"}, "oneShotAt": "number?", "event": "string?"}),
     _tool("logs.query", "safe_read", mutates=False, executor="audit", description="Query append-only audit/log rows as a tool surface for agents.", schema={"deptId": "string?", "kind": "string?", "limit": "number?"}),
     _tool("logs.note", "local_write", mutates=True, executor="audit", description="Append a follow-up note to the audit log without modifying existing rows.", schema={"body": "string", "author": "string?", "departmentId": "string?", "links": "string[]?"}),
+    _tool("audio.transcribe", "external_send", mutates=True, external=True, executor="openai", timeout=180_000, credentials=True, description="Transcribe an audio artifact, object URI, or local sourcePath through the configured OpenAI-compatible audio transcription subsystem, persist a Markdown transcript artifact, and annotate the source artifact with audioTranscription context when available. Use artifactId for uploaded voice notes/audio files when possible.", schema={"artifactId": "string?", "sourcePath": "string?", "uri": "string?", "filename": "string?", "mime": "string?", "ownerDept": "string?", "targetDept": "string?", "projectId": "string?", "artifactName": "string?", "transcriptArtifactName": "string?", "model": "string?", "language": "string?", "prompt": "string?", "allowOAuth": "boolean?", "tags": "string[]?", "links": "string[]?"}),
     _tool("image.generate", "external_send", mutates=True, external=True, executor="openai", timeout=1_800_000, credentials=True, description="Generate image artifacts from text, or from text plus existing image artifact references/masks, using the configured OpenAI-compatible Images API. Queues by default for chat tools so agents can keep working; use asyncMode/statusUrl for background jobs or waitForResult for blocking calls. Prefer gpt-image-2; non-primary GPT image models require user approval or a prior gpt-image-2 failure. Size, quality, format, compression, background, moderation, and n are per-request parameters.", schema={"prompt": "string", "ownerDept": "string?", "threadId": "string?", "taskIds": "string[]?", "projectId": "string?", "artifactName": "string?", "requestedBy": "string?", "asyncMode": "boolean?", "waitForResult": "boolean?", "wakeOnComplete": "boolean?", "model": "gpt-image-2|gpt-image-2-2026-04-21|gpt-image-1.5|gpt-image-1|gpt-image-1-mini?", "modelOverrideApproved": "boolean?", "modelOverrideReason": "string?", "fallbackFromModel": "gpt-image-2?", "primaryModelError": "string?", "referenceArtifactIds": "string[]?", "maskArtifactId": "string?", "n": "number 1..10?", "size": "auto|WIDTHxHEIGHT?", "width": "number?", "height": "number?", "aspectRatio": "string?", "resolution": "hd|2k|4k?", "quality": "low|medium|high|auto?", "clarity": "draft|standard|final|sharp|string?", "outputFormat": "png|jpeg|webp?", "outputCompression": "number 0..100?", "background": "auto|opaque|transparent?", "moderation": "auto|low?", "tags": "string[]?"}),
 ]
 
@@ -535,7 +551,9 @@ def _handoff_involves_department(handoff: dict[str, Any], dept_id: str) -> bool:
 
 
 def _handoff_is_open(status: str | None) -> bool:
-    return status not in {"delivered", "rejected", "escalated"}
+    value = str(status or "requested").strip().lower()
+    value = {"open": "requested", "clarifying": "clarification_requested"}.get(value, value)
+    return value not in {"closed", "cancelled", "rejected", "escalated"}
 
 
 def _approval_targets_department(approval: dict[str, Any], dept_id: str) -> bool:
@@ -959,7 +977,10 @@ class Repo:
     async def thread_messages(self, thread_id: str, limit: int = MAX_MSGS) -> list[dict]:
         rows = (
             await self.s.execute(
-                select(T.Message).where(T.Message.thread_id == thread_id).order_by(T.Message.ts.desc()).limit(limit)
+                select(T.Message)
+                .where(T.Message.thread_id == thread_id)
+                .order_by(T.Message.ts.desc(), T.Message.id.desc())
+                .limit(limit)
             )
         ).scalars().all()
         return [ensure_rendering_metadata(r.data) for r in reversed(rows)]
@@ -972,13 +993,43 @@ class Repo:
         ).scalars().all()
         return [ensure_rendering_metadata(r.data) for r in rows]
 
-    async def thread_messages_after(self, thread_id: str, after_ts: int | None = None, limit: int = 200) -> list[dict]:
+    async def thread_messages_after(
+        self,
+        thread_id: str,
+        after_ts: int | None = None,
+        *,
+        after_id: str | None = None,
+        limit: int = 200,
+    ) -> list[dict]:
         q = select(T.Message).where(T.Message.thread_id == thread_id)
         if after_ts is not None:
-            q = q.where(T.Message.ts >= after_ts)
-        q = q.order_by(T.Message.ts).limit(limit)
+            if after_id:
+                q = q.where((T.Message.ts > after_ts) | ((T.Message.ts == after_ts) & (T.Message.id > after_id)))
+            else:
+                q = q.where(T.Message.ts >= after_ts)
+        q = q.order_by(T.Message.ts.asc(), T.Message.id.asc()).limit(limit)
         rows = (await self.s.execute(q)).scalars().all()
         return [ensure_rendering_metadata(r.data) for r in rows]
+
+    async def thread_messages_before(
+        self,
+        thread_id: str,
+        before_ts: int,
+        *,
+        before_id: str | None = None,
+        limit: int = 200,
+    ) -> list[dict]:
+        q = select(T.Message).where(T.Message.thread_id == thread_id)
+        if before_id:
+            q = q.where((T.Message.ts < before_ts) | ((T.Message.ts == before_ts) & (T.Message.id < before_id)))
+        else:
+            q = q.where(T.Message.ts < before_ts)
+        rows = (
+            await self.s.execute(
+                q.order_by(T.Message.ts.desc(), T.Message.id.desc()).limit(limit)
+            )
+        ).scalars().all()
+        return [ensure_rendering_metadata(r.data) for r in reversed(rows)]
 
     async def thread_messages_with_approval(self, thread_id: str, approval_id: str, limit: int = 200) -> list[dict]:
         rows = (

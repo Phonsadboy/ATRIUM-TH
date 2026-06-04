@@ -242,7 +242,7 @@ async def merge_departments(
 async def _department_idle_ms(dept: dict[str, Any], tasks: list[dict[str, Any]], now: int) -> int:
     active = [
         t for t in tasks
-        if t.get("departmentId") == dept["id"] and t.get("status") in {"assigned", "in_progress", "review", "revising"}
+        if t.get("departmentId") == dept["id"] and t.get("status") in {"assigned", "in_progress", "review", "revising", "waiting"}
     ]
     if active or dept.get("state") not in {"idle", "handoff"}:
         return 0

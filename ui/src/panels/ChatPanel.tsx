@@ -33,6 +33,17 @@ import {
 } from './chat/chatParts'
 
 const EMPTY: ChatMessage[] = []
+const HISTORY_PAGE_SIZE = 30
+
+type ThreadHistoryState = {
+  threadId: string
+  messages: ChatMessage[]
+  loadingInitial: boolean
+  loadingOlder: boolean
+  loadingNewer: boolean
+  hasMoreBefore: boolean
+  error: string | null
+}
 
 /** Split a turn's segments into the rail (everything that led up to the answer,
  *  in chronological order) and the final answer text (rendered at the very
@@ -71,6 +82,21 @@ function isToolActivityLine(m: ChatMessage): boolean {
   )
 }
 
+function isWorkStatusLine(m: ChatMessage): boolean {
+  return m.role === 'system' && (m.flow?.kind === 'department_work' || m.flow?.kind === 'handoff')
+}
+
+function workStatusTone(m: ChatMessage): string {
+  const event = String(m.flow?.refs?.event ?? '')
+  if (event.includes('blocked') || event.includes('rejected') || event.includes('revising') || event.includes('escalated')) {
+    return ACCENT_HEX.coral
+  }
+  if (event.includes('approved') || event.includes('started') || event.includes('delivered') || event.includes('review')) {
+    return ACCENT_HEX.teal
+  }
+  return m.flow?.kind === 'handoff' ? ACCENT_HEX.lavender : ACCENT_HEX.sky
+}
+
 function groupToolActivityMessages(messages: ChatMessage[]): ChatListItem[] {
   const items: ChatListItem[] = []
   let group: ChatMessage[] = []
@@ -103,6 +129,22 @@ function mergeMessages(history: ChatMessage[] | null, live: ChatMessage[]): Chat
   for (const message of history) byId.set(message.id, message)
   for (const message of live) byId.set(message.id, message)
   return [...byId.values()].sort((a, b) => a.ts - b.ts || a.id.localeCompare(b.id))
+}
+
+function compareMessages(a: ChatMessage, b: ChatMessage): number {
+  return a.ts - b.ts || a.id.localeCompare(b.id)
+}
+
+function initialHistoryState(threadId: string): ThreadHistoryState {
+  return {
+    threadId,
+    messages: [],
+    loadingInitial: true,
+    loadingOlder: false,
+    loadingNewer: false,
+    hasMoreBefore: false,
+    error: null,
+  }
 }
 
 function download(name: string, content: string, type: string) {
@@ -630,6 +672,52 @@ function MessageRow({
   const tailActive = !!m.streaming && !answer.trim()
 
   if (m.role === 'system') {
+    if (isWorkStatusLine(m)) {
+      const tone = workStatusTone(m)
+      const steps = m.flow?.steps ?? []
+      return (
+        <div id={`msg-${m.id}`} className="my-2 flex justify-center">
+          <div
+            className="min-w-0 max-w-[92%] rounded-lg px-3 py-2 text-[12px]"
+            style={{
+              background: withAlpha(tone, 0.1),
+              border: `1px solid ${withAlpha(tone, 0.28)}`,
+              color: 'var(--color-cream-dim)',
+            }}
+          >
+            <div className="flex min-w-0 items-start gap-2">
+              <span className="mt-0.5 h-2 w-2 shrink-0 rounded-full" style={{ background: tone }} />
+              <div className="min-w-0 flex-1">
+                <div className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
+                  <span className="font-medium" style={{ color: 'var(--color-cream)' }}>
+                    {m.flow?.kind === 'handoff' ? 'ส่งต่องาน' : 'สถานะงาน'}
+                  </span>
+                  <span className="min-w-0 break-words">{m.text}</span>
+                  <span className="shrink-0 opacity-70">{timeLabel(m.ts)}</span>
+                </div>
+                {steps.length > 0 && (
+                  <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1 text-[11px] text-[var(--color-cream-faint)]">
+                    {steps.map((s, i) => (
+                      <span key={`${s.kind}-${i}`} className="inline-flex min-w-0 items-center gap-1">
+                        {i > 0 && <span style={{ color: withAlpha(tone, 0.85) }}>→</span>}
+                        <span
+                          className="max-w-[160px] truncate rounded-md px-1.5 py-0.5"
+                          style={{ background: withAlpha(tone, 0.12) }}
+                          title={s.label || s.kind}
+                        >
+                          {s.label || s.kind}
+                        </span>
+                      </span>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+            <NoticeCards m={m} onResolveApproval={(id, d) => client.resolveApproval(id, d)} />
+          </div>
+        </div>
+      )
+    }
     return (
       <div id={`msg-${m.id}`} className="my-1.5">
         {m.text && (
@@ -783,6 +871,8 @@ export function ChatPanel({
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const prevLen = useRef(snapshotMessages.length)
   const seedN = useRef(0)
+  const suppressUnseenForPrepend = useRef(false)
+  const newerCursorRef = useRef<string | null>(null)
   const [atBottom, setAtBottom] = useState(true)
   const [unseen, setUnseen] = useState(0)
   const [quoted, setQuoted] = useState<ChatMessage | null>(null)
@@ -793,10 +883,11 @@ export function ChatPanel({
   const [searchOpen, setSearchOpen] = useState(false)
   const [searchQ, setSearchQ] = useState('')
   const [hits, setHits] = useState<{ id: string; snippet: string; author: string }[] | null>(null)
-  const [fullThread, setFullThread] = useState<{ threadId: string; messages: ChatMessage[] } | null>(null)
+  const [history, setHistory] = useState<ThreadHistoryState>(() => initialHistoryState(threadId))
   const setRightTab = useUI((s) => s.setRightTab)
-  const fullMessages = fullThread?.threadId === threadId ? fullThread.messages : null
-  const messages = useMemo(() => mergeMessages(fullMessages, snapshotMessages), [fullMessages, snapshotMessages])
+  const historyState = history?.threadId === threadId ? history : null
+  const historyMessages = historyState?.messages ?? null
+  const messages = useMemo(() => mergeMessages(historyMessages, snapshotMessages), [historyMessages, snapshotMessages])
 
   const busy = useMemo(() => messages.some((m) => m.pending || m.streaming), [messages])
 
@@ -810,22 +901,155 @@ export function ChatPanel({
 
   useEffect(() => {
     let live = true
+    newerCursorRef.current = null
     client
-      .getThreadMessages(threadId, true)
+      .getThreadMessages(threadId, { limit: HISTORY_PAGE_SIZE })
       .then((loaded) => {
-        if (live) setFullThread({ threadId, messages: loaded })
+        if (!live) return
+        setHistory({
+          threadId,
+          messages: loaded,
+          loadingInitial: false,
+          loadingOlder: false,
+          loadingNewer: false,
+          hasMoreBefore: loaded.length === HISTORY_PAGE_SIZE,
+          error: null,
+        })
       })
-      .catch(() => {
-        if (live) setFullThread(null)
+      .catch((err) => {
+        if (!live) return
+        setHistory({
+          threadId,
+          messages: [],
+          loadingInitial: false,
+          loadingOlder: false,
+          loadingNewer: false,
+          hasMoreBefore: false,
+          error: err instanceof Error ? err.message : String(err),
+        })
       })
     return () => {
       live = false
     }
   }, [threadId])
 
+  const restoreScrollAfterPrepend = (previousTop: number, previousHeight: number) => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const el = scrollRef.current
+        if (!el) return
+        el.scrollTop = previousTop + (el.scrollHeight - previousHeight)
+      })
+    })
+  }
+
+  const loadOlder = () => {
+    const state = historyState
+    const first = state?.messages[0] ?? messages[0]
+    if (!state || !first || state.loadingInitial || state.loadingOlder || !state.hasMoreBefore) return
+    const el = scrollRef.current
+    const previousTop = el?.scrollTop ?? 0
+    const previousHeight = el?.scrollHeight ?? 0
+    suppressUnseenForPrepend.current = true
+    setHistory((current) =>
+      current?.threadId === threadId ? { ...current, loadingOlder: true, error: null } : current,
+    )
+    client
+      .getThreadMessages(threadId, {
+        limit: HISTORY_PAGE_SIZE,
+        before: first.ts,
+        beforeId: first.id,
+      })
+      .then((older) => {
+        setHistory((current) => {
+          if (!current || current.threadId !== threadId) return current
+          return {
+            ...current,
+            messages: mergeMessages(older, current.messages),
+            loadingOlder: false,
+            hasMoreBefore: older.length === HISTORY_PAGE_SIZE,
+            error: null,
+          }
+        })
+        restoreScrollAfterPrepend(previousTop, previousHeight)
+      })
+      .catch((err) => {
+        suppressUnseenForPrepend.current = false
+        setHistory((current) =>
+          current?.threadId === threadId
+            ? {
+                ...current,
+                loadingOlder: false,
+                error: err instanceof Error ? err.message : String(err),
+              }
+            : current,
+        )
+      })
+  }
+
+  const latestHistory = historyState?.messages[historyState.messages.length - 1] ?? null
+  const latestSnapshot = snapshotMessages[snapshotMessages.length - 1] ?? null
+  useEffect(() => {
+    if (
+      !historyState ||
+      historyState.loadingInitial ||
+      historyState.loadingNewer ||
+      !latestHistory ||
+      !latestSnapshot ||
+      compareMessages(latestSnapshot, latestHistory) <= 0
+    ) {
+      return
+    }
+    const cursor = `${threadId}:${latestHistory.ts}:${latestHistory.id}`
+    if (newerCursorRef.current === cursor) return
+    newerCursorRef.current = cursor
+    setHistory((current) =>
+      current?.threadId === threadId ? { ...current, loadingNewer: true, error: null } : current,
+    )
+    let live = true
+    client
+      .getThreadMessages(threadId, {
+        limit: HISTORY_PAGE_SIZE,
+        after: latestHistory.ts,
+        afterId: latestHistory.id,
+      })
+      .then((newer) => {
+        if (!live) return
+        newerCursorRef.current = newer.length ? null : cursor
+        setHistory((current) => {
+          if (!current || current.threadId !== threadId) return current
+          return {
+            ...current,
+            messages: mergeMessages(current.messages, newer),
+            loadingNewer: false,
+            error: null,
+          }
+        })
+      })
+      .catch((err) => {
+        if (!live) return
+        setHistory((current) =>
+          current?.threadId === threadId
+            ? {
+                ...current,
+                loadingNewer: false,
+                error: err instanceof Error ? err.message : String(err),
+              }
+            : current,
+        )
+      })
+    return () => {
+      live = false
+    }
+  }, [historyState, latestHistory, latestSnapshot, threadId])
+
   useEffect(() => {
     const grew = messages.length - prevLen.current
     prevLen.current = messages.length
+    if (suppressUnseenForPrepend.current) {
+      suppressUnseenForPrepend.current = false
+      return
+    }
     // Defer to after paint so we don't setState synchronously inside the effect.
     const id = requestAnimationFrame(() => {
       if (atBottom) {
@@ -1022,10 +1246,39 @@ export function ChatPanel({
           const bottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80
           setAtBottom(bottom)
           if (bottom) setUnseen(0)
+          if (el.scrollTop < 96) loadOlder()
         }}
         className="min-h-0 flex-1 space-y-3 overflow-x-hidden overflow-y-auto px-0.5 py-1.5"
       >
-        {messages.length === 0 && (
+        {historyState?.loadingInitial && messages.length === 0 && (
+          <div className="mt-4 text-center text-[12px] text-[var(--color-cream-faint)]">กำลังโหลดประวัติ…</div>
+        )}
+
+        {messages.length > 0 && (historyState?.hasMoreBefore || historyState?.loadingOlder) && (
+          <div className="sticky top-0 z-10 flex justify-center py-1">
+            <button
+              type="button"
+              onClick={loadOlder}
+              disabled={historyState.loadingInitial || historyState.loadingOlder}
+              className="rounded-full border px-3 py-1 text-[12px] font-medium transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+              style={{
+                background: withAlpha(ACCENT_HEX[accent], 0.16),
+                borderColor: withAlpha(ACCENT_HEX[accent], 0.32),
+                color: 'var(--color-cream)',
+              }}
+            >
+              {historyState.loadingOlder ? 'กำลังโหลด…' : `โหลดก่อนหน้า ${HISTORY_PAGE_SIZE} ข้อความ`}
+            </button>
+          </div>
+        )}
+
+        {historyState?.error && (
+          <div className="rounded-xl border px-3 py-2 text-[12px] text-[var(--color-cream-faint)]" style={{ borderColor: 'var(--color-line-soft)' }}>
+            โหลดประวัติไม่สำเร็จ: {historyState.error}
+          </div>
+        )}
+
+        {messages.length === 0 && !historyState?.loadingInitial && (
           <div className="mt-8 px-1">
             <div className="text-center text-base text-[var(--color-cream-dim)]">เริ่มสนทนาได้เลย</div>
             <div className="mt-1 text-center text-[12px] text-[var(--color-cream-faint)]">พิมพ์ข้อความ หรือเลือกหัวข้อเริ่มต้นด้านล่าง</div>

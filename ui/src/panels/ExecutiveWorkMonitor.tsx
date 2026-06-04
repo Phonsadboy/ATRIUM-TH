@@ -2,21 +2,22 @@ import { useMemo } from 'react'
 import { useSelector } from '../state/useCompany'
 import { useUI } from '../state/ui'
 import { Avatar, Dot, Progress, withAlpha } from '../components/primitives'
-import { STATUS_HEX, STATUS_LABEL } from '../lib/tasks'
+import { STATUS_HEX, STATUS_LABEL, taskStatusLabel } from '../lib/tasks'
 import { threadIdFor } from '../lib/threads'
 import { ACCENT_HEX, SEVERITY_HEX, STATE_HEX, STATE_LABEL } from '../lib/visuals'
 import type { ActivityEvent, ChatMessage, ChatToolRun, Department, ExecutiveQueueItem, Task, TaskStatus } from '../contract/types'
 
-const OPEN_STATUSES = new Set<TaskStatus>(['backlog', 'assigned', 'in_progress', 'review', 'revising', 'blocked'])
+const OPEN_STATUSES = new Set<TaskStatus>(['backlog', 'assigned', 'in_progress', 'review', 'revising', 'waiting', 'blocked'])
 const TASK_RANK: Record<TaskStatus, number> = {
   blocked: 0,
-  in_progress: 1,
-  review: 2,
-  revising: 3,
-  assigned: 4,
-  backlog: 5,
-  done: 6,
-  cancelled: 7,
+  waiting: 1,
+  in_progress: 2,
+  review: 3,
+  revising: 4,
+  assigned: 5,
+  backlog: 6,
+  done: 7,
+  cancelled: 8,
 }
 
 function timeLabel(ms?: number | null): string {
@@ -64,7 +65,13 @@ function currentOrOpenTask(dept: Department, tasks: Task[]): Task | null {
   )
 }
 
-function statusSummary(dept: Department, task: Task | null, tools: ChatToolRun[], busy: ChatMessage | null): {
+function statusSummary(
+  dept: Department,
+  task: Task | null,
+  tools: ChatToolRun[],
+  busy: ChatMessage | null,
+  getName: (id: string) => string = () => '—',
+): {
   label: string
   color: string
   attention: boolean
@@ -76,6 +83,7 @@ function statusSummary(dept: Department, task: Task | null, tools: ChatToolRun[]
   if (dept.state !== 'idle') return { label: STATE_LABEL[dept.state], color: STATE_HEX[dept.state], attention: dept.state !== 'review' }
   if (!task) return { label: 'ไม่มีงานเปิด', color: STATE_HEX.idle, attention: false }
   if (task.status === 'review') return { label: 'รอผู้บริหารตรวจ', color: STATUS_HEX.review, attention: true }
+  if (task.status === 'waiting') return { label: taskStatusLabel(task, getName), color: STATUS_HEX.waiting, attention: false }
   if (task.status === 'blocked') return { label: 'งานติดปัญหา', color: STATUS_HEX.blocked, attention: true }
   if (task.status === 'assigned' || task.status === 'backlog' || task.status === 'revising') {
     return { label: 'งานเปิดแต่ยังไม่ประมวลผล', color: ACCENT_HEX.honey, attention: true }
@@ -158,14 +166,16 @@ function DepartmentWorkCard({
   activity: ActivityEvent | null
   now: number
 }) {
+  const departments = useSelector((s) => s.departments)
   const select = useUI((s) => s.select)
   const setRightTab = useUI((s) => s.setRightTab)
   const msg = latestMessage(messages)
   const tools = runningToolRuns(messages)
   const busy = activeReply(messages)
-  const status = statusSummary(dept, task, tools, busy)
+  const deptName = (id: string) => departments.find((item) => item.id === id)?.name ?? (id === 'exec' ? 'ผู้บริหาร' : id)
+  const status = statusSummary(dept, task, tools, busy, deptName)
   const latestTs = signalAge(task, msg, activity)
-  const stale = Boolean(task && OPEN_STATUSES.has(task.status) && latestTs && now - latestTs > 5 * 60_000)
+  const stale = Boolean(task && task.status !== 'waiting' && OPEN_STATUSES.has(task.status) && latestTs && now - latestTs > 5 * 60_000)
   const lastLog = task?.log?.[task.log.length - 1]
   const accent = ACCENT_HEX[dept.accent]
   const openDept = (tab: 'chat' | 'tasks' | 'memory') => {
@@ -213,7 +223,7 @@ function DepartmentWorkCard({
           <div className="flex min-w-0 items-center gap-2 text-[12px]">
             <span className="min-w-0 flex-1 truncate text-[var(--color-cream)]">{task.title}</span>
             <span className="shrink-0 rounded-full px-1.5 py-0.5 text-[10px]" style={{ color: STATUS_HEX[task.status], background: withAlpha(STATUS_HEX[task.status], 0.12) }}>
-              {STATUS_LABEL[task.status]}
+              {taskStatusLabel(task, deptName)}
             </span>
           </div>
           <Progress value={Math.max(0, Math.min(1, task.progress ?? 0))} color={accent} className="mt-2" />
@@ -263,9 +273,10 @@ export function ExecutiveWorkMonitor() {
         const msg = latestMessage(messages)
         const tools = runningToolRuns(messages)
         const busy = activeReply(messages)
-        const status = statusSummary(dept, task, tools, busy)
+        const deptName = (id: string) => departments.find((item) => item.id === id)?.name ?? (id === 'exec' ? 'ผู้บริหาร' : id)
+        const status = statusSummary(dept, task, tools, busy, deptName)
         const lastTs = signalAge(task, msg, latestActivity)
-        const stale = task && OPEN_STATUSES.has(task.status) && lastTs && now - lastTs > 5 * 60_000
+        const stale = task && task.status !== 'waiting' && OPEN_STATUSES.has(task.status) && lastTs && now - lastTs > 5 * 60_000
         const rank = stale ? 0 : status.attention ? 1 : task ? 2 : 3
         return { dept, task, messages, latestActivity, rank, lastTs }
       })

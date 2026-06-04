@@ -99,6 +99,19 @@ def agent_message_metadata(
     return out
 
 
+def operating_protocol_prompt() -> str:
+    return (
+        "\n\nATRIUM operating protocol:\n"
+        "- Every department must treat handoff context as durable work material, not as chat-only memory. "
+        "When a handoff includes contextPacketArtifactId/contextPacketFilename/contextPacketUri or deliverables, "
+        "read and continue from those versioned Markdown work packets before answering.\n"
+        "- When handing work to another department, make the reason, expected answer, and relevant work-file/artifact references explicit "
+        "so future departments created later can still understand the job after chat compaction.\n"
+        "- If your task is waiting for another department's handoff response, describe it as "
+        "รอการตอบกลับจากฝ่ายนั้น. Reserve blocked/ติดปัญหา for true inability to proceed, failed tools, guardrails, or executive escalation."
+    )
+
+
 def persona_prompt(dept: dict[str, Any]) -> str:
     skills = ", ".join(str(item) for item in (dept.get("skills") or [])[:8]) or "none"
     tools = ", ".join(str(item) for item in (dept.get("tools") or [])[:8]) or "none"
@@ -115,6 +128,7 @@ def persona_prompt(dept: dict[str, Any]) -> str:
         "- Treat only this room's visible prior messages as default context. If you are tagged, handed off, or need another room, use the conversation tools to read or send cross-room messages.\n"
         "- Stay inside this department charter. Speak as this employee, not as a generic chatbot.\n"
         "- If work should move to another department, name the target department and reason clearly."
+        f"{operating_protocol_prompt()}"
     )
 
 

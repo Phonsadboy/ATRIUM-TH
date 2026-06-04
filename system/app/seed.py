@@ -230,7 +230,7 @@ BLUEPRINTS: list[dict] = [
         "id": "qa", "name": "คุณภาพ", "role": "ตรวจสอบ · ทดสอบ · มาตรฐาน",
         "charter": "ตรวจงานทุกชิ้นก่อนส่งมอบ หาจุดบกพร่อง และรักษามาตรฐาน",
         "emoji": "🛡️", "accent": "coral", "providerId": "claude_code", "model": "claude-sonnet-4-6",
-        "thinkingEffort": "high", "agentName": "เวร่า", "state": "blocked", "mood": 0.4,
+        "thinkingEffort": "high", "agentName": "เวร่า", "state": "handoff", "mood": 0.4,
         "skills": ["ทดสอบ", "ตรวจรีวิว", "มาตรฐานคุณภาพ"], "tools": ["รันเทสต์", "ตรวจ a11y", "ติดตามบั๊ก"], "autonomy": False,
         "room": {"x": 13, "y": 11, "w": 5, "h": 4},
         "mem": {
@@ -353,8 +353,8 @@ async def _seed_tasks(repo: Repo, now: int) -> None:
          {"kind": "executive"}, 0.4, 95, ["ผู้บริหารมอบหมาย", "ทำ wireframe 3 แบบ"], []),
         ("ต่อสัญญา API ฝั่ง UI", "นิยาม type สัญญา และต่อ live client", "in_progress", "urgent", "engineering",
          {"kind": "user"}, 0.7, 60, ["เริ่มจากสัญญา type", "ต่อ live client"], []),
-        ("ตรวจรับหน้าแดชบอร์ด", "ทดสอบ edge case และการเข้าถึง", "blocked", "normal", "qa",
-         {"kind": "department", "id": "design"}, 0.25, 40, ["รับงานจากออกแบบ", "ติดปัญหา: รอ asset จากออกแบบ"],
+        ("ตรวจรับหน้าแดชบอร์ด", "ทดสอบ edge case และการเข้าถึง", "waiting", "normal", "qa",
+         {"kind": "department", "id": "design"}, 0.25, 40, ["รับงานจากออกแบบ", "รอการตอบกลับจากฝ่ายออกแบบ: asset สำหรับตรวจ visual"],
          [("design", "qa", "ดีไซน์รอบแรกพร้อมตรวจ", 35, "delegate")]),
         ("ร่างบทความเปิดตัว", "เล่าเรื่องบริษัท AI ที่ไม่เคยหลับ", "assigned", "low", "content",
          {"kind": "executive"}, 0.0, 18, ["เข้าคิวรอเริ่ม"], []),
@@ -384,8 +384,10 @@ async def _seed_tasks(repo: Repo, now: int) -> None:
             "deadlineAt": None,
             "result": {"summary": log[-1], "completedAt": _mins(now, max(0, age - 10))} if status == "done" else None,
         }
+        if status == "waiting" and ho:
+            task["waitingOn"] = {"dept": ho[0].get("fromDept"), "handoffId": ho[0].get("id")}
         await repo.save_task(task)
-        if status in ("in_progress", "review") and dept not in current_by_dept:
+        if status in ("in_progress", "review", "waiting") and dept not in current_by_dept:
             current_by_dept[dept] = tid
 
     for dept_id, tid in current_by_dept.items():
@@ -418,7 +420,7 @@ async def _seed_activity(repo: Repo, now: int) -> None:
         ev("autonomous", "content", "โซลเสนอหัวข้อคอนเทนต์ใหม่ 3 หัวข้อจากเทรนด์ล่าสุด", "info", 2),
         ev("compaction", "research", "บีบอัดความจำ: เก็บ 6 ประเด็นสำคัญ ประหยัด 33.8k โทเค็น", "good", 5),
         ev("handoff", "design", "ส่งต่องาน “ตรวจรับหน้าแดชบอร์ด” → คุณภาพ", "info", 35),
-        ev("state_change", "qa", "เวร่าติดปัญหา: รอ asset จากฝ่ายออกแบบ", "warn", 33),
+        ev("state_change", "qa", "เวร่ารอการตอบกลับจากฝ่ายออกแบบ: asset สำหรับตรวจ visual", "info", 33),
         ev("handoff", "qa", "ตีกลับงาน “แก้ดีไซน์การ์ดเมตริก” → ออกแบบ", "warn", 22),
         ev("task_progress", "strategy", "โรดแมป Q3 คืบหน้า 55%", "info", 24),
         ev("message", EXEC_ID, "ออตโต้สรุปความคืบหน้าให้ผู้ใช้", "info", 19),

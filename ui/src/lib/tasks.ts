@@ -1,4 +1,4 @@
-import type { Originator, TaskStatus } from '../contract/types'
+import type { Originator, Task, TaskStatus } from '../contract/types'
 
 export const STATUS_LABEL: Record<TaskStatus, string> = {
   backlog: 'รอคิว',
@@ -6,6 +6,7 @@ export const STATUS_LABEL: Record<TaskStatus, string> = {
   in_progress: 'กำลังทำ',
   review: 'ตรวจงาน',
   revising: 'แก้ตามรีวิว',
+  waiting: 'รอการตอบกลับ',
   done: 'เสร็จ',
   blocked: 'ติดปัญหา',
   cancelled: 'ยกเลิก',
@@ -17,6 +18,7 @@ export const STATUS_HEX: Record<TaskStatus, string> = {
   in_progress: '#57d6bf',
   review: '#f4a945',
   revising: '#e89a3c',
+  waiting: '#b3a4ee',
   done: '#7bbf8f',
   blocked: '#f0735f',
   cancelled: '#9a958c',
@@ -26,12 +28,21 @@ export const STATUS_HEX: Record<TaskStatus, string> = {
 export const BOARD_COLUMNS: TaskStatus[] = [
   'assigned',
   'in_progress',
+  'waiting',
   'review',
   'revising',
   'done',
   'blocked',
   'cancelled',
 ]
+
+export function taskStatusLabel(task: Task, getName: (id: string) => string): string {
+  if (task.status !== 'waiting') return STATUS_LABEL[task.status]
+  const waitingDept = task.waitingOn?.dept ? getName(task.waitingOn.dept) : ''
+  return waitingDept && waitingDept !== '—'
+    ? `รอการตอบกลับจากฝ่าย${waitingDept}`
+    : STATUS_LABEL.waiting
+}
 
 export function originLabel(o: Originator, getName: (id: string) => string): string {
   switch (o.kind) {

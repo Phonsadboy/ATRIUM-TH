@@ -14,7 +14,7 @@ import { SECTION_BY_ID } from './sections'
 import type { Attention } from './useAttention'
 
 const WORKING_STATES = new Set(['working', 'thinking', 'review', 'handoff'])
-const ACTIVE_TASK = new Set(['assigned', 'in_progress', 'review', 'revising'])
+const ACTIVE_TASK = new Set(['assigned', 'in_progress', 'review', 'revising', 'waiting'])
 const QUICK: ConsoleSection[] = ['projects', 'artifacts', 'tools', 'meetings', 'memory', 'audit', 'triggers', 'onboarding']
 
 function budgetHex(ratio: number): string {
@@ -44,6 +44,7 @@ export function OverviewPanel({ attention }: { attention: Attention }) {
     (s) => s.departments.filter((d) => !isExec(d.id) && WORKING_STATES.has(d.state)).length,
   )
   const activeTasks = useSelector((s) => s.tasks.filter((t) => ACTIVE_TASK.has(t.status)).length)
+  const waitingTasks = useSelector((s) => s.tasks.filter((t) => t.status === 'waiting').length)
   const blockedTasks = useSelector((s) => s.tasks.filter((t) => t.status === 'blocked').length)
 
   const setSection = useUI((s) => s.setConsoleSection)
@@ -186,7 +187,11 @@ export function OverviewPanel({ attention }: { attention: Attention }) {
               label="งานที่กำลังเดิน"
               accent={ACCENT_HEX.sky}
               value={activeTasks}
-              sub={blockedTasks > 0 ? `ติดปัญหา ${blockedTasks} งาน` : 'ไม่มีงานติดปัญหา'}
+              sub={blockedTasks > 0
+                ? `ติดปัญหา ${blockedTasks} งาน`
+                : waitingTasks > 0
+                  ? `รอการตอบกลับ ${waitingTasks} งาน`
+                  : 'ไม่มีงานติดปัญหา'}
             />
             <StatTile
               label="รอคุณตัดสินใจ"

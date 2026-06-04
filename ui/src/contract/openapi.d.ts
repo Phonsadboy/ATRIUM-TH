@@ -2781,7 +2781,7 @@ export interface components {
             /** Approvalid */
             approvalId?: string | null;
             /** Approvaltier */
-            approvalTier?: ("department" | "user") | null;
+            approvalTier?: ("department" | "executive" | "full_auto" | "user") | null;
             /** Approvedat */
             approvedAt?: number | null;
             /** Approvedby */
@@ -3718,7 +3718,7 @@ export interface components {
              * Act
              * @enum {string}
              */
-            act: "request" | "accept" | "reject" | "clarify" | "reply" | "deliver";
+            act: "request" | "accept" | "reject" | "clarify" | "reply" | "deliver" | "return";
             /** From */
             from: string;
             /** Taskid */
@@ -4503,8 +4503,26 @@ export interface components {
         };
         /** Handoff */
         Handoff: {
+            /** Chainid */
+            chainId?: string | null;
+            /** Closedat */
+            closedAt?: number | null;
+            /** Closedby */
+            closedBy?: string | null;
+            /** Contextpacketartifactid */
+            contextPacketArtifactId?: string | null;
+            /** Contextpacketartifactversion */
+            contextPacketArtifactVersion?: number | null;
+            /** Contextpacketfilename */
+            contextPacketFilename?: string | null;
             /** Contextpacketref */
             contextPacketRef?: string | null;
+            /** Contextpacketuri */
+            contextPacketUri?: string | null;
+            /** Deadlineat */
+            deadlineAt?: number | null;
+            /** Deliverableartifactids */
+            deliverableArtifactIds?: string[];
             /**
              * Depth
              * @default 0
@@ -4519,16 +4537,24 @@ export interface components {
              * @enum {string}
              */
             kind: "delegate" | "consult" | "collaborate" | "return";
+            /** Lastactionat */
+            lastActionAt?: number | null;
             /** Messages */
             messages?: {
                 [key: string]: unknown;
             }[];
+            /** Parenthandoffid */
+            parentHandoffId?: string | null;
             /** Reason */
             reason: string;
+            /** Replytohandoffid */
+            replyToHandoffId?: string | null;
             /** Sourcetaskid */
             sourceTaskId?: string | null;
             /** Status */
-            status?: string | null;
+            status?: ("draft" | "requested" | "accepted" | "in_progress" | "clarification_requested" | "missing_file" | "delivered" | "returned" | "rejected" | "escalated" | "closed" | "cancelled") | string | null;
+            /** Statusreason */
+            statusReason?: string | null;
             /** Targettaskid */
             targetTaskId?: string | null;
             /** Todept */
@@ -4544,7 +4570,7 @@ export interface components {
              * Act
              * @enum {string}
              */
-            act: "request" | "accept" | "reject" | "clarify" | "reply" | "deliver";
+            act: "request" | "accept" | "reject" | "clarify" | "reply" | "deliver" | "return";
             /** From */
             from: string;
             /** Handoffid */
@@ -5857,6 +5883,12 @@ export interface components {
         };
         /** Task */
         Task: {
+            /** Blockedretrycount */
+            blockedRetryCount?: number | null;
+            /** Blockedretryguard */
+            blockedRetryGuard?: {
+                [key: string]: unknown;
+            } | null;
             /** Createdat */
             createdAt: number;
             /** Deadlineat */
@@ -5869,12 +5901,16 @@ export interface components {
             detail: string;
             /** Draftdeliverablemarkdown */
             draftDeliverableMarkdown?: string | null;
+            /** Handoffchainid */
+            handoffChainId?: string | null;
             /** Handoffs */
             handoffs?: components["schemas"]["Handoff"][];
             /** Id */
             id: string;
             /** Lastreviewreminderat */
             lastReviewReminderAt?: number | null;
+            /** Lastunblockattemptat */
+            lastUnblockAttemptAt?: number | null;
             /** Log */
             log?: string[];
             /** Nextreviewat */
@@ -5911,7 +5947,7 @@ export interface components {
              * Status
              * @enum {string}
              */
-            status: "backlog" | "assigned" | "in_progress" | "review" | "revising" | "done" | "blocked" | "cancelled";
+            status: "backlog" | "assigned" | "in_progress" | "review" | "revising" | "waiting" | "done" | "blocked" | "cancelled";
             /** Subtaskids */
             subTaskIds?: string[];
             /** Title */
@@ -11144,7 +11180,7 @@ export interface operations {
     list_tasks_api_tasks_get: {
         parameters: {
             query?: {
-                status?: ("backlog" | "assigned" | "in_progress" | "review" | "revising" | "done" | "blocked" | "cancelled") | null;
+                status?: ("backlog" | "assigned" | "in_progress" | "review" | "revising" | "waiting" | "done" | "blocked" | "cancelled") | null;
                 departmentId?: string | null;
                 projectId?: string | null;
                 includeDetails?: boolean;
@@ -11668,6 +11704,9 @@ export interface operations {
         parameters: {
             query?: {
                 after?: number | null;
+                afterId?: string | null;
+                before?: number | null;
+                beforeId?: string | null;
                 limit?: number;
                 all?: boolean;
             };

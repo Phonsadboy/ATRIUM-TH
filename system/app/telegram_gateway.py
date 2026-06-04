@@ -1193,6 +1193,78 @@ async def _repair_completed_telegram_progress_message(
     }
 
 
+def _telegram_receipt_used_progress_final(receipt: dict[str, Any] | None) -> bool:
+    if not isinstance(receipt, dict):
+        return False
+    result = receipt.get("result") if isinstance(receipt.get("result"), dict) else {}
+    receipts = result.get("receipts") if isinstance(result.get("receipts"), list) else []
+    return any(isinstance(item, dict) and item.get("progressFinal") for item in receipts)
+
+
+async def _finalize_completed_telegram_progress_from_job(
+    repo: Repo,
+    *,
+    reply: dict[str, Any],
+    payload: dict[str, Any],
+    settings: Settings,
+    auth: dict[str, Any],
+    bot_token: str,
+) -> dict[str, Any]:
+    reply_id = str(reply.get("id") or payload.get("replyMessageId") or "")
+    thread_id = str(payload.get("threadId") or reply.get("threadId") or "") or None
+    reply_channel = reply.get("channelReply") if isinstance(reply.get("channelReply"), dict) else {}
+    payload_channel = payload.get("channelReply") if isinstance(payload.get("channelReply"), dict) else {}
+    channel_reply = _merge_telegram_channel_reply(reply_channel, payload_channel)
+    progress_record = await repo.get_entity("telegram_progress_message", reply_id)
+    if isinstance(progress_record, dict) and progress_record.get("progressMessageId"):
+        record_channel = {
+            "provider": "telegram",
+            "chatId": progress_record.get("chatId"),
+            "progressMessageId": str(progress_record["progressMessageId"]),
+            "progressUpdatedAt": progress_record.get("updatedAt"),
+        }
+        channel_reply = _merge_telegram_channel_reply(channel_reply, record_channel)
+    if channel_reply.get("provider") != "telegram" or not channel_reply.get("progressMessageId"):
+        return {"ok": True, "status": "done"}
+    target = _telegram_target(channel_reply)
+    if not target.get("chat_id"):
+        return {"ok": True, "status": "done", "reason": "missing_target"}
+    dedupe_key = str(channel_reply.get("dedupeKey") or f"telegram:reply:{reply.get('id')}")
+    receipt_id = hmac.new(b"atrium-telegram", dedupe_key.encode("utf-8"), hashlib.sha256).hexdigest()[:40]
+    existing_receipt = await repo.get_entity("telegram_outbox_receipt", receipt_id)
+    if _telegram_receipt_used_progress_final(existing_receipt):
+        return {"ok": True, "status": "done", "reason": "already_finalized"}
+    completed_reply = {
+        **reply,
+        "channelReply": channel_reply,
+    }
+    with contextlib.suppress(Exception):
+        await repo.update_message(completed_reply)
+    with contextlib.suppress(Exception):
+        await commit_and_release(repo.s)
+    try:
+        final_progress = await _repair_completed_telegram_progress_message(
+            repo,
+            bot_token=bot_token,
+            reply=completed_reply,
+            channel_reply=channel_reply,
+            settings=settings,
+            auth=auth,
+            progress_method="sendMessage" if existing_receipt and existing_receipt.get("status") == "sent" else "",
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "completed_finalize_failed",
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    return {
+        "ok": True,
+        "status": "completed_finalized",
+        "finalProgress": final_progress,
+    }
+
+
 def _multipart_body(fields: dict[str, Any], file_field: str, filename: str, data: bytes, mime: str) -> tuple[bytes, str]:
     boundary = "----atriumtelegram" + secrets.token_hex(12)
     parts: list[bytes] = []
@@ -1451,11 +1523,22 @@ async def process_telegram_progress_job(repo: Repo, payload: dict[str, Any], now
         return {"ok": False, "status": "skipped", "reason": "missing_reply"}
     thread_id = str(payload.get("threadId") or "") or None
     reply = await repo.get_message(reply_id, thread_id=thread_id)
-    if not reply or not reply.get("pending"):
+    if not reply:
         return {"ok": True, "status": "done"}
     settings = get_settings()
     auth = load_telegram_auth(settings)
     bot_token = str(auth.get("botToken") or "").strip()
+    if not reply.get("pending"):
+        if not bot_token or not _telegram_progress_messages_enabled(auth):
+            return {"ok": True, "status": "done"}
+        return await _finalize_completed_telegram_progress_from_job(
+            repo,
+            reply=reply,
+            payload=payload,
+            settings=settings,
+            auth=auth,
+            bot_token=bot_token,
+        )
     reply_channel = reply.get("channelReply") if isinstance(reply.get("channelReply"), dict) else {}
     payload_channel = payload.get("channelReply") if isinstance(payload.get("channelReply"), dict) else {}
     channel_reply = _merge_telegram_channel_reply(reply_channel, payload_channel)
@@ -1503,6 +1586,8 @@ async def process_telegram_progress_job(repo: Repo, payload: dict[str, Any], now
                     **base_reply,
                     "channelReply": channel_reply,
                 })
+                with contextlib.suppress(Exception):
+                    await commit_and_release(repo.s)
                 completed_reply = await repo.get_message(reply_id, thread_id=thread_id)
                 if completed_reply and not completed_reply.get("pending"):
                     completed_channel = completed_reply.get("channelReply") if isinstance(completed_reply.get("channelReply"), dict) else {}

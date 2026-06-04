@@ -7,13 +7,14 @@ import type { Task, TaskStatus } from '../contract/types'
 
 const RANK: Record<TaskStatus, number> = {
   blocked: 0,
-  in_progress: 1,
-  review: 2,
-  revising: 3,
-  assigned: 4,
-  backlog: 5,
-  done: 6,
-  cancelled: 7,
+  waiting: 1,
+  in_progress: 2,
+  review: 3,
+  revising: 4,
+  assigned: 5,
+  backlog: 6,
+  done: 7,
+  cancelled: 8,
 }
 
 export function DeptTasks({ deptId }: { deptId: string | null }) {

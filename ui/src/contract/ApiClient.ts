@@ -162,6 +162,15 @@ const EMPTY_STATE: CompanyState = {
   budget: { dailyCapUsd: 500, spentTodayUsd: 0 },
 }
 
+type ThreadMessagesOptions = {
+  all?: boolean
+  limit?: number
+  before?: number
+  beforeId?: string
+  after?: number
+  afterId?: string
+}
+
 function emptyMemory(departmentId: string): DepartmentMemory {
   return { departmentId, archive: [], knowledge: [], graph: { nodes: [], edges: [] } }
 }
@@ -467,11 +476,20 @@ export class ApiClient implements CompanyClient {
     limit?: number,
   ): Promise<ThreadExportResponse> =>
     this.request(`/api/threads/${encodeURIComponent(threadId)}/export${this.qs({ format, limit })}`, 'GET')
-  getThreadMessages = async (threadId: ThreadId, all = false, limit?: number): Promise<ChatMessage[]> => {
+  getThreadMessages = async (
+    threadId: ThreadId,
+    allOrOptions: boolean | ThreadMessagesOptions = false,
+    limit?: number,
+  ): Promise<ChatMessage[]> => {
+    const options: ThreadMessagesOptions =
+      typeof allOrOptions === 'boolean' ? { all: allOrOptions, limit } : allOrOptions
     try {
-      return await this.request(`/api/threads/${encodeURIComponent(threadId)}/messages${this.qs({ all, limit })}`, 'GET')
+      return await this.request(
+        `/api/threads/${encodeURIComponent(threadId)}/messages${this.qs(options)}`,
+        'GET',
+      )
     } catch (err) {
-      if (!all) throw err
+      if (!options.all) throw err
       const exported = await this.exportThread(threadId, 'json', 5000)
       const parsed = JSON.parse(exported.content) as { messages?: ChatMessage[] }
       return Array.isArray(parsed.messages) ? parsed.messages : []

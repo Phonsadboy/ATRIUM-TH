@@ -15,6 +15,7 @@ import random
 import re
 from collections.abc import Awaitable, Callable
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -26,6 +27,7 @@ from .atrium_domain import (
     meeting_context,
     meeting_id_from_thread,
     meeting_participants,
+    operating_protocol_prompt,
     persona_prompt,
     system_chat_message,
     thread_cost_summary,
@@ -78,12 +80,14 @@ from .context_budget import estimate_llm_context_tokens, model_auto_compact_cont
 from .db.base import commit_and_release, session_scope
 from .db.repo import Repo
 from .events import hub
-from .file_intake import attachments_from_tool_runs
+from .file_intake import attachments_from_tool_runs, safe_filename
 from .handoffs import (
     append_handoff_message,
+    handoff_is_open,
     handoff_chat_message,
     handoff_status_for_act,
     make_handoff_message,
+    normalize_handoff_status,
 )
 from .image_generation import RetryableImageGenerationError, mark_image_generation_job_failed, process_image_generation_job
 from .ids import uid
@@ -104,6 +108,7 @@ from .task_review import (
     review_interval_label,
 )
 from .threads import EXEC_THREAD, is_exec, thread_id_for
+from .work_visibility import emit_work_status_notice
 
 MAX_ACTIVITY = 80
 MAX_TRIGGER_CATCH_UP_RUNS = 8
@@ -140,6 +145,40 @@ DEFAULT_NOTIFICATION_DELIVERY = {
     "knowledge_debt": "inbox",
     "security": "push",
 }
+BLOCKED_RETRY_GUARD_LIMIT = 3
+BLOCKED_RETRY_GUARD_REASON = "blocked_retry_guard"
+HANDOFF_SLA_MS = 30 * 60_000
+HANDOFF_WAITING_REPLY_REASON = "handoff_reply"
+HANDOFF_MISSING_FILE_REASON = "missing_file"
+HANDOFF_CLARIFICATION_REASON = "clarification"
+HANDOFF_EXECUTIVE_REASON = "executive_decision"
+HANDOFF_RECONCILER_ENTITY_ID = "handoff_workflow_v2"
+EXECUTIVE_DECISION_ACTIONS = (
+    "ask_clarification",
+    "request_file_again",
+    "reassign_task",
+    "split_task",
+    "approve_assumption",
+    "restart_from_checkpoint",
+    "cancel_task",
+    "close_as_done",
+    "manual_owner_input_required",
+)
+BLOCKED_RETRY_MARKERS = (
+    "ยังไม่มี",
+    "ไม่มีข้อมูล",
+    "ไม่มี audit",
+    "ไม่มี response",
+    "ไม่มี sd return packet",
+    "คง blocked",
+    "คง hold",
+    "รอคำตอบ",
+    "รอการตอบกลับ",
+    "รอ handoff",
+    "รอ checkpoint",
+    "รอข้อมูล",
+    "รอหลักฐาน",
+)
 
 
 def _attach_tool_artifacts_to_message(message: dict[str, Any], tool_runs: list[dict[str, Any]] | None) -> dict[str, Any]:
@@ -559,7 +598,7 @@ def _department_system(dept: dict[str, Any], purpose: str, memory_context: str =
         )
     if memory_context:
         base += "\n\nบริบทความจำที่เกี่ยวข้อง:\n" + memory_context
-    return f"{base}\n\nภารกิจรอบนี้: {purpose}"
+    return f"{base}{operating_protocol_prompt()}\n\nภารกิจรอบนี้: {purpose}"
 
 
 async def _budget_block_reason(repo: Repo, dept: dict[str, Any], estimated_usd: float) -> str | None:
@@ -1578,6 +1617,7 @@ async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int)
     deferred_wake = payload.get("deferredWake") if isinstance(payload.get("deferredWake"), dict) else None
     image_generation_wake = payload.get("imageGenerationWake") if isinstance(payload.get("imageGenerationWake"), dict) else None
     video_job_wake = payload.get("videoJobWake") if isinstance(payload.get("videoJobWake"), dict) else None
+    nudge = payload.get("nudge") if isinstance(payload.get("nudge"), dict) else None
 
     dept = await repo.get_department(dept_id) or await repo.get_department(EXEC_ID)
     if not dept:
@@ -1972,6 +2012,30 @@ async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int)
     if not is_exec(dept["id"]):
         current_task = await repo.get_task(str(dept.get("currentTaskId"))) if dept.get("currentTaskId") else None
         await _add_executive_department_reply_line(repo, dept, reply, task=current_task, now=now)
+        if nudge or deferred_wake or image_generation_wake or video_job_wake:
+            source_dept = None
+            source_dept_id = str((nudge or {}).get("sourceDepartmentId") or "").strip()
+            if source_dept_id:
+                source_dept = await repo.get_department(source_dept_id)
+            source_thread = str((nudge or {}).get("sourceThreadId") or "").strip()
+            source_name = (
+                source_dept.get("name") or source_dept.get("agentName") or source_dept.get("id")
+                if isinstance(source_dept, dict)
+                else "ห้องต้นทาง" if source_thread else "ผู้เกี่ยวข้อง"
+            )
+            preview = _clip_text(str(reply.get("text") or ""), 280) or str(reply.get("status") or "sent")
+            await emit_work_status_notice(
+                repo,
+                event="agent_reply_finished",
+                summary=f"ฝ่าย{dept.get('name', dept['id'])}ตอบกลับ{source_name}แล้ว: {preview}",
+                source_dept=dept,
+                target_dept=source_dept,
+                task=current_task,
+                severity="good" if reply.get("status") == "sent" else "warn",
+                now=now,
+                dedupe_key=f"agent_reply_finished:{reply.get('id')}",
+                extra_threads=[source_thread] if source_thread and source_thread != thread_id else None,
+            )
     if deferred_wake and deferred_wake.get("id"):
         await repo.put_entity(
             "deferred_chat_wake",
@@ -2060,6 +2124,70 @@ def _task_by_id(tasks: list[dict[str, Any]], task_id: str | None) -> dict[str, A
     if not task_id:
         return None
     return next((task for task in tasks if task["id"] == task_id), None)
+
+
+def _blocked_retry_line_is_stale(line: Any) -> bool:
+    text = str(line or "").strip().lower()
+    return bool(text and any(marker in text for marker in BLOCKED_RETRY_MARKERS))
+
+
+def _blocked_retry_log_count(task: dict[str, Any]) -> int:
+    count = 0
+    for line in reversed(list(task.get("log") or [])[-8:]):
+        if _blocked_retry_line_is_stale(line):
+            count += 1
+            continue
+        break
+    return count
+
+
+def _blocked_retry_guard_frozen(task: dict[str, Any]) -> bool:
+    guard = task.get("blockedRetryGuard")
+    return isinstance(guard, dict) and guard.get("status") == "frozen"
+
+
+def _blocked_retry_guard_count(task: dict[str, Any]) -> int:
+    try:
+        stored = int(task.get("blockedRetryCount") or 0)
+    except (TypeError, ValueError):
+        stored = 0
+    return max(stored, _blocked_retry_log_count(task))
+
+
+def _blocked_retry_guard_active(task: dict[str, Any]) -> bool:
+    return _blocked_retry_guard_frozen(task) or _blocked_retry_guard_count(task) >= BLOCKED_RETRY_GUARD_LIMIT
+
+
+def _freeze_blocked_retry_guard(task: dict[str, Any], *, now: int, reason: str, count: int) -> bool:
+    if _blocked_retry_guard_frozen(task):
+        return False
+    task["blockedRetryCount"] = max(count, BLOCKED_RETRY_GUARD_LIMIT)
+    task["blockedRetryGuard"] = {
+        "status": "frozen",
+        "reason": _clip_text(reason, 500),
+        "count": task["blockedRetryCount"],
+        "frozenAt": now,
+        "requires": "owner_input_or_handoff_reply",
+    }
+    task["waitingOn"] = {
+        "dept": "executive",
+        "reason": BLOCKED_RETRY_GUARD_REASON,
+    }
+    task["updatedAt"] = now
+    task["log"] = [
+        *task.get("log", []),
+        "หยุดปลุกอัตโนมัติ: งาน blocked ซ้ำโดยไม่มีข้อมูลใหม่ครบ 3 รอบ รอ owner/handoff ปลดบล็อก",
+    ]
+    return True
+
+
+def _clear_blocked_retry_guard(task: dict[str, Any]) -> None:
+    task.pop("blockedRetryCount", None)
+    task.pop("blockedLastReason", None)
+    task.pop("blockedRetryGuard", None)
+    waiting_on = task.get("waitingOn")
+    if isinstance(waiting_on, dict) and waiting_on.get("reason") == BLOCKED_RETRY_GUARD_REASON:
+        task.pop("waitingOn", None)
 
 
 def _make_task(
@@ -2357,10 +2485,18 @@ async def _process_task_review_reminder_job(repo: Repo, payload: dict[str, Any],
         return
     progress = max(0.0, min(1.0, float(task.get("progress") or 0.0)))
     status = str(task.get("status") or "assigned")
+    status_text = status
+    if status == "waiting":
+        waiting_on = task.get("waitingOn") or {}
+        waiting_dept = await repo.get_department(str(waiting_on.get("dept") or ""))
+        waiting_name = waiting_dept.get("name") if waiting_dept else None
+        status_text = f"รอการตอบกลับจากฝ่าย{waiting_name}" if waiting_name else "รอการตอบกลับ"
+    elif status == "blocked":
+        status_text = "ติดปัญหา"
     label = review_interval_label(interval_ms)
     text = (
         f"ถึงรอบตรวจงานทุก {label}: ฝ่าย{dept.get('name')}ยังมีงาน “{task.get('title')}” "
-        f"สถานะ {status} คืบหน้า {round(progress * 100)}% ผู้บริหารควรเปิดดูและสานงานต่อถ้าจำเป็น"
+        f"สถานะ {status_text} คืบหน้า {round(progress * 100)}% ผู้บริหารควรเปิดดูและสานงานต่อถ้าจำเป็น"
     )
     await _add_executive_watch_line(
         repo,
@@ -3134,6 +3270,666 @@ def _artifact_content_path(dept_id: str, artifact_id: str, version: int) -> str:
     return str(path)
 
 
+def _handoff_packet_content_path(dept_id: str, artifact_id: str, filename: str) -> str:
+    path = (get_settings().workspace_dir / dept_id / "artifacts" / artifact_id / filename).resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+def _append_unique(values: list[Any] | None, value: str) -> list[Any]:
+    out = list(values or [])
+    if value not in out:
+        out.append(value)
+    return out
+
+
+def _handoff_waiting_on(task: dict[str, Any], handoff_id: str) -> bool:
+    waiting_on = task.get("waitingOn")
+    return isinstance(waiting_on, dict) and waiting_on.get("handoffId") == handoff_id
+
+
+def _set_handoff_status(
+    handoff: dict[str, Any],
+    status: str,
+    *,
+    now: int,
+    reason: str | None = None,
+    closed_by: str | None = None,
+) -> None:
+    handoff["status"] = normalize_handoff_status(status)
+    handoff["lastActionAt"] = now
+    if reason:
+        handoff["statusReason"] = _clip_text(reason, 500)
+    if handoff["status"] in {"closed", "cancelled", "rejected", "escalated"}:
+        handoff["closedAt"] = handoff.get("closedAt") or now
+        handoff["closedBy"] = closed_by or handoff.get("closedBy") or "system"
+
+
+def _handoff_chain_id(task: dict[str, Any], handoff: dict[str, Any] | None = None) -> str:
+    if handoff and handoff.get("chainId"):
+        return str(handoff["chainId"])
+    if task.get("handoffChainId"):
+        return str(task["handoffChainId"])
+    for item in task.get("handoffs") or []:
+        if item.get("chainId"):
+            return str(item["chainId"])
+    return uid("hc")
+
+
+def _find_parent_handoff_for_reply(
+    *,
+    task: dict[str, Any],
+    source_dept_id: str,
+    target_dept_id: str,
+    kind: str,
+) -> dict[str, Any] | None:
+    if kind != "return":
+        return None
+    for handoff in reversed(list(task.get("handoffs") or [])):
+        if (
+            str(handoff.get("fromDept") or "") == target_dept_id
+            and str(handoff.get("toDept") or "") == source_dept_id
+            and handoff_is_open(handoff.get("status"))
+        ):
+            return handoff
+    return None
+
+
+async def _artifact_ref_missing(repo: Repo, artifact_id: str) -> str | None:
+    if not artifact_id:
+        return None
+    if not hasattr(repo, "get_entity"):
+        return None
+    artifact = await repo.get_entity("artifact", artifact_id)
+    if not artifact:
+        return "entity_missing"
+    uri = str(artifact.get("uri") or "").strip()
+    if artifact.get("storage") == "filesystem" or uri.startswith("/"):
+        if uri and not Path(uri).exists():
+            return "file_missing"
+    return None
+
+
+async def _missing_handoff_artifact_refs(repo: Repo, task: dict[str, Any]) -> list[dict[str, str]]:
+    missing: list[dict[str, str]] = []
+    for artifact_id in [str(item) for item in task.get("deliverables", []) if str(item).strip()]:
+        reason = await _artifact_ref_missing(repo, artifact_id)
+        if reason:
+            missing.append({"artifactId": artifact_id, "reason": reason})
+    return missing
+
+
+def _minimum_handoff_packet(
+    *,
+    dept: dict[str, Any],
+    target: dict[str, Any],
+    task: dict[str, Any],
+    handoff: dict[str, Any],
+    reason: str,
+) -> str:
+    deliverables = [str(item) for item in task.get("deliverables", []) if str(item).strip()]
+    draft = _clip_text(task.get("draftDeliverableMarkdown"), 6000)
+    logs = [str(line) for line in task.get("log", [])[-5:]]
+    done = draft or ("; ".join(logs) if logs else "ยังไม่มีบันทึกงานก่อนหน้า")
+    return "\n".join([
+        f"งานนี้คือ: {task.get('title') or task.get('id')}",
+        f"ส่งต่อจากฝ่าย{dept.get('name', dept['id'])}ไปฝ่าย{target.get('name', target['id'])} ({handoff.get('kind')})",
+        "",
+        "ทำอะไรไปแล้ว / บริบทล่าสุด:",
+        done,
+        "",
+        "ขอให้ฝ่ายรับทำต่อ:",
+        _clip_text(reason, 3000) or "รับช่วงงานต่อจากบริบทด้านบน",
+        "",
+        "ไฟล์หรือ artifact ที่เกี่ยวข้อง:",
+        ", ".join(deliverables) if deliverables else "ไม่มีไฟล์แนบ",
+    ])
+
+
+def _task_checkpoint_id(task: dict[str, Any]) -> str | None:
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    for key in ("checkpointId", "lastCheckpointId", "restartCheckpointId"):
+        value = task.get(key) or result.get(key)
+        if value:
+            return str(value)
+    return None
+
+
+def _task_has_done_signal(task: dict[str, Any]) -> bool:
+    try:
+        progress = float(task.get("progress") or 0)
+    except (TypeError, ValueError):
+        progress = 0
+    return (
+        str(task.get("status") or "") in {"review", "done"}
+        or progress >= 1
+        or bool(str(task.get("draftDeliverableMarkdown") or "").strip() and progress >= 0.95)
+    )
+
+
+def _candidate_reassign_department_id(task: dict[str, Any]) -> str | None:
+    current_dept_id = str(task.get("departmentId") or "")
+    for handoff in reversed(list(task.get("handoffs") or [])):
+        for key in ("toDept", "fromDept"):
+            candidate = str(handoff.get(key) or "")
+            if candidate and candidate != current_dept_id:
+                return candidate
+    return None
+
+
+def _select_executive_decision_action(
+    task: dict[str, Any],
+    *,
+    reason: str,
+    trigger: str,
+    suggested_action: str | None,
+) -> str:
+    explicit = str(suggested_action or "").strip()
+    if explicit in EXECUTIVE_DECISION_ACTIONS and explicit != "manual_owner_input_required":
+        return explicit
+    waiting_on = task.get("waitingOn") if isinstance(task.get("waitingOn"), dict) else {}
+    text = " ".join([
+        trigger,
+        reason,
+        str(task.get("blockedLastReason") or ""),
+        " ".join(str(line) for line in task.get("log", [])[-8:]),
+    ]).lower()
+    if (
+        waiting_on.get("reason") == HANDOFF_MISSING_FILE_REASON
+        or any(marker in text for marker in ("missing_file", "file_missing", "entity_missing", "missing file"))
+        or any(marker in text for marker in ("ไฟล์หาย", "ไม่มีไฟล์", "ไฟล์เปิดไม่ได้", "artifact หาย"))
+    ):
+        return "request_file_again"
+    if _task_has_done_signal(task):
+        return "close_as_done"
+    if _task_checkpoint_id(task) or "checkpoint" in text:
+        return "restart_from_checkpoint"
+    if any(marker in text for marker in ("assumption", "สมมติ", "เดาต่อ", "ทำต่อด้วย assumption")):
+        return "approve_assumption"
+    if trigger == "handoff_sla" and _candidate_reassign_department_id(task):
+        return "reassign_task"
+    if any(marker in text for marker in ("clarification", "ไม่เข้าใจ", "ข้อมูลไม่พอ", "ไม่มีข้อมูล", "รอข้อมูล")):
+        return "ask_clarification"
+    return explicit if explicit in EXECUTIVE_DECISION_ACTIONS else "manual_owner_input_required"
+
+
+async def _resolve_department(repo: Repo, dept_id: str | None, fallback: dict[str, Any] | None = None) -> dict[str, Any] | None:
+    if fallback and str(fallback.get("id") or "") == str(dept_id or ""):
+        return fallback
+    if dept_id and hasattr(repo, "get_department"):
+        return await repo.get_department(str(dept_id))
+    return fallback
+
+
+async def _save_department_if_possible(repo: Repo, dept: dict[str, Any] | None) -> None:
+    if dept and hasattr(repo, "save_department"):
+        await repo.save_department(dept)
+
+
+def _mark_guard_action(
+    task: dict[str, Any],
+    *,
+    request_id: str,
+    action: str,
+    now: int,
+    resolved: bool,
+) -> None:
+    guard = task.get("blockedRetryGuard") if isinstance(task.get("blockedRetryGuard"), dict) else {}
+    guard = dict(guard or {})
+    guard["executiveDecisionRequestId"] = request_id
+    guard["executiveAction"] = action
+    guard["executiveActionAppliedAt"] = now
+    if resolved:
+        guard["status"] = "resolved"
+        guard["resolvedAt"] = now
+    else:
+        guard["status"] = guard.get("status") or "frozen"
+    task["blockedRetryGuard"] = guard
+
+
+async def _apply_executive_decision_action(
+    repo: Repo,
+    dept: dict[str, Any] | None,
+    task: dict[str, Any],
+    *,
+    request_id: str,
+    action: str,
+    reason: str,
+    trigger: str,
+    now: int,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {"action": action, "changedTask": True}
+    current_dept = await _resolve_department(repo, task.get("departmentId"), dept)
+    target_dept: dict[str, Any] | None = None
+
+    async def clear_current_department() -> None:
+        if current_dept and current_dept.get("currentTaskId") == task.get("id"):
+            current_dept["currentTaskId"] = None
+            if current_dept.get("state") not in {"offline"}:
+                current_dept["state"] = "idle"
+            await _save_department_if_possible(repo, current_dept)
+
+    async def assign_current_department() -> None:
+        if current_dept:
+            current_dept["currentTaskId"] = task.get("id")
+            if current_dept.get("state") not in {"offline"}:
+                current_dept["state"] = "working"
+            await _save_department_if_possible(repo, current_dept)
+
+    base_wait_reason = BLOCKED_RETRY_GUARD_REASON if trigger == BLOCKED_RETRY_GUARD_REASON else HANDOFF_EXECUTIVE_REASON
+    note = _clip_text(reason, 700)
+
+    if action == "ask_clarification":
+        _mark_guard_action(task, request_id=request_id, action=action, now=now, resolved=False)
+        task["status"] = "waiting"
+        task["waitingOn"] = {"dept": EXEC_ID, "reason": HANDOFF_CLARIFICATION_REASON, "decisionRequestId": request_id}
+        task["log"] = [*task.get("log", []), f"AI ผู้บริหารขอ clarification เพิ่ม: {note}"]
+        await clear_current_department()
+    elif action == "request_file_again":
+        _mark_guard_action(task, request_id=request_id, action=action, now=now, resolved=False)
+        task["status"] = "waiting"
+        task["waitingOn"] = {"dept": EXEC_ID, "reason": HANDOFF_MISSING_FILE_REASON, "decisionRequestId": request_id}
+        task["log"] = [*task.get("log", []), f"AI ผู้บริหารขอไฟล์/หลักฐานใหม่: {note}"]
+        await clear_current_department()
+    elif action == "reassign_task":
+        target_dept_id = _candidate_reassign_department_id(task)
+        target_dept = await _resolve_department(repo, target_dept_id, None)
+        if not target_dept:
+            return await _apply_executive_decision_action(
+                repo,
+                dept,
+                task,
+                request_id=request_id,
+                action="manual_owner_input_required",
+                reason=reason,
+                trigger=trigger,
+                now=now,
+            )
+        _mark_guard_action(task, request_id=request_id, action=action, now=now, resolved=True)
+        await clear_current_department()
+        task["departmentId"] = target_dept["id"]
+        task["status"] = "assigned"
+        task.pop("waitingOn", None)
+        if not target_dept.get("currentTaskId") and target_dept.get("state") in {None, "idle"}:
+            target_dept["currentTaskId"] = task.get("id")
+            target_dept["state"] = "working"
+            result["startedTarget"] = target_dept["id"]
+        await _save_department_if_possible(repo, target_dept)
+        task["log"] = [*task.get("log", []), f"AI ผู้บริหาร reassign งานไปฝ่าย{target_dept.get('name', target_dept['id'])}"]
+        result["targetDepartmentId"] = target_dept["id"]
+    elif action == "split_task":
+        target_dept_id = str(task.get("departmentId") or (dept or {}).get("id") or EXEC_ID)
+        child = _make_task(
+            title=f"แยกงานย่อยจาก: {task.get('title') or task.get('id')}",
+            detail=(
+                "AI ผู้บริหารแตกงานจาก circuit breaker เพื่อให้มีเจ้าของงานย่อยชัดเจน\n\n"
+                f"สาเหตุ: {note or '-'}"
+            ),
+            dept_id=target_dept_id,
+            now=now,
+            priority=str(task.get("priority") or "normal"),
+            origin={"kind": "executive"},
+            log=[f"created by executive_decision_request {request_id}"],
+        )
+        child["parentTaskId"] = task.get("id")
+        child["projectId"] = task.get("projectId")
+        child["handoffChainId"] = task.get("handoffChainId")
+        if hasattr(repo, "save_task"):
+            await repo.save_task(child)
+        _mark_guard_action(task, request_id=request_id, action=action, now=now, resolved=True)
+        task["subTaskIds"] = list(dict.fromkeys([*task.get("subTaskIds", []), child["id"]]))
+        task["status"] = "waiting"
+        task["waitingOn"] = {"dept": target_dept_id, "reason": HANDOFF_EXECUTIVE_REASON, "decisionRequestId": request_id}
+        task["log"] = [*task.get("log", []), f"AI ผู้บริหารแตกงานย่อย {child['id']}"]
+        await clear_current_department()
+        result["childTaskId"] = child["id"]
+    elif action == "approve_assumption":
+        _mark_guard_action(task, request_id=request_id, action=action, now=now, resolved=True)
+        task["status"] = "in_progress"
+        task.pop("waitingOn", None)
+        task["log"] = [*task.get("log", []), f"AI ผู้บริหารอนุมัติให้ทำต่อด้วย assumption: {note}"]
+        await assign_current_department()
+    elif action == "restart_from_checkpoint":
+        checkpoint_id = _task_checkpoint_id(task)
+        _mark_guard_action(task, request_id=request_id, action=action, now=now, resolved=True)
+        task["status"] = "in_progress"
+        task.pop("waitingOn", None)
+        task["result"] = {
+            **(task.get("result") or {}),
+            "restartFromCheckpoint": checkpoint_id,
+            "restartRequestedBy": EXEC_ID,
+            "restartRequestedAt": now,
+        }
+        task["log"] = [*task.get("log", []), f"AI ผู้บริหารสั่ง restart จาก checkpoint {checkpoint_id or 'latest'}"]
+        await assign_current_department()
+        result["checkpointId"] = checkpoint_id
+    elif action == "cancel_task":
+        _mark_guard_action(task, request_id=request_id, action=action, now=now, resolved=True)
+        task["status"] = "cancelled"
+        task.pop("waitingOn", None)
+        task["log"] = [*task.get("log", []), f"AI ผู้บริหารยกเลิกงาน: {note}"]
+        await clear_current_department()
+    elif action == "close_as_done":
+        _mark_guard_action(task, request_id=request_id, action=action, now=now, resolved=True)
+        task["status"] = "done"
+        task["progress"] = 1
+        task.pop("waitingOn", None)
+        task["result"] = {
+            **(task.get("result") or {}),
+            "summary": "AI ผู้บริหารปิดงานจาก circuit breaker",
+            "reviewStatus": "closed_by_executive_auto_all",
+            "completedAt": now,
+        }
+        task["log"] = [*task.get("log", []), f"AI ผู้บริหารปิดงานเป็น done: {note}"]
+        await clear_current_department()
+    else:
+        _mark_guard_action(task, request_id=request_id, action="manual_owner_input_required", now=now, resolved=False)
+        if task.get("status") not in {"blocked", "waiting"}:
+            task["status"] = "waiting"
+        task["waitingOn"] = {"dept": EXEC_ID, "reason": base_wait_reason, "decisionRequestId": request_id}
+        task["log"] = [*task.get("log", []), f"AI ผู้บริหารหยุดรอ owner input: {note}"]
+        await clear_current_department()
+
+    task["lastUnblockAttemptAt"] = now
+    task["updatedAt"] = now
+    return result
+
+
+async def _create_executive_decision_request(
+    repo: Repo,
+    dept: dict[str, Any] | None,
+    task: dict[str, Any],
+    *,
+    now: int,
+    reason: str,
+    trigger: str,
+    suggested_action: str = "manual_owner_input_required",
+) -> dict[str, Any]:
+    guard = task.get("blockedRetryGuard") if isinstance(task.get("blockedRetryGuard"), dict) else {}
+    existing_id = guard.get("executiveDecisionRequestId") if isinstance(guard, dict) else None
+    if existing_id and hasattr(repo, "get_entity"):
+        existing = await repo.get_entity("executive_decision_request", str(existing_id))
+        if existing:
+            return existing
+    request_id = uid("edr")
+    handoffs = list(task.get("handoffs") or [])
+    artifact_ids = [str(item) for item in task.get("deliverables", []) if str(item).strip()]
+    selected_action = _select_executive_decision_action(
+        task,
+        reason=reason,
+        trigger=trigger,
+        suggested_action=suggested_action,
+    )
+    applied_result = await _apply_executive_decision_action(
+        repo,
+        dept,
+        task,
+        request_id=request_id,
+        action=selected_action,
+        reason=reason,
+        trigger=trigger,
+        now=now,
+    )
+    request = {
+        "id": request_id,
+        "kind": "executive_decision_request",
+        "status": "applied",
+        "trigger": trigger,
+        "taskId": task.get("id"),
+        "departmentId": task.get("departmentId"),
+        "reason": _clip_text(reason, 1200),
+        "allowedActions": list(EXECUTIVE_DECISION_ACTIONS),
+        "selectedAction": selected_action,
+        "appliedAction": selected_action,
+        "appliedResult": applied_result,
+        "candidateRootCause": _clip_text(reason, 500),
+        "handoffChain": [
+            {
+                "id": item.get("id"),
+                "kind": item.get("kind"),
+                "status": item.get("status"),
+                "fromDept": item.get("fromDept"),
+                "toDept": item.get("toDept"),
+                "targetTaskId": item.get("targetTaskId"),
+                "contextPacketArtifactId": item.get("contextPacketArtifactId"),
+            }
+            for item in handoffs[-8:]
+        ],
+        "artifacts": artifact_ids,
+        "logs": [str(line) for line in task.get("log", [])[-8:]],
+        "createdAt": now,
+        "updatedAt": now,
+        "appliedAt": now,
+        "appliedBy": EXEC_ID,
+    }
+    if hasattr(repo, "put_entity"):
+        await repo.put_entity(
+            "executive_decision_request",
+            request,
+            dept=task.get("departmentId"),
+            project=task.get("projectId"),
+            status=request["status"],
+            ts=now,
+        )
+        decision = {
+            "id": uid("dec"),
+            "title": f"AI ผู้บริหารตัดสินงาน blocked: {task.get('title')}",
+            "proposedBy": EXEC_ID,
+            "approvedBy": EXEC_ID,
+            "rationale": request["reason"],
+            "alternatives": request["allowedActions"],
+            "impact": f"auto-all applied action={selected_action}",
+            "linkedTask": task.get("id"),
+            "linkedArtifacts": artifact_ids,
+            "status": "approved",
+            "supersedes": None,
+            "ts": now,
+        }
+        await repo.put_entity("decision", decision, dept=EXEC_ID, project=task.get("projectId"), status="approved", ts=now)
+    task["log"] = [*task.get("log", []), f"AI ผู้บริหารรับช่วงตัดสิน action={selected_action} request={request_id}"]
+    await repo.add_activity(_activity(
+        f"AI ผู้บริหารรับช่วงตัดสินงาน “{task.get('title')}”: {selected_action}",
+        type_="state_change",
+        department_id=task.get("departmentId"),
+        severity="warn",
+        ts=now,
+    ))
+    await _add_executive_watch_line(
+        repo,
+        dept or {"id": task.get("departmentId") or EXEC_ID, "name": task.get("departmentId") or EXEC_ID},
+        task,
+        f"AI ผู้บริหารรับช่วงตัดสินงาน “{task.get('title')}” เพราะ {reason}; action={selected_action}",
+        event="executive_decision",
+        severity="warn",
+        now=now,
+    )
+    return request
+
+
+async def _close_handoff_copies(
+    repo: Repo,
+    handoff_id: str,
+    *,
+    now: int,
+    status: str,
+    reason: str,
+    child_handoff_id: str | None = None,
+    target_task_id: str | None = None,
+) -> int:
+    if not hasattr(repo, "list_active_tasks"):
+        return 0
+    changed = 0
+    for task in await repo.list_active_tasks(limit=1000):
+        task_changed = False
+        for handoff in task.get("handoffs") or []:
+            if handoff.get("id") != handoff_id:
+                continue
+            _set_handoff_status(handoff, status, now=now, reason=reason, closed_by="auto-link")
+            if child_handoff_id:
+                handoff["replyToHandoffId"] = child_handoff_id
+            if target_task_id:
+                handoff["targetTaskId"] = handoff.get("targetTaskId") or target_task_id
+            task_changed = True
+        if _handoff_waiting_on(task, handoff_id):
+            task.pop("waitingOn", None)
+            if task.get("status") == "waiting":
+                task["status"] = "review" if status in {"closed", "delivered", "returned"} else "in_progress"
+            task["log"] = [*task.get("log", []), f"handoff {handoff_id}: auto-linked {status}"]
+            task_changed = True
+        if task_changed:
+            task["updatedAt"] = now
+            await repo.save_task(task)
+            changed += 1
+    return changed
+
+
+async def _reconcile_handoff_workflow(
+    repo: Repo,
+    departments: list[dict[str, Any]] | None,
+    now: int,
+    *,
+    force: bool = False,
+) -> int:
+    if not hasattr(repo, "list_active_tasks"):
+        return 0
+    if not force and hasattr(repo, "get_entity"):
+        state = await repo.get_entity("workflow_reconciler_state", HANDOFF_RECONCILER_ENTITY_ID)
+        if state and int(state.get("lastRunAt") or 0) > now - HANDOFF_SLA_MS:
+            return 0
+    changed = 0
+    departments = departments or (await repo.list_departments() if hasattr(repo, "list_departments") else [])
+    departments_by_id = {str(dept.get("id")): dept for dept in departments}
+    tasks = await repo.list_active_tasks(limit=1000)
+    tasks_by_id = {str(task.get("id")): task for task in tasks}
+    child_by_parent: dict[str, dict[str, Any]] = {}
+    for task in tasks:
+        for handoff in task.get("handoffs") or []:
+            parent_id = str(handoff.get("parentHandoffId") or handoff.get("replyToHandoffId") or "")
+            if parent_id:
+                child_by_parent[parent_id] = handoff
+
+    for task in tasks:
+        task_changed = False
+        for handoff in task.get("handoffs") or []:
+            normalized = normalize_handoff_status(handoff.get("status"))
+            if handoff.get("status") != normalized:
+                handoff["status"] = normalized
+                task_changed = True
+            handoff_id = str(handoff.get("id") or "")
+            if not handoff_id:
+                continue
+            packet_id = str(handoff.get("contextPacketArtifactId") or "")
+            if packet_id:
+                missing = await _artifact_ref_missing(repo, packet_id)
+                if missing and handoff.get("status") != "missing_file":
+                    _set_handoff_status(
+                        handoff,
+                        "missing_file",
+                        now=now,
+                        reason=f"context packet {packet_id} {missing}",
+                    )
+                    if _handoff_waiting_on(task, handoff_id):
+                        task["waitingOn"] = {
+                            "dept": handoff.get("fromDept") or EXEC_ID,
+                            "handoffId": handoff_id,
+                            "reason": HANDOFF_MISSING_FILE_REASON,
+                        }
+                    task["log"] = [*task.get("log", []), f"handoff {handoff_id}: packet missing ({missing})"]
+                    task_changed = True
+
+            child = child_by_parent.get(handoff_id)
+            if child and handoff_is_open(handoff.get("status")):
+                status = "closed" if child.get("kind") == "return" else "delivered"
+                _set_handoff_status(
+                    handoff,
+                    status,
+                    now=now,
+                    reason=f"auto-linked child handoff {child.get('id')}",
+                    closed_by="reconciler",
+                )
+                handoff["replyToHandoffId"] = child.get("id")
+                if _handoff_waiting_on(task, handoff_id):
+                    task.pop("waitingOn", None)
+                    if task.get("status") == "waiting":
+                        task["status"] = "review"
+                task["log"] = [*task.get("log", []), f"handoff {handoff_id}: ปิดวงจาก child {child.get('id')}"]
+                task_changed = True
+
+            target_task_id = str(handoff.get("targetTaskId") or "")
+            target_task = tasks_by_id.get(target_task_id)
+            if target_task and target_task.get("status") in {"review", "done"} and handoff_is_open(handoff.get("status")):
+                _set_handoff_status(
+                    handoff,
+                    "closed",
+                    now=now,
+                    reason=f"target task {target_task_id} reached {target_task.get('status')}",
+                    closed_by="reconciler",
+                )
+                if _handoff_waiting_on(task, handoff_id):
+                    task.pop("waitingOn", None)
+                    if task.get("status") == "waiting":
+                        task["status"] = "review"
+                task["log"] = [*task.get("log", []), f"handoff {handoff_id}: ปิดวงเพราะ target พร้อมตรวจแล้ว"]
+                task_changed = True
+
+            deadline_at = int(handoff.get("deadlineAt") or 0)
+            if deadline_at and deadline_at <= now and handoff_is_open(handoff.get("status")):
+                _set_handoff_status(handoff, "escalated", now=now, reason="handoff SLA exceeded", closed_by="reconciler")
+                task["waitingOn"] = {
+                    "dept": EXEC_ID,
+                    "handoffId": handoff_id,
+                    "reason": HANDOFF_EXECUTIVE_REASON,
+                }
+                await _create_executive_decision_request(
+                    repo,
+                    departments_by_id.get(str(task.get("departmentId") or "")),
+                    task,
+                    now=now,
+                    reason=f"handoff {handoff_id} ค้างเกิน SLA 30 นาที",
+                    trigger="handoff_sla",
+                    suggested_action="manual_owner_input_required",
+                )
+                task_changed = True
+
+        if task_changed:
+            task["updatedAt"] = now
+            await repo.save_task(task)
+            changed += 1
+
+    for dept in departments:
+        current_task_id = str(dept.get("currentTaskId") or "")
+        if not current_task_id:
+            continue
+        current_task = tasks_by_id.get(current_task_id)
+        if not current_task or current_task.get("status") in {"done", "cancelled"}:
+            dept["currentTaskId"] = None
+            if dept.get("state") not in {"offline"}:
+                dept["state"] = "idle"
+            await repo.save_department(dept)
+            changed += 1
+        elif dept.get("state") == "idle" and current_task.get("status") == "waiting":
+            dept["currentTaskId"] = None
+            current_task["log"] = [*current_task.get("log", []), "reconciler: ปลด currentTaskId ระหว่างรอ handoff"]
+            current_task["updatedAt"] = now
+            await repo.save_task(current_task)
+            await repo.save_department(dept)
+            changed += 1
+
+    if hasattr(repo, "put_entity"):
+        await repo.put_entity(
+            "workflow_reconciler_state",
+            {
+                "id": HANDOFF_RECONCILER_ENTITY_ID,
+                "kind": "handoff_workflow_v2",
+                "lastRunAt": now,
+                "changed": changed,
+            },
+            status="active",
+            ts=now,
+        )
+    return changed
+
+
 async def _record_task_deliverable(
     repo: Repo,
     dept: dict[str, Any],
@@ -3253,6 +4049,149 @@ async def _record_task_deliverable(
     return artifact_id
 
 
+async def _record_handoff_packet_artifact(
+    repo: Repo,
+    dept: dict[str, Any],
+    target: dict[str, Any],
+    task: dict[str, Any],
+    next_task: dict[str, Any],
+    handoff: dict[str, Any],
+    message: dict[str, Any],
+    packet: str,
+    now: int,
+) -> dict[str, Any]:
+    """Persist every handoff as a versioned Markdown work packet, not only chat text."""
+    version = 1
+    artifact_id = uid("art")
+    source_task_id = str(task["id"])
+    target_task_id = str(next_task["id"])
+    filename = safe_filename(
+        f"handoff_{source_task_id}_{dept['id']}_to_{target['id']}_{handoff['id']}_v{version}.md"
+    )
+    uri = _handoff_packet_content_path(dept["id"], artifact_id, filename)
+    related_deliverables = [str(item) for item in task.get("deliverables", []) if str(item).strip()]
+    missing_refs = await _missing_handoff_artifact_refs(repo, task)
+    if missing_refs:
+        _set_handoff_status(
+            handoff,
+            "missing_file",
+            now=now,
+            reason="; ".join(f"{item['artifactId']}:{item['reason']}" for item in missing_refs),
+        )
+    draft = _clip_text(task.get("draftDeliverableMarkdown"), 12000)
+    log_lines = [str(line) for line in task.get("log", [])[-8:]]
+    content = "\n".join([
+        f"# Handoff Packet v{version}: {task.get('title') or source_task_id}",
+        "",
+        "## Minimum Context",
+        _minimum_handoff_packet(dept=dept, target=target, task=task, handoff=handoff, reason=handoff.get("reason") or packet),
+        "",
+        "## Version",
+        f"- Filename: `{filename}`",
+        f"- Version: v{version}",
+        f"- Handoff ID: `{handoff['id']}`",
+        f"- Context message ID: `{message['id']}`",
+        "",
+        "## Route",
+        f"- From: {dept.get('name', dept['id'])} (`{dept['id']}`)",
+        f"- To: {target.get('name', target['id'])} (`{target['id']}`)",
+        f"- Kind: `{handoff['kind']}`",
+        f"- Depth: {handoff.get('depth', 0)}",
+        f"- Source task: `{source_task_id}`",
+        f"- Target task: `{target_task_id}`",
+        "",
+        "## Reason",
+        _clip_text(handoff.get("reason") or packet, 3000) or "-",
+        "",
+        "## Packet",
+        _clip_text(packet, 12000) or "-",
+        "",
+        "## Existing Deliverables",
+        "\n".join(f"- `{artifact_id}`" for artifact_id in related_deliverables) or "- none",
+        "",
+        "## Missing Artifact Checks",
+        "\n".join(f"- `{item['artifactId']}`: {item['reason']}" for item in missing_refs) or "- none",
+        "",
+        "## Source Draft",
+        draft or "- no draft deliverable yet",
+        "",
+        "## Latest Source Log",
+        "\n".join(f"- {line}" for line in log_lines) or "- no log entries",
+        "",
+    ])
+    with open(uri, "w", encoding="utf-8") as f:
+        f.write(content)
+    artifact = {
+        "id": artifact_id,
+        "name": f"Handoff Packet v{version}: {dept.get('name', dept['id'])} → {target.get('name', target['id'])}",
+        "kind": "report",
+        "mime": "text/markdown",
+        "ownerDept": dept["id"],
+        "taskIds": [source_task_id, target_task_id],
+        "projectId": task.get("projectId"),
+        "version": version,
+        "status": "approved",
+        "uri": uri,
+        "storage": "filesystem",
+        "contentMime": "text/markdown; charset=utf-8",
+        "tags": [
+            "engine",
+            "handoff",
+            "handoff_packet",
+            f"v{version}",
+            dept["id"],
+            target["id"],
+            str(handoff["kind"]),
+        ],
+        "links": [
+            f"atrium://task/{source_task_id}",
+            f"atrium://task/{target_task_id}",
+            f"atrium://handoff/{handoff['id']}",
+            f"atrium://handoff-message/{message['id']}",
+        ],
+        "preview": {"kind": "md", "uri": uri},
+        "createdAt": now,
+        "createdBy": dept["id"],
+        "updatedAt": now,
+        "updatedBy": dept["id"],
+        "approvalTier": "department",
+        "approvedBy": dept["id"],
+        "approvedAt": now,
+    }
+    version_row = {
+        "id": f"{artifact_id}:{version}",
+        "artifactId": artifact_id,
+        "version": version,
+        "author": dept["id"],
+        "ts": now,
+        "note": f"handoff packet {handoff['id']} v{version}",
+        "parent": None,
+        "uri": uri,
+        "storage": "filesystem",
+        "contentMime": "text/markdown; charset=utf-8",
+        "preview": {"kind": "md", "uri": uri},
+    }
+    await repo.put_entity("artifact", artifact, dept=dept["id"], project=task.get("projectId"), status="approved", ts=now)
+    await repo.put_entity(
+        "artifact_version",
+        version_row,
+        dept=dept["id"],
+        project=task.get("projectId"),
+        status="approved",
+        ts=now,
+    )
+    handoff["contextPacketArtifactId"] = artifact_id
+    handoff["contextPacketArtifactVersion"] = version
+    handoff["contextPacketFilename"] = filename
+    handoff["contextPacketUri"] = uri
+    handoff["deliverableArtifactIds"] = list(dict.fromkeys([*handoff.get("deliverableArtifactIds", []), *related_deliverables]))
+    task["deliverables"] = _append_unique(task.get("deliverables"), artifact_id)
+    next_task["deliverables"] = _append_unique(next_task.get("deliverables"), artifact_id)
+    task["log"] = [*task.get("log", []), f"สร้าง handoff packet artifact {artifact_id} v{version}"]
+    next_task["log"] = [*next_task.get("log", []), f"รับ handoff packet artifact {artifact_id} v{version}"]
+    return artifact
+
+
 async def _task_close_approval_message(
     repo: Repo,
     approval: dict[str, Any],
@@ -3365,6 +4304,17 @@ async def request_task_close_approval(
     await repo.save_department(dept)
     await repo.add_approval(approval)
     await _task_close_approval_message(repo, approval, dept, task, now)
+    await emit_work_status_notice(
+        repo,
+        event="task_close_requested",
+        summary=f"ฝ่าย{dept.get('name', dept['id'])}ขอปิดงาน “{task['title']}” แล้ว รอผู้บริหารอนุมัติ",
+        source_dept=dept,
+        task=task,
+        severity="warn",
+        now=now,
+        dedupe_key=f"task_close_requested:{task['id']}:{approval['id']}",
+        include_executive=False,
+    )
     await repo.add_activity(_activity(
         f"{dept.get('agentName', dept['id'])} ขออนุมัติปิดงาน “{task['title']}”",
         type_="approval",
@@ -3490,6 +4440,17 @@ async def approve_task_close_request(
         severity="good",
         now=now,
     )
+    await emit_work_status_notice(
+        repo,
+        event="task_close_approved",
+        summary=f"ผู้บริหารอนุมัติปิดงาน “{task['title']}” แล้ว",
+        source_dept=dept,
+        task=task,
+        severity="good",
+        now=now,
+        dedupe_key=f"task_close_approved:{task['id']}:{approval['id']}",
+        include_executive=False,
+    )
     hub.pulse({"kind": "done", "departmentId": dept["id"]})
     return True
 
@@ -3554,6 +4515,17 @@ async def reject_task_close_request(
         event="task_revising",
         severity="warn",
         now=now,
+    )
+    await emit_work_status_notice(
+        repo,
+        event="task_close_rejected",
+        summary=f"ผู้บริหารตีกลับงาน “{task['title']}” ให้แก้ต่อ: {note}",
+        source_dept=dept,
+        task=task,
+        severity="warn",
+        now=now,
+        dedupe_key=f"task_close_rejected:{task['id']}:{approval['id']}",
+        include_executive=False,
     )
     hub.pulse({"kind": "state", "departmentId": dept["id"]})
     return True
@@ -3920,6 +4892,14 @@ async def _create_handoff_task(
     source_depths = [int(h.get("depth") or 0) for h in task.get("handoffs", [])]
     depth = (max(source_depths) if source_depths else 0) + 1
     normalized_kind = _choice(kind, {"delegate", "consult", "collaborate", "return"}, "delegate")
+    parent_handoff = _find_parent_handoff_for_reply(
+        task=task,
+        source_dept_id=str(dept["id"]),
+        target_dept_id=str(target["id"]),
+        kind=normalized_kind,
+    )
+    chain_id = _handoff_chain_id(task, parent_handoff)
+    task["handoffChainId"] = chain_id
     consult_rounds = sum(
         1
         for h in task.get("handoffs", [])
@@ -3969,8 +4949,17 @@ async def _create_handoff_task(
         "ts": now,
         "reason": reason,
         "kind": normalized_kind,
-        "status": "open",
+        "status": "requested",
         "depth": depth,
+        "chainId": chain_id,
+        "parentHandoffId": parent_handoff.get("id") if parent_handoff else None,
+        "replyToHandoffId": parent_handoff.get("id") if parent_handoff else None,
+        "lastActionAt": now,
+        "deadlineAt": now + HANDOFF_SLA_MS,
+        "closedAt": None,
+        "closedBy": None,
+        "statusReason": None,
+        "deliverableArtifactIds": [],
         "contextPacketRef": None,
         "sourceTaskId": task["id"],
         "targetTaskId": None,
@@ -3987,15 +4976,9 @@ async def _create_handoff_task(
         handoffs=[handoff],
         log=[f"รับ context packet จาก {dept['name']}"],
     )
+    next_task["handoffChainId"] = chain_id
     handoff["targetTaskId"] = next_task["id"]
-    packet = (
-        f"Context packet for task {task['id']}\n"
-        f"จากฝ่าย{dept['name']}ถึงฝ่าย{target['name']}\n"
-        f"kind: {handoff['kind']} depth: {handoff['depth']}\n"
-        f"เหตุผล: {reason}\n"
-        f"ผลงานที่เกี่ยวข้อง: {', '.join(task.get('deliverables', [])) or '-'}\n"
-        f"บันทึกล่าสุด: {'; '.join(task.get('log', [])[-5:])}"
-    )
+    packet = _minimum_handoff_packet(dept=dept, target=target, task=task, handoff=handoff, reason=reason)
     message = await _record_handoff_message(
         repo,
         handoff,
@@ -4007,6 +4990,35 @@ async def _create_handoff_task(
         task_id=task["id"],
     )
     handoff = append_handoff_message(handoff, message, status=handoff_status_for_act("request"))
+    packet_artifact = await _record_handoff_packet_artifact(
+        repo,
+        dept,
+        target,
+        task,
+        next_task,
+        handoff,
+        message,
+        packet,
+        now,
+    )
+    if parent_handoff:
+        _set_handoff_status(
+            parent_handoff,
+            "returned" if normalized_kind == "return" else "delivered",
+            now=now,
+            reason=f"reply handoff {handoff['id']} created",
+            closed_by=dept["id"],
+        )
+        parent_handoff["replyToHandoffId"] = handoff["id"]
+        await _close_handoff_copies(
+            repo,
+            str(parent_handoff["id"]),
+            now=now,
+            status="closed",
+            reason=f"auto-linked by reply handoff {handoff['id']}",
+            child_handoff_id=handoff["id"],
+            target_task_id=next_task["id"],
+        )
     if handoff["kind"] == "collaborate":
         war_room = {
             "id": uid("war"),
@@ -4019,20 +5031,21 @@ async def _create_handoff_task(
             "status": "active",
             "createdAt": now,
             "updatedAt": now,
-            "scratchpad": packet,
+            "scratchpad": f"{packet}\n\nhandoffPacketArtifact={packet_artifact['id']} uri={packet_artifact['uri']}",
         }
         await repo.put_entity("war_room", war_room, project=task.get("projectId"), status="active", ts=now)
         handoff["warRoomId"] = war_room["id"]
     next_task["handoffs"] = [handoff]
     task["handoffs"] = [*task.get("handoffs", []), handoff]
-    task["status"] = "blocked"
+    task["status"] = "waiting"
     task["progress"] = min(float(task.get("progress", 0.9)), 0.95)
-    task["waitingOn"] = {"dept": target["id"], "handoffId": handoff["id"]}
-    task["log"] = [*task.get("log", []), f"รอคำตอบจาก {target['name']} ({handoff['kind']})"]
+    waiting_reason = HANDOFF_MISSING_FILE_REASON if handoff.get("status") == "missing_file" else HANDOFF_WAITING_REPLY_REASON
+    task["waitingOn"] = {"dept": target["id"], "handoffId": handoff["id"], "reason": waiting_reason}
+    task["log"] = [*task.get("log", []), f"รอการตอบกลับจาก {target['name']} ({handoff['kind']})"]
     dept["state"] = "handoff"
     dept["currentTaskId"] = task["id"]
     woke_target = False
-    if not target.get("currentTaskId") and str(target.get("state") or "idle") == "idle":
+    if handoff.get("status") != "missing_file" and not target.get("currentTaskId") and str(target.get("state") or "idle") == "idle":
         next_task["status"] = "in_progress"
         next_task["updatedAt"] = now
         next_task["log"] = [*next_task.get("log", []), "เริ่มทำทันทีจาก handoff"]
@@ -4058,6 +5071,19 @@ async def _create_handoff_task(
         severity="info",
         now=now,
     )
+    await emit_work_status_notice(
+        repo,
+        event="handoff_requested",
+        summary=f"ฝ่าย{dept.get('name', dept['id'])}ส่งต่องาน “{task['title']}” ไปฝ่าย{target.get('name', target['id'])}: {reason}",
+        source_dept=dept,
+        target_dept=target,
+        task=task,
+        handoff_id=handoff["id"],
+        severity="info",
+        now=now,
+        dedupe_key=f"handoff_requested:{handoff['id']}",
+        include_executive=False,
+    )
     if woke_target:
         await _add_executive_watch_line(
             repo,
@@ -4067,6 +5093,19 @@ async def _create_handoff_task(
             event="task_started",
             severity="good",
             now=now,
+        )
+        await emit_work_status_notice(
+            repo,
+            event="task_started",
+            summary=f"ฝ่าย{target.get('name', target['id'])}เริ่มรับงานส่งต่อแล้ว: “{next_task['title']}”",
+            source_dept=dept,
+            target_dept=target,
+            task=next_task,
+            handoff_id=handoff["id"],
+            severity="good",
+            now=now,
+            dedupe_key=f"handoff_target_started:{handoff['id']}:{next_task['id']}",
+            include_executive=False,
         )
     hub.pulse({"kind": "handoff", "departmentId": dept["id"], "toDepartmentId": target["id"]})
     return next_task
@@ -4110,6 +5149,24 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
             )
         if status == "blocked":
             task["status"] = "blocked"
+            task["blockedLastReason"] = log_line
+            try:
+                stored_repeat_count = int(task.get("blockedRetryCount") or 0)
+            except (TypeError, ValueError):
+                stored_repeat_count = 0
+            repeat_count = max(
+                _blocked_retry_log_count(task),
+                stored_repeat_count + 1,
+            )
+            task["blockedRetryCount"] = repeat_count
+            guard_froze = False
+            if repeat_count >= BLOCKED_RETRY_GUARD_LIMIT:
+                guard_froze = _freeze_blocked_retry_guard(
+                    task,
+                    now=now,
+                    reason=log_line,
+                    count=repeat_count,
+                )
             dept["state"] = "blocked"
             dept["mood"] = min(float(dept.get("mood", 0.6)), 0.35)
             await repo.save_task(task)
@@ -4130,8 +5187,50 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
                 severity="warn",
                 now=now,
             )
+            await emit_work_status_notice(
+                repo,
+                event="task_blocked",
+                summary=f"งาน “{task['title']}” ติดปัญหา: {log_line}",
+                source_dept=dept,
+                task=task,
+                severity="warn",
+                now=now,
+                dedupe_key=f"task_blocked:{task['id']}:{repeat_count}",
+                include_executive=False,
+            )
+            if guard_froze:
+                await _create_executive_decision_request(
+                    repo,
+                    dept,
+                    task,
+                    now=now,
+                    reason=log_line,
+                    trigger=BLOCKED_RETRY_GUARD_REASON,
+                    suggested_action="manual_owner_input_required",
+                )
+                await repo.save_task(task)
+                await repo.add_activity(_activity(
+                    f"หยุด retry อัตโนมัติของงาน “{task['title']}” เพราะ blocked ซ้ำครบ {repeat_count} รอบ",
+                    type_="state_change",
+                    department_id=dept["id"],
+                    severity="warn",
+                    ts=now,
+                ))
+                await _add_executive_watch_line(
+                    repo,
+                    dept,
+                    task,
+                    (
+                        f"ฝ่าย{dept.get('name', dept['id'])}ถูกหยุด retry อัตโนมัติในงาน “{task['title']}” "
+                        f"หลัง blocked ซ้ำ {repeat_count} รอบโดยไม่มีข้อมูลใหม่"
+                    ),
+                    event="task_blocked",
+                    severity="warn",
+                    now=now,
+                )
             hub.pulse({"kind": "state", "departmentId": dept["id"]})
             return True
+        _clear_blocked_retry_guard(task)
         task["status"] = "review" if task["progress"] >= 1 or status == "review" else "in_progress"
         await repo.save_task(task)
         if task["status"] == "review":
@@ -4145,6 +5244,17 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
                 event="task_review",
                 severity="good",
                 now=now,
+            )
+            await emit_work_status_notice(
+                repo,
+                event="task_review",
+                summary=f"งาน “{task['title']}” พร้อมตรวจแล้ว: {log_line}",
+                source_dept=dept,
+                task=task,
+                severity="good",
+                now=now,
+                dedupe_key=f"task_review:{task['id']}",
+                include_executive=False,
             )
             hub.pulse({"kind": "state", "departmentId": dept["id"]})
         else:
@@ -4212,6 +5322,17 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
                     severity="warn",
                     ts=now,
                 ))
+                await emit_work_status_notice(
+                    repo,
+                    event="task_revising",
+                    summary=f"review ตีกลับงาน “{task['title']}” ให้แก้ต่อ: {note}",
+                    source_dept=dept,
+                    task=task,
+                    severity="warn",
+                    now=now,
+                    dedupe_key=f"task_revising:{task['id']}:{revision_count}",
+                    include_executive=False,
+                )
                 hub.pulse({"kind": "state", "departmentId": dept["id"]})
                 return True
 
@@ -4280,6 +5401,63 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
         return True
 
     if state == "blocked":
+        if task and str(task.get("status") or "") == "blocked" and _blocked_retry_guard_active(task):
+            repeat_count = _blocked_retry_guard_count(task)
+            guard_froze = _freeze_blocked_retry_guard(
+                task,
+                now=now,
+                reason=str((task.get("log") or ["blocked"])[-1]),
+                count=repeat_count,
+            )
+            if guard_froze:
+                await _create_executive_decision_request(
+                    repo,
+                    dept,
+                    task,
+                    now=now,
+                    reason=str((task.get("log") or ["blocked"])[-1]),
+                    trigger=BLOCKED_RETRY_GUARD_REASON,
+                    suggested_action="manual_owner_input_required",
+                )
+                if task.get("status") == "blocked":
+                    dept["state"] = "blocked"
+                await repo.save_task(task)
+                await repo.save_department(dept)
+                await repo.add_activity(_activity(
+                    f"หยุด retry อัตโนมัติของงาน “{task['title']}” เพราะ blocked ซ้ำครบ {repeat_count} รอบ",
+                    type_="state_change",
+                    department_id=dept["id"],
+                    severity="warn",
+                    ts=now,
+                ))
+                await _add_executive_watch_line(
+                    repo,
+                    dept,
+                    task,
+                    (
+                        f"ฝ่าย{dept.get('name', dept['id'])}ถูกหยุด retry อัตโนมัติในงาน “{task['title']}” "
+                        f"หลัง blocked ซ้ำ {repeat_count} รอบโดยไม่มีข้อมูลใหม่"
+                    ),
+                    event="task_blocked",
+                    severity="warn",
+                    now=now,
+                )
+                await emit_work_status_notice(
+                    repo,
+                    event="task_blocked",
+                    summary=(
+                        f"งาน “{task['title']}” ถูกหยุด retry อัตโนมัติหลัง blocked ซ้ำ {repeat_count} รอบ"
+                    ),
+                    source_dept=dept,
+                    task=task,
+                    severity="warn",
+                    now=now,
+                    dedupe_key=f"task_blocked_guard:{task['id']}:{repeat_count}",
+                    include_executive=False,
+                )
+                hub.pulse({"kind": "state", "departmentId": dept["id"]})
+                return True
+            return False
         if random.random() < 0.25:
             dept["state"] = "working" if dept.get("currentTaskId") else "idle"
             dept["mood"] = _clamp(float(dept.get("mood", 0.4)) + 0.08, 0, 1)
@@ -4296,6 +5474,7 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
         return False
 
     if task and task.get("status") in {"assigned", "backlog", "revising", "in_progress"}:
+        _clear_blocked_retry_guard(task)
         task["status"] = "in_progress"
         task["updatedAt"] = now
         task["log"] = [*task.get("log", []), "resume จาก currentTaskId หลัง state idle"]
@@ -4324,6 +5503,7 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
 
     open_task = _open_task_for(dept["id"], tasks)
     if open_task:
+        _clear_blocked_retry_guard(open_task)
         open_task["status"] = "in_progress"
         open_task["updatedAt"] = now
         open_task["log"] = [*open_task.get("log", []), "เริ่มลงมือ"]
@@ -4573,6 +5753,7 @@ async def run_engine_tick(
         "triggerJobs": 0,
         "jobs": 0,
         "departments": 0,
+        "handoffReconciliations": 0,
         "notifications": 0,
         "compactions": 0,
         "running": True,
@@ -4598,6 +5779,10 @@ async def run_engine_tick(
             changed = changed or bool(stats["objectiveJobs"] or stats["triggerJobs"] or stats["jobs"])
 
             departments = await repo.list_departments()
+            _set_engine_phase("handoff_reconciler")
+            stats["handoffReconciliations"] = await _reconcile_handoff_workflow(repo, departments, now)
+            changed = changed or bool(stats["handoffReconciliations"])
+
             _set_engine_phase("advance_departments_parallel")
             await commit_and_release(repo.s)
             stats["departments"] = await _advance_departments_parallel(departments, now, settings)

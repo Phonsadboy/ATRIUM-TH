@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import tempfile
 import unittest
 from pathlib import Path
@@ -113,6 +115,10 @@ def _settings(tmp: str, **overrides):
 
     (auth_dir / "telegram-gateway.json").write_text(json.dumps(auth), encoding="utf-8")
     return SimpleNamespace(**values)
+
+
+def _outbox_receipt_id(dedupe_key: str) -> str:
+    return hmac.new(b"atrium-telegram", dedupe_key.encode("utf-8"), hashlib.sha256).hexdigest()[:40]
 
 
 def _dm_update(text: str = "สรุปแผนวันนี้") -> dict:
@@ -599,6 +605,177 @@ class TelegramChannelGatewayTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(api_calls[2][1]["text"], "คำตอบสุดท้าย")
             self.assertFalse(repo.messages[reply["id"]]["pending"])
             self.assertEqual(repo.messages[reply["id"]]["channelReply"]["progressMessageId"], "100")
+
+    async def test_completed_progress_job_deletes_stale_status_after_separate_final_reply(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FakeRepo()
+            settings = _settings(tmp)
+            dedupe_key = "telegram:reply:555:42"
+            reply = {
+                "id": "msg_reply",
+                "threadId": "executive",
+                "pending": False,
+                "status": "sent",
+                "text": "คำตอบสุดท้าย",
+                "channelReply": {
+                    "provider": "telegram",
+                    "chatId": "555",
+                    "replyToTelegramMessageId": "42",
+                    "dedupeKey": dedupe_key,
+                },
+            }
+            repo.messages[reply["id"]] = reply
+            await repo.put_entity(
+                "telegram_progress_message",
+                {
+                    "id": reply["id"],
+                    "replyMessageId": reply["id"],
+                    "threadId": "executive",
+                    "chatId": "555",
+                    "progressMessageId": "100",
+                    "updatedAt": 10_000,
+                },
+            )
+            await repo.put_entity(
+                "telegram_outbox_receipt",
+                {
+                    "id": _outbox_receipt_id(dedupe_key),
+                    "status": "sent",
+                    "result": {"receipts": [{"method": "sendMessage", "response": {"message_id": 200}}]},
+                },
+            )
+            api_calls: list[tuple[str, dict]] = []
+
+            def fake_api(bot_token, method, body):
+                del bot_token
+                api_calls.append((method, body))
+                return {"ok": True, "result": True}
+
+            with (
+                mock.patch.object(telegram_gateway, "get_settings", return_value=settings),
+                mock.patch.object(telegram_gateway, "_telegram_api_request", side_effect=fake_api),
+            ):
+                result = await telegram_gateway.process_telegram_progress_job(
+                    repo,
+                    {
+                        "replyMessageId": reply["id"],
+                        "threadId": "executive",
+                    },
+                    12_000,
+                )
+
+            self.assertEqual(result["status"], "completed_finalized")
+            self.assertEqual(result["finalProgress"]["status"], "deleted_stale_progress")
+            self.assertEqual([method for method, _ in api_calls], ["deleteMessage"])
+            self.assertEqual(api_calls[0][1]["message_id"], 100)
+
+    async def test_completed_progress_job_edits_status_into_final_when_outbound_has_not_sent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FakeRepo()
+            settings = _settings(tmp)
+            reply = {
+                "id": "msg_reply",
+                "threadId": "executive",
+                "pending": False,
+                "status": "sent",
+                "text": "คำตอบสุดท้าย",
+                "channelReply": {
+                    "provider": "telegram",
+                    "chatId": "555",
+                    "replyToTelegramMessageId": "42",
+                },
+            }
+            repo.messages[reply["id"]] = reply
+            await repo.put_entity(
+                "telegram_progress_message",
+                {
+                    "id": reply["id"],
+                    "replyMessageId": reply["id"],
+                    "threadId": "executive",
+                    "chatId": "555",
+                    "progressMessageId": "100",
+                    "updatedAt": 10_000,
+                },
+            )
+            api_calls: list[tuple[str, dict]] = []
+
+            def fake_api(bot_token, method, body):
+                del bot_token
+                api_calls.append((method, body))
+                return {"ok": True, "result": {"message_id": 100}}
+
+            with (
+                mock.patch.object(telegram_gateway, "get_settings", return_value=settings),
+                mock.patch.object(telegram_gateway, "_telegram_api_request", side_effect=fake_api),
+            ):
+                result = await telegram_gateway.process_telegram_progress_job(
+                    repo,
+                    {
+                        "replyMessageId": reply["id"],
+                        "threadId": "executive",
+                    },
+                    12_000,
+                )
+
+            self.assertEqual(result["status"], "completed_finalized")
+            self.assertEqual(result["finalProgress"]["status"], "edited_progress_to_final")
+            self.assertEqual([method for method, _ in api_calls], ["editMessageText"])
+            self.assertEqual(api_calls[0][1]["message_id"], 100)
+            self.assertEqual(api_calls[0][1]["text"], "คำตอบสุดท้าย")
+            self.assertEqual(repo.messages[reply["id"]]["channelReply"]["progressMessageId"], "100")
+
+    async def test_completed_progress_job_leaves_already_edited_final_message_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FakeRepo()
+            settings = _settings(tmp)
+            dedupe_key = "telegram:reply:555:42"
+            reply = {
+                "id": "msg_reply",
+                "threadId": "executive",
+                "pending": False,
+                "status": "sent",
+                "text": "คำตอบสุดท้าย",
+                "channelReply": {
+                    "provider": "telegram",
+                    "chatId": "555",
+                    "replyToTelegramMessageId": "42",
+                    "progressMessageId": "100",
+                    "dedupeKey": dedupe_key,
+                },
+            }
+            repo.messages[reply["id"]] = reply
+            await repo.put_entity(
+                "telegram_outbox_receipt",
+                {
+                    "id": _outbox_receipt_id(dedupe_key),
+                    "status": "sent",
+                    "result": {"receipts": [{"method": "editMessageText", "progressFinal": True}]},
+                },
+            )
+            api_calls: list[tuple[str, dict]] = []
+
+            def fake_api(bot_token, method, body):
+                del bot_token
+                api_calls.append((method, body))
+                return {"ok": True, "result": True}
+
+            with (
+                mock.patch.object(telegram_gateway, "get_settings", return_value=settings),
+                mock.patch.object(telegram_gateway, "_telegram_api_request", side_effect=fake_api),
+            ):
+                result = await telegram_gateway.process_telegram_progress_job(
+                    repo,
+                    {
+                        "replyMessageId": reply["id"],
+                        "threadId": "executive",
+                        "channelReply": reply["channelReply"],
+                    },
+                    12_000,
+                )
+
+            self.assertEqual(result["status"], "done")
+            self.assertEqual(result["reason"], "already_finalized")
+            self.assertEqual(api_calls, [])
 
     async def test_send_telegram_payload_edits_progress_message_into_final_reply(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -4,7 +4,7 @@ import { useSelector, client } from '../state/useCompany'
 import { useUI } from '../state/ui'
 import { Progress, Pill, cx } from './primitives'
 import { PRIORITY_HEX, PRIORITY_LABEL, ACCENT_HEX } from '../lib/visuals'
-import { STATUS_HEX, STATUS_LABEL, originLabel } from '../lib/tasks'
+import { STATUS_HEX, originLabel, taskStatusLabel } from '../lib/tasks'
 import { relTime } from '../lib/format'
 import type { Task } from '../contract/types'
 
@@ -16,6 +16,26 @@ export function TaskCard({ task, compact }: { task: Task; compact?: boolean }) {
 
   const dept = departments.find((d) => d.id === task.departmentId)
   const getName = (id: string) => departments.find((d) => d.id === id)?.name ?? '—'
+  const statusText = taskStatusLabel(task, getName)
+  const waitingOnName = task.status === 'waiting' && task.waitingOn?.dept ? getName(task.waitingOn.dept) : ''
+  const waitingHandoff = task.status === 'waiting'
+    ? task.handoffs.find((handoff) => handoff.id === task.waitingOn?.handoffId)
+    : undefined
+  const waitingPacket = waitingHandoff?.contextPacketFilename || waitingHandoff?.contextPacketArtifactId || ''
+  const waitingReason = task.waitingOn?.reason || ''
+  const waitingReasonLabels: Record<string, string> = {
+    handoff_reply: 'รอคำตอบจาก handoff',
+    missing_file: 'รอไฟล์หรือหลักฐาน',
+    clarification: 'รอคำถาม/คำชี้แจง',
+    executive_decision: 'รอ AI ผู้บริหารตัดสิน',
+    blocked_retry_guard: 'หยุดรันอัตโนมัติ',
+  }
+  const waitingReasonText = waitingReasonLabels[waitingReason] ?? waitingReason
+  const waitingStatus = waitingHandoff?.status ? ` · status: ${waitingHandoff.status}` : ''
+  const blockedGuard = task.blockedRetryGuard && typeof task.blockedRetryGuard === 'object'
+    ? task.blockedRetryGuard as Record<string, unknown>
+    : null
+  const blockedFrozen = blockedGuard?.status === 'frozen'
   const active =
     task.status === 'in_progress' ||
     task.status === 'review' ||
@@ -79,7 +99,7 @@ export function TaskCard({ task, compact }: { task: Task; compact?: boolean }) {
       )}
 
       <div className="mt-2 flex flex-wrap items-center gap-1.5">
-        <Pill color={STATUS_HEX[task.status]}>{STATUS_LABEL[task.status]}</Pill>
+        <Pill color={STATUS_HEX[task.status]}>{statusText}</Pill>
         {dept && (
           <span className="text-[11px] text-[var(--color-cream-dim)]">
             {dept.emoji} {dept.name}
@@ -103,6 +123,23 @@ export function TaskCard({ task, compact }: { task: Task; compact?: boolean }) {
         จาก {originLabel(task.origin, getName)}
       </div>
 
+      {task.status === 'waiting' && (
+        <div
+          className="mt-2 rounded-md border px-2 py-1.5 text-[10px] leading-relaxed text-[var(--color-cream-dim)]"
+          style={{
+            borderColor: `${STATUS_HEX.waiting}55`,
+            background: `${STATUS_HEX.waiting}14`,
+          }}
+        >
+          {waitingOnName && waitingOnName !== '—'
+            ? `รอการตอบกลับจากฝ่าย${waitingOnName}`
+            : 'รอการตอบกลับจากแผนกที่เกี่ยวข้อง'}
+          {waitingReasonText ? ` · ${waitingReasonText}` : ''}
+          {waitingStatus}
+          {waitingPacket ? ` · packet: ${waitingPacket}` : ''}
+        </div>
+      )}
+
       {task.status === 'blocked' && (
         <div
           className="mt-2 rounded-md border px-2 py-1.5 text-[10px] leading-relaxed text-[var(--color-cream-dim)]"
@@ -111,7 +148,10 @@ export function TaskCard({ task, compact }: { task: Task; compact?: boolean }) {
             background: `${STATUS_HEX.blocked}14`,
           }}
         >
-          ติดปัญหา: แผนกหรือเครื่องมือไปต่อไม่ได้ รอผู้บริหารตรวจสาเหตุจากแชทและบันทึกงาน
+          {blockedFrozen
+            ? 'หยุดรันอัตโนมัติ: ให้ AI ผู้บริหารตัดสินแล้ว'
+            : 'ติดปัญหา: แผนกหรือเครื่องมือไปต่อไม่ได้ รอผู้บริหารตรวจสาเหตุจากแชทและบันทึกงาน'}
+          {blockedGuard?.executiveAction ? ` · action: ${String(blockedGuard.executiveAction)}` : ''}
         </div>
       )}
 

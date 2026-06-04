@@ -61,6 +61,7 @@ from .audio_transcription import (
     AudioTranscriptionError,
     AudioTranscriptionNotConfigured,
     audio_transcription_status,
+    execute_audio_transcription_tool,
     format_audio_transcript_preview,
     is_audio_file,
     transcribe_audio_bytes,
@@ -150,6 +151,7 @@ from .handoffs import (
     handoff_participants,
     handoff_status_for_act,
     make_handoff_message,
+    normalize_handoff_status,
 )
 from .host_bridge_proof import host_bridge_parity_proof_id, host_bridge_source_provenance
 from .engine import (
@@ -342,6 +344,7 @@ from .scheduling import (
 from .threads import dept_id_from_thread, is_exec, thread_id_for
 from .task_review import apply_task_review_schedule, enqueue_task_review_reminder, normalize_review_interval_ms, review_interval_label
 from .telegram_gateway import handle_telegram_update, run_telegram_polling_loop, telegram_webhook_secret
+from .work_visibility import emit_work_status_notice, visibility_event_label
 
 logger = logging.getLogger(__name__)
 
@@ -757,6 +760,28 @@ def _job_stale_after_ms(settings: Any) -> int:
     engine_stale_s = float(getattr(settings, "engine_stale_after_s", 0) or 0)
     job_timeout_s = float(getattr(settings, "engine_job_timeout_s", 0) or 0)
     return int(max(1.0, engine_stale_s, job_timeout_s) * 1000)
+
+
+def _database_fingerprint(settings: Any) -> dict[str, Any]:
+    url = str(getattr(settings, "effective_database_url", "") or "")
+    parsed = urlparse(url)
+    backend = parsed.scheme.split("+", 1)[0] or "unknown"
+    redacted = url
+    if parsed.password:
+        netloc = parsed.netloc.replace(f":{parsed.password}@", ":***@")
+        redacted = parsed._replace(netloc=netloc).geturl()
+    elif backend == "sqlite":
+        redacted = parsed.path or url
+        if redacted.startswith("//"):
+            redacted = redacted[1:]
+    explicitly_configured = bool(getattr(settings, "database_url", "") or "")
+    return {
+        "backend": backend,
+        "configured": bool(url),
+        "explicitlyConfigured": explicitly_configured,
+        "redacted": redacted,
+        "fingerprint": hashlib.sha256(redacted.encode("utf-8")).hexdigest()[:12],
+    }
 
 AUDITED_API_METHODS = {"POST", "PATCH", "PUT", "DELETE"}
 
@@ -2035,6 +2060,7 @@ MUTATING_TOOLS = {
     "notify.send",
     "scheduler.create",
     "logs.note",
+    "audio.transcribe",
     "image.generate",
 }
 CHECKPOINT_RISKS = {"local_write", "host_write", "destructive", "external_send", "privileged"}
@@ -2443,6 +2469,8 @@ def _tool_risk_class(run: dict[str, Any]) -> ToolRiskClass:
         return "credential" if contains_credential else "local_write"
     if tool == "image.generate":
         return "credential" if contains_credential else "external_send"
+    if tool == "audio.transcribe":
+        return "credential" if contains_credential else "external_send"
     if tool in {"fs.list", "fs.read"}:
         if args.get("path"):
             _, _, inside = _tool_path_info(run["departmentId"], args.get("path"))
@@ -2483,6 +2511,12 @@ def _tool_runtime_block_reason(run: dict[str, Any]) -> str | None:
         return None
     if tool == "image.generate" and not settings.image_generation_api_key:
         return "ATRIUM_IMAGE_GENERATION_API_KEY is not configured"
+    if tool == "audio.transcribe":
+        status = audio_transcription_status(settings)
+        if not status.get("enabled"):
+            return "audio transcription is disabled"
+        if not status.get("configured"):
+            return "OpenAI audio transcription is not configured; set ATRIUM_OPENAI_API_KEY or enable a supported ChatGPT OAuth audio route"
     if tool == "mcp.call":
         return _mcp_runtime_block_reason(args)
     if tool.startswith("browser.") or tool.startswith("desktop.") or tool == "notify.send":
@@ -4363,6 +4397,8 @@ async def _execute_repo_tool(repo: Repo, run: dict[str, Any]) -> dict[str, Any] 
 
     if tool in VIDEO_TOOL_NAMES:
         return await execute_video_tool(repo, {**run, "tool": tool})
+    if tool == "audio.transcribe":
+        return await execute_audio_transcription_tool(repo, {**run, "tool": tool})
     if tool == "image.generate":
         explicit_async = args.get("asyncMode") if "asyncMode" in args else args.get("async_mode")
         wait_for_result = (
@@ -7688,6 +7724,7 @@ async def runtime_status() -> dict[str, Any]:
                 "model": settings.ollama_embedding_model,
             },
             "memory": memory,
+            "database": _database_fingerprint(settings),
             "objectStoreEnabled": settings.object_store_enabled,
             "backup": _backup_runtime_status(settings, now),
             "toolRegistryCount": len(registry.list()),
@@ -8228,17 +8265,24 @@ async def get_activity(
 async def get_thread_messages(
     thread_id: str,
     after: int | None = Query(default=None),
+    after_id: str | None = Query(default=None, alias="afterId"),
+    before: int | None = Query(default=None),
+    before_id: str | None = Query(default=None, alias="beforeId"),
     limit: int = Query(default=200, ge=1, le=1000),
     all_: bool = Query(default=False, alias="all"),
 ) -> list[dict[str, Any]]:
     """Replay durable chat messages so reconnecting clients can fill transcript gaps."""
+    if before is not None and after is not None:
+        raise HTTPException(status_code=400, detail="use either before or after, not both")
     async with session_scope() as s:
         repo = Repo(s)
-        if all_ and after is None:
+        if all_ and after is None and before is None:
             return await repo.all_thread_messages(thread_id)
+        if before is not None:
+            return await repo.thread_messages_before(thread_id, before_ts=before, before_id=before_id, limit=limit)
         if after is None:
             return await repo.thread_messages(thread_id, limit=limit)
-        return await repo.thread_messages_after(thread_id, after_ts=after, limit=limit)
+        return await repo.thread_messages_after(thread_id, after_ts=after, after_id=after_id, limit=limit)
 
 
 @app.get("/api/threads/{thread_id}/cost", response_model=ThreadCostSummary)
@@ -8800,7 +8844,7 @@ async def _apply_handoff_message_to_tasks(
             if handoff.get("id") != handoff_id:
                 updated_handoffs.append(handoff)
                 continue
-            current_status = status
+            current_status = normalize_handoff_status(status)
             reject_count = sum(
                 1 for m in [*handoff.get("messages", []), message] if m.get("act") == "reject"
             )
@@ -8808,29 +8852,41 @@ async def _apply_handoff_message_to_tasks(
                 current_status = "escalated"
                 escalated = True
             updated = append_handoff_message(handoff, message, status=current_status)
+            updated["lastActionAt"] = now
+            if current_status in {"rejected", "escalated", "closed", "cancelled"}:
+                updated["closedAt"] = updated.get("closedAt") or now
+                updated["closedBy"] = updated.get("closedBy") or message["from"]
             updated_handoffs.append(updated)
             task_changed = True
 
             if task["id"] == updated.get("sourceTaskId"):
                 if message["act"] == "clarify":
-                    task["status"] = "blocked"
-                    task["waitingOn"] = {"dept": message["from"], "handoffId": handoff_id}
+                    task["status"] = "waiting"
+                    task["waitingOn"] = {"dept": message["from"], "handoffId": handoff_id, "reason": "clarification"}
                 elif message["act"] == "reply":
                     task.pop("waitingOn", None)
-                    if task.get("status") == "blocked":
+                    if task.get("status") in {"blocked", "waiting"}:
                         task["status"] = "in_progress"
-                elif message["act"] == "deliver":
+                elif message["act"] in {"deliver", "return"}:
                     task.pop("waitingOn", None)
-                    if task.get("status") == "blocked":
-                        task["status"] = "in_progress"
+                    if task.get("status") in {"blocked", "waiting"}:
+                        task["status"] = "review" if message["act"] == "deliver" else "in_progress"
                 elif message["act"] == "reject":
                     task["status"] = "blocked" if escalated else "revising"
-                    task["waitingOn"] = {"dept": "executive" if escalated else message["from"], "handoffId": handoff_id}
+                    task["waitingOn"] = {
+                        "dept": "executive" if escalated else message["from"],
+                        "handoffId": handoff_id,
+                        "reason": "executive_decision" if escalated else "clarification",
+                    }
 
             if task["id"] == updated.get("targetTaskId"):
-                if message["act"] == "deliver":
+                if message["act"] in {"deliver", "return"}:
                     task["status"] = "done"
                     task["progress"] = 1
+                    updated["deliverableArtifactIds"] = list(dict.fromkeys([
+                        *updated.get("deliverableArtifactIds", []),
+                        *[str(item) for item in task.get("deliverables", []) if str(item).strip()],
+                    ]))
                     dept = await repo.get_department(task.get("departmentId"))
                     if dept and dept.get("currentTaskId") == task["id"]:
                         dept["state"] = "idle"
@@ -8857,7 +8913,7 @@ async def _apply_handoff_message_to_tasks(
                         dept,
                         task,
                         now,
-                        reason="หลัง handoff ปลดบล็อก",
+                        reason="หลัง handoff ตอบกลับ",
                     )
             touched = True
     if not touched:
@@ -8871,6 +8927,20 @@ async def _apply_handoff_message_to_tasks(
             if h.get("id") == handoff_id
         )
         await _escalate_handoff_rejects(repo, handoff, reject_count=reject_count, now=now)
+        source_dept = await repo.get_department(str(handoff.get("fromDept") or ""))
+        target_dept = await repo.get_department(str(handoff.get("toDept") or ""))
+        await emit_work_status_notice(
+            repo,
+            event="handoff_escalated",
+            summary=f"handoff {handoff_id} ถูกส่งต่อผู้บริหารหลังถูกปฏิเสธ {reject_count} ครั้ง",
+            source_dept=source_dept or handoff.get("fromDept"),
+            target_dept=target_dept or handoff.get("toDept"),
+            task_id=handoff.get("sourceTaskId"),
+            handoff_id=handoff_id,
+            severity="warn",
+            now=now,
+            dedupe_key=f"handoff_escalated:{handoff_id}:{reject_count}",
+        )
 
 
 @app.post("/api/engine/tick", response_model=EngineTickResponse)
@@ -9330,7 +9400,7 @@ async def reassign_task(task_id: str, input: ReassignTaskInput) -> dict[str, Any
 
         old_dept = await repo.get_department(old_dept_id) if old_dept_id else None
         task["departmentId"] = target["id"]
-        if task.get("status") == "backlog":
+        if task.get("status") in {"backlog", "waiting"}:
             task["status"] = "assigned"
         task["waitingOn"] = None
         task["updatedAt"] = now
@@ -11658,6 +11728,30 @@ async def create_handoff_message(handoff_id: str, input: CreateHandoffMessageInp
             msg,
             status=handoff_status_for_act(input.act),
             now=now,
+        )
+        source_dept = await repo.get_department(str(handoff.get("fromDept") or ""))
+        target_dept = await repo.get_department(str(handoff.get("toDept") or ""))
+        event = {
+            "request": "handoff_requested",
+            "accept": "handoff_accepted",
+            "clarify": "handoff_clarify",
+            "reply": "handoff_reply",
+            "deliver": "handoff_delivered",
+            "return": "handoff_returned",
+            "reject": "handoff_rejected",
+        }.get(input.act, f"handoff_{input.act}")
+        actor_name = await _actor_display_name(repo, input.from_)
+        await emit_work_status_notice(
+            repo,
+            event=event,
+            summary=f"{actor_name} {visibility_event_label(event)}: {_clip_text(input.text, 260) or '-'}",
+            source_dept=source_dept or handoff.get("fromDept"),
+            target_dept=target_dept or handoff.get("toDept"),
+            task=task,
+            handoff_id=handoff_id,
+            severity="warn" if input.act in {"reject", "clarify"} else "good" if input.act in {"accept", "deliver"} else "info",
+            now=now,
+            dedupe_key=f"{event}:{handoff_id}:{msg['id']}",
         )
         await repo.add_activity(_activity(
             f"handoff {handoff_id}: {input.act}",

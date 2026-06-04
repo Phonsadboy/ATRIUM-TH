@@ -27,6 +27,7 @@ from urllib.parse import urlencode, urlparse
 
 from .clock import now_ms
 from .atrium_domain import agent_message_metadata, meeting_flow, meeting_participants, meeting_thread_id, system_chat_message
+from .audio_transcription import audio_transcription_status, execute_audio_transcription_tool
 from .catalog import DEFAULT_MODEL, MODELS, PROVIDERS, THINKING_EFFORTS, coerce_model_speed, normalize_ai_config
 from .chat_input import resolve_department_mentions
 from .config import get_settings
@@ -81,6 +82,7 @@ from .tools.visual_bridge import (
 )
 from .video_editing import VIDEO_TOOL_NAMES, execute_video_tool
 from .web_tools import execute_web_fetch, execute_web_search
+from .work_visibility import emit_work_status_notice, visibility_event_label
 
 CHAT_TOOL_RESULT_LIMIT = 16_000
 TOOL_MEMORY_ARGS_LIMIT = 420
@@ -464,6 +466,7 @@ def chat_tool_system_instructions(departments: list[dict[str, Any]], active_dept
         "When your assigned task is ready to close, request closure instead of marking it done yourself: call call_atrium_api with POST /api/tasks/{taskId}/request-close and include summary/detail. The executive approval resolves the final done/revising state. "
         "When you are tagged, handed off, or need another department's context, call read_conversation with departmentId or threadId and the latest message count you need. "
         "When you need to send a visible message to another department or the executive, call post_visible_chat_message with targetDepartmentId, departmentId, or threadId. "
+        "When you receive work, send work to another agent, return handoff output, finish a nudge/deferred task, get blocked, or request/receive task-close review, call report_work_status so the executive and related department rooms see a durable status summary. "
         "ATRIUM Owner Mode is full-system-first: use available Owner tools directly without asking the user for approval, unless the user explicitly asks you to pause before acting. "
         "For image requests, use generate_image_asset so the generated file becomes a durable artifact and the next model turn can inspect the pixels when supported. "
         "Image generation is queued by default: the tool returns jobId/statusUrl immediately, you continue working, and the chat gets updated with attachments when the background job finishes. "
@@ -486,6 +489,7 @@ def chat_tool_system_instructions(departments: list[dict[str, Any]], active_dept
         "When you need time to pass before continuing, call wait_and_continue yourself: use mode='inline' for short waits up to 60 seconds so this same turn sleeps and continues without replying to the user, and use mode='wake' for longer waits so the current turn can answer briefly and ATRIUM queues a future chat_reply to resume the work. "
         "For local files or chat attachment artifacts that you need to inspect more deeply, use open_local_file with a path or artifactId; "
         "it imports host files as durable artifacts and returns image pixels to the next model turn when possible. "
+        "For voice notes or audio files, call run_owner_tool with tool='audio.transcribe' and artifactId when available; it persists a transcript artifact and attaches audioTranscription context to the source artifact. "
         "For visual browser or desktop work, call browser.profiles when profile context matters; use profile='atrium' (aliases own/agent/system) for ATRIUM's isolated browser profile and profile='user' only when an existing user login/session is needed. "
         "For JS-heavy web UI flows in an isolated profile, prefer browser.snapshot to get DOM refs and browser.act to click/fill/type/press by ref or selector before falling back to coordinate clicks. "
         "For native desktop apps, prefer desktop.snapshot to get fresh accessibility/UIA refs and desktop.act to act by ref when available; choose refs whose supportedActions include the needed action, prefer nativeActionable refs when available, set requireNative=true when the task must prove semantic Accessibility/UIAutomation control instead of coordinate fallback, and use screenshot coordinates when accessibility refs are missing or visual pixels matter. "
@@ -870,6 +874,55 @@ def chat_tool_definitions(departments: list[dict[str, Any]], active_dept: dict[s
                     "beforeTs": {"type": "integer", "description": "Optional epoch-ms upper bound; messages at or after this timestamp are skipped."},
                     "includeSystem": {"type": "boolean", "description": "Include ATRIUM system/work-log messages. Default true."},
                 },
+            },
+        },
+        {
+            "name": "report_work_status",
+            "description": (
+                "Post a durable, routed work-status summary to the executive room and related department rooms. "
+                "Use this for task assignment receipt, handoff send/return, close-review status, blocked/revising status, "
+                "or completion of an AI-to-AI/deferred/background continuation."
+            ),
+            "input_schema": {
+                "type": "object",
+                "properties": {
+                    "event": {
+                        "type": "string",
+                        "enum": [
+                            "task_assigned",
+                            "task_started",
+                            "task_review",
+                            "task_blocked",
+                            "task_revising",
+                            "task_close_requested",
+                            "task_close_approved",
+                            "task_close_rejected",
+                            "handoff_requested",
+                            "handoff_accepted",
+                            "handoff_clarify",
+                            "handoff_reply",
+                            "handoff_delivered",
+                            "handoff_returned",
+                            "handoff_rejected",
+                            "handoff_escalated",
+                            "agent_reply_finished",
+                        ],
+                        "description": "Lifecycle event being reported.",
+                    },
+                    "summary": {"type": "string", "description": "Short visible Thai status summary."},
+                    "taskId": {"type": "string", "description": "Optional related task id."},
+                    "handoffId": {"type": "string", "description": "Optional related handoff id."},
+                    "targetDepartmentId": {
+                        "type": "string",
+                        "description": "Optional target/receiving department id, including exec for executive.",
+                    },
+                    "severity": {"type": "string", "enum": ["info", "good", "warn", "alert"]},
+                    "threadId": {
+                        "type": "string",
+                        "description": "Optional extra room to notify, such as handoff:<task>:<from>:<to> or war:<id>.",
+                    },
+                },
+                "required": ["event", "summary"],
             },
         },
         {
@@ -2709,6 +2762,8 @@ async def _dispatch_chat_tool(
         return await _read_conversation_tool(repo, args, active_dept, thread_id)
     if tool == "post_visible_chat_message":
         return await _post_visible_chat_message_tool(repo, args, active_dept, thread_id)
+    if tool == "report_work_status":
+        return await _report_work_status_tool(repo, args, active_dept, thread_id)
     if tool == "get_finance_snapshot":
         return await _finance_snapshot_tool(repo, args)
     if tool == "schedule_meeting":
@@ -2936,6 +2991,7 @@ OWNER_TOOL_MUTATING_TOOLS = {
     "notify.send",
     "scheduler.create",
     "logs.note",
+    "audio.transcribe",
     "video.create_project",
     "video.add_asset",
     "video.sample_frames",
@@ -3148,6 +3204,8 @@ def _owner_tool_risk(run: dict[str, Any]) -> str:
     if tool in VIDEO_TOOL_NAMES:
         item = _owner_tool_catalog_item(tool) or {}
         return str(item.get("riskClass") or "local_write")
+    if tool == "audio.transcribe":
+        return "external_send"
     if tool == "sandbox.exec":
         return "network" if args.get("network") else "command"
     if tool in {"git.status", "git.diff", "logs.query", "browser.snapshot", "browser.screenshot", "desktop.snapshot", "desktop.screenshot", "desktop.apps"}:
@@ -3338,6 +3396,12 @@ def _owner_runtime_block(run: dict[str, Any]) -> str | None:
         return None
     if tool == "mcp.call":
         return _mcp_runtime_block(args)
+    if tool == "audio.transcribe":
+        status = audio_transcription_status(get_settings())
+        if not status.get("enabled"):
+            return "audio transcription is disabled"
+        if not status.get("configured"):
+            return "OpenAI audio transcription is not configured; set ATRIUM_OPENAI_API_KEY or enable a supported ChatGPT OAuth audio route"
     if tool.startswith("browser.") or tool.startswith("desktop.") or tool == "notify.send":
         allowed, reason = HostBridge().can_run(tool, args)
         if not allowed:
@@ -5950,6 +6014,8 @@ async def _owner_execute_tool_async(repo: Repo, run: dict[str, Any]) -> dict[str
     args = run.get("args") or {}
     if tool in VIDEO_TOOL_NAMES:
         return await execute_video_tool(repo, {**run, "tool": tool})
+    if tool == "audio.transcribe":
+        return await execute_audio_transcription_tool(repo, {**run, "tool": tool})
     if tool == "shell.exec" and bool(args.get("background") or args.get("async") or args.get("asyncMode")):
         return await _owner_start_background_shell_run(repo, run)
     if tool == "process":
@@ -6425,6 +6491,17 @@ async def _create_task_tool(repo: Repo, args: dict[str, Any], active_dept: dict[
         department_id=target["id"],
         severity="good",
     ))
+    await emit_work_status_notice(
+        repo,
+        event="task_assigned",
+        summary=f"{active_dept.get('agentName', active_dept['id'])} มอบหมายงาน “{task['title']}” ให้ฝ่าย{target.get('name', target['id'])}",
+        source_dept=active_dept,
+        target_dept=target,
+        task=task,
+        severity="good",
+        now=now,
+        dedupe_key=f"task_assigned:{task['id']}",
+    )
     woke = await _wake_department_for_new_task(repo, target, task, now)
     if woke:
         hub.pulse({
@@ -6473,6 +6550,17 @@ async def _wake_department_for_new_task(
         severity="good",
         ts=now,
     ))
+    await emit_work_status_notice(
+        repo,
+        event="task_started",
+        summary=f"ฝ่าย{dept.get('name', dept['id'])}เริ่มงาน “{task['title']}” ทันทีหลังรับมอบหมาย",
+        source_dept=dept,
+        task=task,
+        severity="good",
+        now=now,
+        dedupe_key=f"task_started:{task['id']}",
+        include_executive=False,
+    )
     if (task.get("origin") or {}).get("kind") == "executive":
         msg = system_chat_message(
             EXEC_THREAD,
@@ -7056,6 +7144,77 @@ async def _read_conversation_tool(
         "departmentId": read_dept_id,
         "readerDepartmentId": active_dept["id"],
         "messages": [_conversation_message_payload(message) for message in selected],
+    }
+
+
+async def _report_work_status_tool(
+    repo: Repo,
+    args: dict[str, Any],
+    active_dept: dict[str, Any],
+    thread_id: str,
+) -> dict[str, Any]:
+    event = str(args.get("event") or "").strip()
+    if not event:
+        raise ValueError("event is required")
+    summary = _clip_text(str(args.get("summary") or args.get("text") or "").strip(), 2000)
+    if not summary:
+        raise ValueError("summary is required")
+    severity = str(args.get("severity") or "info").strip()
+    if severity not in {"info", "good", "warn", "alert"}:
+        severity = "info"
+    task_id = str(args.get("taskId") or args.get("task_id") or "").strip() or None
+    handoff_id = str(args.get("handoffId") or args.get("handoff_id") or "").strip() or None
+    target_dept_id = str(
+        args.get("targetDepartmentId")
+        or args.get("target_department_id")
+        or args.get("departmentId")
+        or args.get("department_id")
+        or ""
+    ).strip()
+    target_dept = await repo.get_department(target_dept_id) if target_dept_id else None
+    if target_dept_id and not target_dept:
+        raise ValueError("targetDepartmentId does not match an existing department")
+    task = await repo.get_task(task_id) if task_id else None
+    if task_id and not task:
+        raise ValueError(f"task not found: {task_id}")
+    extra_threads: list[str] = []
+    extra_thread = _normalize_tool_thread_id(args.get("threadId") or args.get("thread_id"))
+    if extra_thread:
+        extra_threads.append(extra_thread)
+    elif thread_id:
+        extra_threads.append(thread_id)
+    fingerprint = hashlib.sha1(summary.encode("utf-8")).hexdigest()[:12]
+    messages = await emit_work_status_notice(
+        repo,
+        event=event,
+        summary=summary,
+        source_dept=active_dept,
+        target_dept=target_dept,
+        task=task,
+        task_id=task_id,
+        handoff_id=handoff_id,
+        severity=severity,
+        dedupe_key=":".join(
+            item for item in ["report_work_status", event, task_id or "", handoff_id or "", active_dept["id"], target_dept_id, fingerprint] if item
+        ),
+        extra_threads=extra_threads,
+        as_agent=True,
+        author_dept=active_dept,
+    )
+    await repo.add_activity(_activity(
+        f"{active_dept.get('agentName', active_dept['id'])} รายงานสถานะงาน: {visibility_event_label(event)}",
+        type_="message",
+        department_id=active_dept["id"],
+        severity=severity,
+    ))
+    hub.mark_dirty()
+    return {
+        "ok": True,
+        "tool": "report_work_status",
+        "summary": f"reported {event} to {len(messages)} room(s)",
+        "event": event,
+        "messageCount": len(messages),
+        "messages": [_conversation_message_payload(message) for message in messages],
     }
 
 

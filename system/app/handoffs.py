@@ -5,6 +5,20 @@ from typing import Any
 from .ids import uid
 from .threads import EXEC_ID, is_exec, thread_id_for
 
+HANDOFF_TERMINAL_STATUSES = {"closed", "cancelled", "rejected", "escalated"}
+HANDOFF_OPEN_STATUSES = {
+    "draft",
+    "requested",
+    "accepted",
+    "in_progress",
+    "clarification_requested",
+    "missing_file",
+    "delivered",
+    "returned",
+    "open",
+    "clarifying",
+}
+
 
 def handoff_thread_id(task_id: str, from_dept: str, to_dept: str) -> str:
     return f"handoff:{task_id}:{from_dept}:{to_dept}"
@@ -14,11 +28,26 @@ def handoff_status_for_act(act: str) -> str:
     return {
         "accept": "accepted",
         "reject": "rejected",
-        "clarify": "clarifying",
-        "reply": "open",
+        "clarify": "clarification_requested",
+        "reply": "in_progress",
         "deliver": "delivered",
-        "request": "open",
-    }.get(act, "open")
+        "return": "returned",
+        "request": "requested",
+    }.get(act, "requested")
+
+
+def normalize_handoff_status(status: Any) -> str:
+    value = str(status or "requested").strip().lower()
+    return {
+        "open": "requested",
+        "clarifying": "clarification_requested",
+        "reply": "in_progress",
+    }.get(value, value)
+
+
+def handoff_is_open(status: Any) -> bool:
+    normalized = normalize_handoff_status(status)
+    return normalized in HANDOFF_OPEN_STATUSES and normalized not in HANDOFF_TERMINAL_STATUSES
 
 
 def handoff_source_task_id(handoff: dict[str, Any], fallback_task_id: str) -> str:
@@ -95,8 +124,9 @@ def append_handoff_message(
 ) -> dict[str, Any]:
     existing = [m for m in handoff.get("messages", []) if m.get("id") != message["id"]]
     updated = {**handoff, "messages": [*existing, message]}
+    updated["lastActionAt"] = message.get("ts") or updated.get("lastActionAt")
     if status is not None:
-        updated["status"] = status
+        updated["status"] = normalize_handoff_status(status)
     if not updated.get("contextPacketRef") and message.get("act") == "request":
         updated["contextPacketRef"] = message["id"]
     return updated

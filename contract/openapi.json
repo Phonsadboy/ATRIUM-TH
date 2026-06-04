@@ -441,6 +441,8 @@
               {
                 "enum": [
                   "department",
+                  "executive",
+                  "full_auto",
                   "user"
                 ],
                 "type": "string"
@@ -3589,7 +3591,8 @@
               "reject",
               "clarify",
               "reply",
-              "deliver"
+              "deliver",
+              "return"
             ],
             "title": "Act",
             "type": "string"
@@ -6088,6 +6091,72 @@
       },
       "Handoff": {
         "properties": {
+          "chainId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Chainid"
+          },
+          "closedAt": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Closedat"
+          },
+          "closedBy": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Closedby"
+          },
+          "contextPacketArtifactId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contextpacketartifactid"
+          },
+          "contextPacketArtifactVersion": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contextpacketartifactversion"
+          },
+          "contextPacketFilename": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contextpacketfilename"
+          },
           "contextPacketRef": {
             "anyOf": [
               {
@@ -6098,6 +6167,35 @@
               }
             ],
             "title": "Contextpacketref"
+          },
+          "contextPacketUri": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contextpacketuri"
+          },
+          "deadlineAt": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deadlineat"
+          },
+          "deliverableArtifactIds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Deliverableartifactids",
+            "type": "array"
           },
           "depth": {
             "default": 0,
@@ -6122,6 +6220,17 @@
             "title": "Kind",
             "type": "string"
           },
+          "lastActionAt": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lastactionat"
+          },
           "messages": {
             "items": {
               "additionalProperties": true,
@@ -6130,9 +6239,31 @@
             "title": "Messages",
             "type": "array"
           },
+          "parentHandoffId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parenthandoffid"
+          },
           "reason": {
             "title": "Reason",
             "type": "string"
+          },
+          "replyToHandoffId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Replytohandoffid"
           },
           "sourceTaskId": {
             "anyOf": [
@@ -6148,6 +6279,23 @@
           "status": {
             "anyOf": [
               {
+                "enum": [
+                  "draft",
+                  "requested",
+                  "accepted",
+                  "in_progress",
+                  "clarification_requested",
+                  "missing_file",
+                  "delivered",
+                  "returned",
+                  "rejected",
+                  "escalated",
+                  "closed",
+                  "cancelled"
+                ],
+                "type": "string"
+              },
+              {
                 "type": "string"
               },
               {
@@ -6155,6 +6303,17 @@
               }
             ],
             "title": "Status"
+          },
+          "statusReason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Statusreason"
           },
           "targetTaskId": {
             "anyOf": [
@@ -6207,7 +6366,8 @@
               "reject",
               "clarify",
               "reply",
-              "deliver"
+              "deliver",
+              "return"
             ],
             "title": "Act",
             "type": "string"
@@ -10063,6 +10223,29 @@
       },
       "Task": {
         "properties": {
+          "blockedRetryCount": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Blockedretrycount"
+          },
+          "blockedRetryGuard": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Blockedretryguard"
+          },
           "createdAt": {
             "title": "Createdat",
             "type": "integer"
@@ -10111,6 +10294,17 @@
             ],
             "title": "Draftdeliverablemarkdown"
           },
+          "handoffChainId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Handoffchainid"
+          },
           "handoffs": {
             "items": {
               "$ref": "#/components/schemas/Handoff"
@@ -10132,6 +10326,17 @@
               }
             ],
             "title": "Lastreviewreminderat"
+          },
+          "lastUnblockAttemptAt": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lastunblockattemptat"
           },
           "log": {
             "items": {
@@ -10238,6 +10443,7 @@
               "in_progress",
               "review",
               "revising",
+              "waiting",
               "done",
               "blocked",
               "cancelled"
@@ -19306,6 +19512,7 @@
                     "in_progress",
                     "review",
                     "revising",
+                    "waiting",
                     "done",
                     "blocked",
                     "cancelled"
@@ -20110,6 +20317,54 @@
                 }
               ],
               "title": "After"
+            }
+          },
+          {
+            "in": "query",
+            "name": "afterId",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Afterid"
+            }
+          },
+          {
+            "in": "query",
+            "name": "before",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Before"
+            }
+          },
+          {
+            "in": "query",
+            "name": "beforeId",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Beforeid"
             }
           },
           {

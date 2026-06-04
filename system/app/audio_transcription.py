@@ -6,6 +6,7 @@ OAuth can be opted in only for routes that are known to accept it.
 """
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,10 @@ from typing import Any
 import httpx
 
 from .config import Settings, get_settings
+from .clock import now_ms
+from .file_intake import bytes_from_uri, guess_mime, safe_filename
+from .ids import uid
+from .schema import Artifact, ArtifactVersion
 
 DEFAULT_OPENAI_AUDIO_MODEL = "gpt-4o-transcribe"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
@@ -28,6 +33,7 @@ AUDIO_SUFFIXES = {
     ".wav",
     ".webm",
 }
+TOOL_RESULT_TEXT_LIMIT = 16_000
 
 
 class AudioTranscriptionError(RuntimeError):
@@ -35,6 +41,10 @@ class AudioTranscriptionError(RuntimeError):
 
 
 class AudioTranscriptionNotConfigured(AudioTranscriptionError):
+    pass
+
+
+class AudioTranscriptionSourceError(AudioTranscriptionError):
     pass
 
 
@@ -174,6 +184,291 @@ def format_audio_transcript_preview(result: AudioTranscriptionResult) -> str:
         result.text.strip(),
     ]
     return "\n".join(lines).strip()
+
+
+def _clip_text(text: str, limit: int = TOOL_RESULT_TEXT_LIMIT) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit].rstrip() + "\n...[truncated]"
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on", "enabled"}
+    return False
+
+
+def _string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(",") if item.strip()]
+    return []
+
+
+async def _resolve_audio_tool_source(
+    repo: Any,
+    args: dict[str, Any],
+    *,
+    max_bytes: int,
+) -> tuple[bytes, str, str, dict[str, Any] | None, str]:
+    artifact_id = str(args.get("artifactId") or args.get("artifact_id") or "").strip()
+    if artifact_id:
+        artifact = await repo.get_entity("artifact", artifact_id)
+        if not artifact:
+            raise AudioTranscriptionSourceError(f"artifact not found: {artifact_id}")
+        filename = safe_filename(args.get("filename") or artifact.get("name") or f"{artifact_id}.audio")
+        mime = guess_mime(filename, artifact.get("contentMime") or artifact.get("mime"))
+        data = bytes_from_uri(artifact.get("uri"), max_bytes=max_bytes if max_bytes > 0 else None)
+        if data is None:
+            raise AudioTranscriptionSourceError(
+                "artifact bytes are unavailable or exceed the configured transcription limit"
+            )
+        return data, filename, mime, artifact, f"artifact:{artifact_id}"
+
+    raw_uri = str(args.get("uri") or "").strip()
+    if raw_uri:
+        filename = safe_filename(args.get("filename") or args.get("name") or "audio-upload")
+        mime = guess_mime(filename, args.get("mime") or args.get("contentType"))
+        data = bytes_from_uri(raw_uri, max_bytes=max_bytes if max_bytes > 0 else None)
+        if data is None:
+            raise AudioTranscriptionSourceError("uri bytes are unavailable or exceed the configured transcription limit")
+        return data, filename, mime, None, raw_uri
+
+    raw_path = str(args.get("sourcePath") or args.get("source_path") or args.get("path") or "").strip()
+    if not raw_path:
+        raise AudioTranscriptionSourceError("audio.transcribe requires artifactId, uri, or sourcePath")
+    path = Path(raw_path).expanduser().resolve()
+    if not path.is_file():
+        raise AudioTranscriptionSourceError(f"audio source file not found: {path}")
+    if max_bytes > 0 and path.stat().st_size > max_bytes:
+        raise AudioTranscriptionSourceError(f"audio file exceeds transcription limit of {max_bytes} bytes")
+    filename = safe_filename(args.get("filename") or args.get("name") or path.name)
+    mime = guess_mime(filename, args.get("mime") or args.get("contentType"))
+    return path.read_bytes(), filename, mime, None, str(path)
+
+
+def _transcript_artifact_name(source_filename: str, requested: Any = None) -> str:
+    raw = safe_filename(str(requested or "").strip() or f"{Path(source_filename).stem or source_filename} transcript.md")
+    if Path(raw).suffix.lower() not in {".md", ".txt"}:
+        raw = f"{raw}.md"
+    return raw
+
+
+def _write_transcript_text(
+    text: str,
+    *,
+    owner_dept: str,
+    artifact_id: str,
+    settings: Settings,
+) -> tuple[str, str, str, int]:
+    mime = "text/markdown; charset=utf-8"
+    if bool(getattr(settings, "object_store_enabled", True)):
+        from .storage.object_store import get_object_store
+
+        stored = get_object_store(settings).put_text(text, mime=mime)
+        return stored.uri, "object_store", stored.content_hash, stored.size_bytes
+    path = (settings.workspace_dir / owner_dept / "artifacts" / artifact_id / "v1.md").resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    encoded = text.encode("utf-8")
+    return str(path), "filesystem", hashlib.sha256(encoded).hexdigest(), len(encoded)
+
+
+async def execute_audio_transcription_tool(repo: Any, run: dict[str, Any]) -> dict[str, Any]:
+    """Transcribe an ATRIUM artifact/URI/local audio path and persist a transcript artifact."""
+    args = run.get("args") or {}
+    settings = get_settings()
+    max_bytes = int(getattr(settings, "audio_transcription_max_bytes", 20 * 1024 * 1024) or 0)
+    data, filename, mime, source_artifact, source_ref = await _resolve_audio_tool_source(
+        repo,
+        args,
+        max_bytes=max_bytes,
+    )
+    if not is_audio_file(filename, mime):
+        raise AudioTranscriptionSourceError("audio.transcribe source is not an audio file")
+
+    allow_oauth_raw = args.get("allowOAuth") if "allowOAuth" in args else args.get("allow_oauth")
+    allow_oauth = None if allow_oauth_raw is None else _truthy(allow_oauth_raw)
+    result = await transcribe_audio_bytes(
+        data,
+        filename=filename,
+        mime=mime,
+        settings=settings,
+        model=args.get("model"),
+        language=args.get("language"),
+        prompt=args.get("prompt"),
+        allow_oauth=allow_oauth,
+    )
+    owner_dept = str(
+        args.get("ownerDept")
+        or args.get("owner_dept")
+        or args.get("targetDept")
+        or args.get("target_dept")
+        or (source_artifact or {}).get("ownerDept")
+        or run.get("departmentId")
+        or "executive"
+    )
+    project_id = (
+        args.get("projectId")
+        or args.get("project_id")
+        or (source_artifact or {}).get("projectId")
+    )
+    requested_by = str(run.get("requestedBy") or args.get("requestedBy") or owner_dept)
+    transcript_md = format_audio_transcript_preview(result)
+    artifact_id = uid("art")
+    artifact_name = _transcript_artifact_name(
+        filename,
+        args.get("transcriptArtifactName") or args.get("transcript_artifact_name") or args.get("artifactName"),
+    )
+    uri, storage, content_hash, content_size = _write_transcript_text(
+        transcript_md,
+        owner_dept=owner_dept,
+        artifact_id=artifact_id,
+        settings=settings,
+    )
+    now = now_ms()
+    tags = _string_list(args.get("tags"))
+    for tag in ("audio", "transcript", "transcribed"):
+        if tag not in tags:
+            tags.append(tag)
+    source_artifact_id = str((source_artifact or {}).get("id") or "")
+    if source_artifact_id and source_artifact_id not in tags:
+        tags.append(source_artifact_id)
+    links = _string_list(args.get("links"))
+    if source_ref and source_ref not in links:
+        links.append(source_ref)
+    preview_record = {"kind": "md", "uri": uri}
+    artifact = Artifact(
+        id=artifact_id,
+        name=artifact_name,
+        kind="report",
+        mime="text/markdown; charset=utf-8",
+        owner_dept=owner_dept,
+        task_ids=[],
+        project_id=str(project_id) if project_id else None,
+        version=1,
+        status="approved",
+        uri=uri,
+        storage=storage,  # type: ignore[arg-type]
+        content_hash=content_hash,
+        content_size_bytes=content_size,
+        content_mime="text/markdown; charset=utf-8",
+        tags=tags,
+        links=links,
+        preview=preview_record,
+        created_at=now,
+        created_by=requested_by,
+        updated_at=now,
+        updated_by=requested_by,
+    ).dump()
+    artifact["audioSource"] = {
+        "artifactId": source_artifact_id or None,
+        "source": source_ref,
+        "filename": filename,
+        "mime": mime,
+    }
+    metadata_transcription = result.public_dict()
+    metadata_transcription.pop("text", None)
+    artifact["transcription"] = metadata_transcription
+    version = ArtifactVersion(
+        artifact_id=artifact_id,
+        version=1,
+        author=requested_by,
+        ts=now,
+        note=f"audio transcript for {filename}",
+        parent=None,
+        uri=uri,
+        storage=storage,  # type: ignore[arg-type]
+        content_hash=content_hash,
+        content_size_bytes=content_size,
+        content_mime="text/markdown; charset=utf-8",
+        preview=preview_record,
+    ).dump()
+    version["transcription"] = metadata_transcription
+    await repo.put_entity("artifact", artifact, dept=owner_dept, project=str(project_id) if project_id else None, status="approved", ts=now)
+    await repo.put_entity(
+        "artifact_version",
+        {**version, "id": f"{artifact_id}:1"},
+        dept=owner_dept,
+        project=str(project_id) if project_id else None,
+        status="approved",
+        ts=now,
+    )
+    await repo.add_knowledge(
+        owner_dept,
+        {
+            "id": uid("kn"),
+            "title": f"Transcript: {filename}",
+            "ts": now,
+            "score": 0.82,
+            "text": transcript_md[:10_000],
+            "tags": [*tags, artifact_id],
+            "source": artifact_id,
+        },
+        source=artifact_id,
+    )
+
+    if source_artifact:
+        updated_source = {**source_artifact}
+        source_tags = list(updated_source.get("tags") or [])
+        for tag in ("audio", "transcribed"):
+            if tag not in source_tags:
+                source_tags.append(tag)
+        updated_source["tags"] = source_tags
+        updated_source["audioTranscription"] = result.public_dict()
+        updated_source["transcriptArtifactId"] = artifact_id
+        updated_source["preview"] = preview_record
+        updated_source["extraction"] = {"status": "audio_transcription", "warnings": []}
+        updated_source["updatedAt"] = now
+        updated_source["updatedBy"] = requested_by
+        await repo.put_entity(
+            "artifact",
+            updated_source,
+            dept=updated_source.get("ownerDept") or owner_dept,
+            project=updated_source.get("projectId") or project_id,
+            status=updated_source.get("status") or "approved",
+            ts=now,
+        )
+
+    await repo.add_activity(
+        {
+            "id": uid("ev"),
+            "ts": now,
+            "type": "system",
+            "departmentId": owner_dept,
+            "text": f"audio.transcribe: {filename} -> {artifact_id}",
+            "severity": "good",
+        }
+    )
+    public_transcription = result.public_dict()
+    full_text = str(public_transcription.pop("text", result.text) or result.text)
+    text_preview = _clip_text(full_text)
+    return {
+        "ok": True,
+        "status": "succeeded",
+        "tool": "audio.transcribe",
+        "summary": f"transcribed {filename} to artifact {artifact_id}",
+        "transcription": public_transcription,
+        "text": text_preview,
+        "textTruncated": len(full_text) > TOOL_RESULT_TEXT_LIMIT,
+        "artifact": artifact,
+        "transcriptArtifact": artifact,
+        "sourceArtifactId": source_artifact_id or None,
+        "source": source_ref,
+        "preview": {
+            "kind": "md",
+            "uri": uri,
+            "text": text_preview,
+            "download": f"/api/artifacts/{artifact_id}/download",
+        },
+    }
 
 
 async def transcribe_audio_bytes(

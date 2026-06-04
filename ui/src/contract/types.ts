@@ -164,6 +164,7 @@ export type TaskStatus =
   | 'in_progress'
   | 'review'
   | 'revising'
+  | 'waiting'
   | 'done'
   | 'blocked'
   | 'cancelled'
@@ -176,6 +177,19 @@ export type Originator =
   | { kind: 'department'; id: ID }
 
 export type HandoffKind = 'delegate' | 'consult' | 'collaborate' | 'return'
+export type HandoffStatus =
+  | 'draft'
+  | 'requested'
+  | 'accepted'
+  | 'in_progress'
+  | 'clarification_requested'
+  | 'missing_file'
+  | 'delivered'
+  | 'returned'
+  | 'rejected'
+  | 'escalated'
+  | 'closed'
+  | 'cancelled'
 
 export interface Handoff {
   id: ID
@@ -184,7 +198,26 @@ export interface Handoff {
   ts: number
   reason: string
   kind: HandoffKind
-  status?: string
+  status?: HandoffStatus | string
+  depth?: number
+  chainId?: ID | null
+  parentHandoffId?: ID | null
+  replyToHandoffId?: ID | null
+  lastActionAt?: number | null
+  deadlineAt?: number | null
+  closedAt?: number | null
+  closedBy?: ID | null
+  statusReason?: string | null
+  deliverableArtifactIds?: ID[]
+  contextPacketRef?: string | null
+  contextPacketArtifactId?: string | null
+  contextPacketArtifactVersion?: number | null
+  contextPacketFilename?: string | null
+  contextPacketUri?: string | null
+  sourceTaskId?: ID | null
+  targetTaskId?: ID | null
+  warRoomId?: ID | null
+  messages?: Record<string, unknown>[]
 }
 
 export interface Task {
@@ -203,7 +236,11 @@ export interface Task {
   handoffs: Handoff[]
   log: string[]
   /** set while this task is parked pending another department's handoff */
-  waitingOn?: { dept: ID; handoffId: ID }
+  waitingOn?: { dept?: ID; handoffId?: ID | null; reason?: string | null; decisionRequestId?: ID | null; approvalId?: ID | null }
+  blockedRetryCount?: number
+  blockedRetryGuard?: Record<string, unknown> | null
+  lastUnblockAttemptAt?: number | null
+  handoffChainId?: ID | null
   /** v0.4: optional project grouping and durable outputs. */
   projectId?: ID | null
   deliverables?: ID[]
@@ -762,7 +799,7 @@ export interface ArtifactPreview {
   uri: string
 }
 
-export type ArtifactApprovalTier = 'department' | 'user'
+export type ArtifactApprovalTier = 'department' | 'executive' | 'full_auto' | 'user'
 
 export interface Artifact {
   id: ID
