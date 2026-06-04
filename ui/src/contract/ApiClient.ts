@@ -78,6 +78,7 @@ import type {
   Playbook,
   PolicyMode,
   Preference,
+  Priority,
   Project,
   ProviderAuthReferenceResponse,
   ProviderAuthStartResponse,
@@ -147,6 +148,20 @@ import { isExec, deptIdFromThread } from '../lib/threads'
 const ACCENTS: Department['accent'][] = ['amber', 'teal', 'coral', 'lavender', 'sky', 'honey']
 const DAY_MS = 86_400_000
 const COST_CATEGORIES: CostCategory[] = ['work', 'chat', 'meeting', 'autonomous', 'memory', 'tool']
+const DEFAULT_TASK_REVIEW_INTERVAL_MS = 5 * 60_000
+
+function suggestedTaskReviewIntervalMs(priority?: Priority | null): number {
+  switch (priority) {
+    case 'urgent':
+      return 2 * 60_000
+    case 'high':
+      return 3 * 60_000
+    case 'low':
+      return 10 * 60_000
+    default:
+      return DEFAULT_TASK_REVIEW_INTERVAL_MS
+  }
+}
 
 const EMPTY_STATE: CompanyState = {
   companyName: 'ATRIUM',
@@ -555,9 +570,11 @@ export class ApiClient implements CompanyClient {
   assignTask = (input: AssignTaskInput): Task => {
     const id = input.id ?? uid('task')
     const now = Date.now()
-    const reviewIntervalMs = input.reviewIntervalMs && input.reviewIntervalMs > 0
-      ? Math.max(60_000, input.reviewIntervalMs)
-      : null
+    const reviewIntervalMs = input.reviewIntervalMs == null || input.reviewIntervalMs === undefined
+      ? suggestedTaskReviewIntervalMs(input.priority ?? 'normal')
+      : input.reviewIntervalMs > 0
+        ? Math.max(60_000, input.reviewIntervalMs)
+        : null
     const task: Task = {
       id,
       title: input.title,

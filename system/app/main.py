@@ -343,7 +343,13 @@ from .scheduling import (
     resolve_trigger_cadence,
 )
 from .threads import dept_id_from_thread, is_exec, thread_id_for
-from .task_review import apply_task_review_schedule, enqueue_task_review_reminder, normalize_review_interval_ms, review_interval_label
+from .task_review import (
+    apply_task_review_schedule,
+    enqueue_task_review_reminder,
+    normalize_review_interval_ms,
+    review_interval_for_new_task,
+    review_interval_label,
+)
 from .telegram_gateway import handle_telegram_update, run_telegram_polling_loop, telegram_webhook_secret
 from .work_visibility import emit_work_status_notice, visibility_event_label
 
@@ -5574,6 +5580,11 @@ async def _write_artifact_content_version(
         artifact["preview"] = {"kind": preview_kind, "uri": str(path)}
         version_uri = str(path)
     artifact["version"] = next_version
+    artifact["contentStatus"] = "available" if text.strip() else "empty"
+    tags = [str(tag) for tag in artifact.get("tags", []) if str(tag) != "empty_content"]
+    if artifact["contentStatus"] == "empty":
+        tags.append("empty_content")
+    artifact["tags"] = tags
     if status:
         artifact["status"] = status
     artifact["updatedAt"] = now
@@ -5592,6 +5603,7 @@ async def _write_artifact_content_version(
     version["contentHash"] = artifact.get("contentHash") or content_hash
     version["contentSizeBytes"] = artifact.get("contentSizeBytes")
     version["contentMime"] = artifact.get("contentMime")
+    version["contentStatus"] = artifact.get("contentStatus")
     await repo.put_entity(
         "artifact",
         artifact,
@@ -6166,6 +6178,8 @@ def _system_prompt(dept: dict[str, Any], memory_context: str = "") -> str:
         base = (
             f"คุณคือ {dept['agentName']} ผู้บริหารของบริษัท AI ATRIUM. "
             "หน้าที่คือรับโจทย์จากผู้ใช้ แตกงาน มอบหมายงาน ตรวจคุณภาพ และสรุปกลับเป็นภาษาไทยที่ชัดเจน. "
+            "เมื่อมอบหมายงานให้ออตโต้/แผนกผ่าน create_task ให้ตั้งรอบปลุกตรวจงานเสมอ: urgent 2 นาที, high 3 นาที, normal 5 นาที, low 10 นาที; "
+            "ถ้าเลือกต่างจากนี้ให้มีเหตุผลจากความเสี่ยงหรือเวลารองาน. "
             "ตอบให้กระชับ มีเหตุผล และพร้อมนำไปปฏิบัติ. "
             "ในการคุยจริงครั้งแรกกับเจ้าของ ให้ถามว่าอยากให้ผู้บริหารคนนี้ชื่ออะไร; "
             "เมื่อเจ้าของบอกชื่อ ให้ใช้ tool rename_self เพื่อบันทึกชื่อนั้นเป็นชื่อของตัวเองก่อนทำงานต่อ."
@@ -9248,7 +9262,7 @@ async def assign_task(input: AssignTaskInput) -> dict[str, Any]:
             "deadlineAt": input.deadline_at,
             "result": None,
         }
-        interval_ms = normalize_review_interval_ms(input.review_interval_ms)
+        interval_ms = review_interval_for_new_task(input.review_interval_ms, priority=task["priority"])
         apply_task_review_schedule(task, interval_ms, now)
         if interval_ms:
             task["log"].append(f"ตั้งรอบปลุกผู้บริหารตรวจงานทุก {review_interval_label(interval_ms)}")
@@ -11139,6 +11153,9 @@ async def create_artifact(input: CreateArtifactInput) -> dict[str, Any]:
     ).dump()
     # Preserve explicitly supplied nullable fields from the input model.
     artifact.update({k: v for k, v in data.items() if k in {"mime", "preview"} and v is not None})
+    artifact["contentStatus"] = "available" if artifact.get("preview") else ("referenced" if input.uri else "empty")
+    if artifact["contentStatus"] == "empty" and "empty_content" not in artifact.get("tags", []):
+        artifact["tags"] = [*artifact.get("tags", []), "empty_content"]
     version = ArtifactVersion(
         artifact_id=artifact_id,
         version=1,
@@ -11146,6 +11163,7 @@ async def create_artifact(input: CreateArtifactInput) -> dict[str, Any]:
         ts=now,
         note="initial version",
         uri=artifact["uri"],
+        content_status=artifact["contentStatus"],
         preview=artifact.get("preview"),
     ).dump()
     async with session_scope() as s:

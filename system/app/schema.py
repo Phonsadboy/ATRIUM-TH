@@ -353,6 +353,7 @@ class Task(Schema):
     blocked_retry_guard: Optional[dict[str, Any]] = None
     last_unblock_attempt_at: Optional[int] = None
     handoff_chain_id: Optional[str] = None
+    context_paging: Optional[dict[str, Any]] = None
     # v0.4 extension fields (additive; UI ignores unknown keys)
     project_id: Optional[str] = None
     deliverables: list[str] = Field(default_factory=list)
@@ -926,11 +927,17 @@ class AssignTaskInput(Schema):
     watchers: list[str] = Field(default_factory=list)
     parent_task_id: Optional[str] = None
     deadline_at: Optional[int] = None
-    review_interval_ms: Optional[int] = None
+    review_interval_ms: Optional[int] = Field(
+        default=None,
+        description="Owner review reminder interval in milliseconds. Omit for the priority-based default; pass 0 to disable.",
+    )
 
 
 class UpdateTaskReviewScheduleInput(Schema):
-    review_interval_ms: Optional[int] = None
+    review_interval_ms: Optional[int] = Field(
+        default=None,
+        description="Owner review reminder interval in milliseconds. Null, 0, or negative disables reminders.",
+    )
 
 
 class ReassignTaskInput(Schema):
@@ -1089,6 +1096,7 @@ class Artifact(Schema):
     content_hash: Optional[str] = None
     content_size_bytes: Optional[int] = None
     content_mime: Optional[str] = None
+    content_status: Optional[str] = None
     tags: list[str] = Field(default_factory=list)
     links: list[str] = Field(default_factory=list)
     preview: Optional[ArtifactPreview] = None
@@ -1125,6 +1133,7 @@ class ArtifactVersion(Schema):
     content_hash: Optional[str] = None
     content_size_bytes: Optional[int] = None
     content_mime: Optional[str] = None
+    content_status: Optional[str] = None
     preview: Optional[ArtifactPreview] = None
 
 

@@ -55,6 +55,7 @@ from .mcp_local import (
 from .provider.base import LLMMessage, LLMResult, LLMToolCall
 from .schema import Artifact, ArtifactVersion, Decision, Meeting, Notification, Trigger
 from .scheduling import cadence_from_schedule_object, next_run_for_cadence, resolve_trigger_cadence
+from .task_review import apply_task_review_schedule, enqueue_task_review_reminder, review_interval_for_new_task, review_interval_label
 from .threads import EXEC_ID, EXEC_THREAD, dept_id_from_thread, is_exec, thread_id_for
 from .tools.foundry import custom_tool_catalog_row, execute_custom_tool
 from .tools.host_bridge import HostBridge
@@ -440,6 +441,8 @@ def chat_tool_system_instructions(departments: list[dict[str, Any]], active_dept
         "use tools before answering. Do not claim that a task, artifact, meeting, finance check, or escalation "
         "was done unless the matching tool result says it succeeded. If a tool fails, explain the failure and "
         "the safest next step. For executive delegation, use create_task instead of guessing silently. "
+        "When using create_task, set reviewIntervalMs so the owner is reminded to inspect progress: urgent 2 minutes, high 3 minutes, normal 5 minutes, low 10 minutes; "
+        "only choose a different interval when the task risk or expected wait time clearly justifies it. "
         "When creating departments or org plans, providerId is required; never omit it or rely on an implicit default. "
         f"{_account_provider_recommendation()}"
         "Before choosing or explaining providers/credentials, call GET /api/provider-auth/reference; for live connection "
@@ -660,7 +663,7 @@ def chat_tool_definitions(departments: list[dict[str, Any]], active_dept: dict[s
         },
         {
             "name": "create_task",
-            "description": "Create a durable ATRIUM task assigned to a department.",
+            "description": "Create a durable ATRIUM task assigned to a department, including an owner review reminder cadence.",
             "input_schema": {
                 "type": "object",
                 "properties": {
@@ -668,6 +671,10 @@ def chat_tool_definitions(departments: list[dict[str, Any]], active_dept: dict[s
                     "detail": {"type": "string", "description": "Concrete task details and acceptance criteria."},
                     "departmentId": dept_schema,
                     "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"]},
+                    "reviewIntervalMs": {
+                        "type": "integer",
+                        "description": "Owner review reminder interval in milliseconds. Recommended: urgent=120000, high=180000, normal=300000, low=600000. Omit to use the priority default; pass 0 to disable only when the owner explicitly asks.",
+                    },
                     "projectId": project_schema,
                     "watchers": {"type": "array", "items": {"type": "string"}},
                     "parentTaskId": {"type": "string"},
@@ -6483,8 +6490,16 @@ async def _create_task_tool(repo: Repo, args: dict[str, Any], active_dept: dict[
         "deadlineAt": args.get("deadlineAt") or args.get("deadline_at"),
         "result": None,
     }
+    interval_ms = review_interval_for_new_task(
+        args.get("reviewIntervalMs", args.get("review_interval_ms")),
+        priority=priority,
+    )
+    apply_task_review_schedule(task, interval_ms, now)
+    if interval_ms:
+        task["log"].append(f"ตั้งรอบปลุกผู้บริหารตรวจงานทุก {review_interval_label(interval_ms)}")
     await _link_child_task(repo, task)
     await repo.save_task(task)
+    await enqueue_task_review_reminder(repo, task, now=now)
     await repo.add_activity(_activity(
         f"tool create_task: “{task['title']}” → ฝ่าย{target['name']}",
         type_="task_assigned" if is_exec(active_dept["id"]) else "task_created",
@@ -7425,12 +7440,25 @@ async def _create_artifact_tool(repo: Repo, args: dict[str, Any], active_dept: d
     uri = f"atrium://artifact/{artifact_id}"
     preview = None
     mime = None
+    storage = None
+    content_mime = None
+    content_size_bytes = None
+    content_hash = None
+    content_status = "empty"
     if isinstance(content, str) and content.strip():
         path = _artifact_content_path(owner["id"], artifact_id, 1)
         path.write_text(content, encoding="utf-8")
         uri = str(path)
         preview = {"kind": "md", "uri": str(path)}
         mime = "text/markdown"
+        storage = "filesystem"
+        content_mime = "text/markdown; charset=utf-8"
+        content_size_bytes = path.stat().st_size
+        content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        content_status = "available"
+    tags = _string_list(args.get("tags"))
+    if content_status == "empty" and "empty_content" not in tags:
+        tags.append("empty_content")
     artifact = Artifact(
         id=artifact_id,
         name=name,
@@ -7442,7 +7470,11 @@ async def _create_artifact_tool(repo: Repo, args: dict[str, Any], active_dept: d
         version=1,
         status="draft",
         uri=uri,
-        tags=_string_list(args.get("tags")),
+        storage=storage,
+        content_mime=content_mime,
+        content_size_bytes=content_size_bytes,
+        content_hash=content_hash,
+        tags=tags,
         links=_string_list(args.get("links")),
         preview=preview,
         created_at=now,
@@ -7450,6 +7482,7 @@ async def _create_artifact_tool(repo: Repo, args: dict[str, Any], active_dept: d
         updated_at=now,
         updated_by=active_dept["id"],
     ).dump()
+    artifact["contentStatus"] = content_status
     version = ArtifactVersion(
         artifact_id=artifact_id,
         version=1,
@@ -7457,6 +7490,11 @@ async def _create_artifact_tool(repo: Repo, args: dict[str, Any], active_dept: d
         ts=now,
         note="created by chat tool",
         uri=uri,
+        storage=storage,
+        content_mime=content_mime,
+        content_size_bytes=content_size_bytes,
+        content_hash=content_hash,
+        content_status=content_status,
         preview=preview,
     ).dump()
     await repo.put_entity("artifact", artifact, dept=owner["id"], project=project_id, status="draft", ts=now)

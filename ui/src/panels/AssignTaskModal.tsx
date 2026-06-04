@@ -7,6 +7,12 @@ import { EXEC_ID } from '../lib/threads'
 import type { Priority } from '../contract/types'
 
 const PRIORITIES: Priority[] = ['low', 'normal', 'high', 'urgent']
+const REVIEW_MINUTES_BY_PRIORITY: Record<Priority, string> = {
+  urgent: '2',
+  high: '3',
+  normal: '5',
+  low: '10',
+}
 
 type DeptOption = { id: string; name: string; emoji: string }
 
@@ -67,6 +73,15 @@ function AssignTaskForm({
   const [reviewMinutes, setReviewMinutes] = useState('5')
 
   const canSubmit = title.trim() !== '' && deptId !== ''
+
+  const choosePriority = (next: Priority) => {
+    setReviewMinutes((current) => (
+      current === REVIEW_MINUTES_BY_PRIORITY[priority]
+        ? REVIEW_MINUTES_BY_PRIORITY[next]
+        : current
+    ))
+    setPriority(next)
+  }
 
   const submit = () => {
     if (!canSubmit) return
@@ -133,7 +148,7 @@ function AssignTaskForm({
                 <button
                   key={p}
                   type="button"
-                  onClick={() => setPriority(p)}
+                  onClick={() => choosePriority(p)}
                   className="flex-1 rounded-xl border py-2 text-[12px] font-medium transition-colors"
                   style={{
                     borderColor: on ? withAlpha(col, 0.5) : 'var(--color-line-soft)',

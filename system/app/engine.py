@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import random
 import re
@@ -80,7 +81,7 @@ from .context_budget import estimate_llm_context_tokens, model_auto_compact_cont
 from .db.base import commit_and_release, session_scope
 from .db.repo import Repo
 from .events import hub
-from .file_intake import attachments_from_tool_runs, safe_filename
+from .file_intake import attachments_from_tool_runs, extract_text_from_uri, safe_filename
 from .handoffs import (
     append_handoff_message,
     handoff_is_open,
@@ -147,6 +148,9 @@ DEFAULT_NOTIFICATION_DELIVERY = {
 }
 BLOCKED_RETRY_GUARD_LIMIT = 3
 BLOCKED_RETRY_GUARD_REASON = "blocked_retry_guard"
+TASK_ARTIFACT_CONTEXT_MAX_ITEMS = 12
+TASK_ARTIFACT_CONTEXT_PAGE_CHARS = 5000
+TASK_ARTIFACT_CONTEXT_TOTAL_CHARS = 20000
 HANDOFF_SLA_MS = 30 * 60_000
 HANDOFF_WAITING_REPLY_REASON = "handoff_reply"
 HANDOFF_MISSING_FILE_REASON = "missing_file"
@@ -1145,6 +1149,8 @@ def _chat_system_prompt(dept: dict[str, Any], memory_context: str = "") -> str:
         base = (
             f"คุณคือ {dept['agentName']} ผู้บริหารของบริษัท AI ATRIUM. "
             "หน้าที่คือรับโจทย์จากผู้ใช้ แตกงาน มอบหมายงาน ตรวจคุณภาพ และสรุปกลับเป็นภาษาไทยที่ชัดเจน. "
+            "เมื่อมอบหมายงานให้ออตโต้/แผนกผ่าน create_task ให้ตั้งรอบปลุกตรวจงานเสมอ: urgent 2 นาที, high 3 นาที, normal 5 นาที, low 10 นาที; "
+            "ถ้าเลือกต่างจากนี้ให้มีเหตุผลจากความเสี่ยงหรือเวลารองาน. "
             "ตอบให้กระชับ มีเหตุผล และพร้อมนำไปปฏิบัติ. "
             "ในการคุยจริงครั้งแรกกับเจ้าของ ให้ถามว่าอยากให้ผู้บริหารคนนี้ชื่ออะไร; "
             "เมื่อเจ้าของบอกชื่อ ให้ใช้ tool rename_self เพื่อบันทึกชื่อนั้นเป็นชื่อของตัวเองก่อนทำงานต่อ."
@@ -3350,6 +3356,276 @@ async def _artifact_ref_missing(repo: Repo, artifact_id: str) -> str | None:
     return None
 
 
+def _task_context_artifact_ids(task: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+
+    def add(value: Any) -> None:
+        artifact_id = str(value or "").strip()
+        if artifact_id:
+            ids.append(artifact_id)
+
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    add(result.get("artifactId"))
+    for handoff in task.get("handoffs") or []:
+        if not isinstance(handoff, dict):
+            continue
+        add(handoff.get("contextPacketArtifactId"))
+        for artifact_id in handoff.get("deliverableArtifactIds") or []:
+            add(artifact_id)
+    for artifact_id in task.get("deliverables") or []:
+        add(artifact_id)
+    return list(dict.fromkeys(ids))
+
+
+def _local_artifact_path(uri: Any) -> Path | None:
+    raw = str(uri or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("file://"):
+        raw = raw[7:]
+    if "://" in raw or raw.startswith("atrium://"):
+        return None
+    try:
+        path = Path(raw).expanduser().resolve()
+    except Exception:
+        return None
+    return path if path.is_file() else None
+
+
+def _artifact_primary_text_uri(artifact: dict[str, Any]) -> str:
+    preview = artifact.get("preview") if isinstance(artifact.get("preview"), dict) else {}
+    if preview.get("kind") in {"md", "diff", "sheet"} and preview.get("uri"):
+        return str(preview["uri"])
+    return str(artifact.get("uri") or "")
+
+
+def _file_sha256(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except Exception:
+        return None
+
+
+def _artifact_text_page(
+    artifact: dict[str, Any],
+    *,
+    page_index: int,
+    page_chars: int,
+    max_extract_chars: int,
+) -> dict[str, Any]:
+    uri = _artifact_primary_text_uri(artifact)
+    mime = artifact.get("contentMime") or artifact.get("mime")
+    filename = str(artifact.get("name") or artifact.get("id") or "artifact")
+    path = _local_artifact_path(uri)
+    content_size = artifact.get("contentSizeBytes")
+    content_hash = artifact.get("contentHash")
+    text = ""
+    total_chars_known = False
+
+    if path:
+        try:
+            content_size = path.stat().st_size
+            content_hash = content_hash or _file_sha256(path)
+            if content_size <= 0:
+                return {
+                    "contentStatus": "empty",
+                    "uri": uri,
+                    "contentSizeBytes": content_size,
+                    "contentHash": content_hash,
+                    "pageCount": 0,
+                    "pageIndex": 0,
+                    "nextPageIndex": 0,
+                    "totalCharsKnown": True,
+                }
+            text = path.read_text(encoding="utf-8", errors="replace")
+            total_chars_known = True
+        except Exception as exc:
+            return {
+                "contentStatus": "unreadable",
+                "uri": uri,
+                "contentSizeBytes": content_size,
+                "contentHash": content_hash,
+                "error": f"{type(exc).__name__}: {_clip_text(str(exc), 240)}",
+                "pageCount": 0,
+                "pageIndex": 0,
+                "nextPageIndex": 0,
+                "totalCharsKnown": False,
+            }
+    else:
+        try:
+            extract_limit = min(max_extract_chars, max(page_chars, (page_index + 1) * page_chars))
+            text = extract_text_from_uri(uri, filename=filename, mime=mime, limit=extract_limit)
+        except Exception as exc:
+            return {
+                "contentStatus": "unreadable",
+                "uri": uri,
+                "contentSizeBytes": content_size,
+                "contentHash": content_hash,
+                "error": f"{type(exc).__name__}: {_clip_text(str(exc), 240)}",
+                "pageCount": 0,
+                "pageIndex": 0,
+                "nextPageIndex": 0,
+                "totalCharsKnown": False,
+            }
+
+    if not text.strip():
+        placeholder = str(artifact.get("uri") or "").startswith("atrium://artifact/")
+        external_ref = "://" in str(artifact.get("uri") or "") and not str(artifact.get("uri") or "").startswith(
+            ("atrium://artifact/", "file://")
+        )
+        if external_ref:
+            content_status = "external_reference"
+        elif placeholder or not content_size:
+            content_status = "empty"
+        else:
+            content_status = "metadata_only"
+        return {
+            "contentStatus": content_status,
+            "uri": uri,
+            "contentSizeBytes": content_size,
+            "contentHash": content_hash,
+            "pageCount": 0,
+            "pageIndex": 0,
+            "nextPageIndex": 0,
+            "totalCharsKnown": total_chars_known,
+        }
+
+    page_count = max(1, (len(text) + page_chars - 1) // page_chars)
+    if page_index >= page_count:
+        page_index = 0
+    start = page_index * page_chars
+    end = min(len(text), start + page_chars)
+    return {
+        "contentStatus": "available",
+        "uri": uri,
+        "contentSizeBytes": content_size,
+        "contentHash": content_hash,
+        "totalChars": len(text) if total_chars_known else None,
+        "totalCharsKnown": total_chars_known,
+        "pageCount": page_count if total_chars_known else None,
+        "pageIndex": page_index,
+        "nextPageIndex": (page_index + 1) % page_count if total_chars_known and page_count > 1 else 0,
+        "excerpt": {
+            "charStart": start,
+            "charEnd": end,
+            "text": text[start:end],
+            "truncated": end < len(text) or not total_chars_known,
+        },
+    }
+
+
+async def _artifact_context_entry(
+    repo: Repo,
+    artifact_id: str,
+    *,
+    page_index: int,
+    page_chars: int,
+    remaining_chars: int,
+) -> dict[str, Any]:
+    base = {
+        "artifactId": artifact_id,
+        "contentApi": f"/api/artifacts/{artifact_id}/content",
+        "previewApi": f"/api/artifacts/{artifact_id}/preview",
+        "downloadApi": f"/api/artifacts/{artifact_id}/download",
+        "versionsApi": f"/api/artifacts/{artifact_id}/versions",
+    }
+    if not hasattr(repo, "get_entity"):
+        return {**base, "contentStatus": "unknown", "issue": "repo_get_entity_unavailable"}
+    artifact = await repo.get_entity("artifact", artifact_id)
+    if not artifact:
+        return {**base, "contentStatus": "entity_missing", "issue": "artifact entity is missing"}
+    missing = await _artifact_ref_missing(repo, artifact_id)
+    entry = {
+        **base,
+        "name": artifact.get("name"),
+        "kind": artifact.get("kind"),
+        "status": artifact.get("status"),
+        "version": artifact.get("version"),
+        "ownerDept": artifact.get("ownerDept"),
+        "projectId": artifact.get("projectId"),
+        "taskIds": artifact.get("taskIds") or [],
+        "uri": artifact.get("uri"),
+        "storage": artifact.get("storage"),
+        "mime": artifact.get("contentMime") or artifact.get("mime"),
+        "preview": artifact.get("preview"),
+        "tags": artifact.get("tags") or [],
+    }
+    if missing:
+        return {**entry, "contentStatus": missing, "issue": f"artifact reference failed: {missing}"}
+    if remaining_chars <= 0:
+        return {
+            **entry,
+            "contentStatus": "available_not_inlined",
+            "issue": "context inline budget exhausted; use contentApi/downloadApi for full details",
+        }
+    page = _artifact_text_page(
+        artifact,
+        page_index=page_index,
+        page_chars=min(page_chars, remaining_chars),
+        max_extract_chars=max(page_chars, remaining_chars),
+    )
+    return {**entry, **page}
+
+
+async def _task_artifact_context(repo: Repo, task: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    artifact_ids = _task_context_artifact_ids(task)
+    paging = task.get("contextPaging") if isinstance(task.get("contextPaging"), dict) else {}
+    current_pages = paging.get("artifactPages") if isinstance(paging.get("artifactPages"), dict) else {}
+    used_chars = 0
+    next_pages: dict[str, int] = {}
+    entries: list[dict[str, Any]] = []
+    for artifact_id in artifact_ids[:TASK_ARTIFACT_CONTEXT_MAX_ITEMS]:
+        try:
+            page_index = max(0, int(current_pages.get(artifact_id) or 0))
+        except (TypeError, ValueError):
+            page_index = 0
+        entry = await _artifact_context_entry(
+            repo,
+            artifact_id,
+            page_index=page_index,
+            page_chars=TASK_ARTIFACT_CONTEXT_PAGE_CHARS,
+            remaining_chars=max(0, TASK_ARTIFACT_CONTEXT_TOTAL_CHARS - used_chars),
+        )
+        excerpt = entry.get("excerpt") if isinstance(entry.get("excerpt"), dict) else {}
+        used_chars += len(str(excerpt.get("text") or ""))
+        next_pages[artifact_id] = int(entry.get("nextPageIndex") or 0)
+        entries.append(entry)
+    status_counts: dict[str, int] = {}
+    for entry in entries:
+        status = str(entry.get("contentStatus") or "unknown")
+        status_counts[status] = status_counts.get(status, 0) + 1
+    context = {
+        "mode": "paged_artifact_manifest",
+        "policy": (
+            "Artifact ids and APIs are durable full references. Inline excerpts are pages for this turn only; "
+            "do not treat a truncated excerpt as missing content."
+        ),
+        "pageChars": TASK_ARTIFACT_CONTEXT_PAGE_CHARS,
+        "inlineBudgetChars": TASK_ARTIFACT_CONTEXT_TOTAL_CHARS,
+        "artifactIds": artifact_ids,
+        "omittedArtifactIds": artifact_ids[TASK_ARTIFACT_CONTEXT_MAX_ITEMS:],
+        "artifacts": entries,
+        "statusCounts": status_counts,
+        "emptyArtifactIds": [
+            str(entry["artifactId"])
+            for entry in entries
+            if entry.get("contentStatus") in {"empty", "metadata_only"}
+        ],
+        "missingArtifactIds": [
+            str(entry["artifactId"])
+            for entry in entries
+            if entry.get("contentStatus") in {"entity_missing", "file_missing"}
+        ],
+        "nextArtifactPages": next_pages,
+    }
+    next_paging = {"artifactPages": next_pages, "pageChars": TASK_ARTIFACT_CONTEXT_PAGE_CHARS}
+    return context, next_paging
+
+
 async def _missing_handoff_artifact_refs(repo: Repo, task: dict[str, Any]) -> list[dict[str, str]]:
     missing: list[dict[str, str]] = []
     for artifact_id in [str(item) for item in task.get("deliverables", []) if str(item).strip()]:
@@ -3952,6 +4228,9 @@ async def _record_task_deliverable(
     content_uri = _artifact_content_path(dept["id"], artifact_id, 1)
     with open(content_uri, "w", encoding="utf-8") as f:
         f.write(report)
+    content_path = Path(content_uri)
+    content_size = content_path.stat().st_size if content_path.exists() else len(report.encode("utf-8"))
+    content_hash = _file_sha256(content_path) if content_path.exists() else hashlib.sha256(report.encode("utf-8")).hexdigest()
     artifact = {
         "id": artifact_id,
         "name": f"สรุปผลงาน: {task['title']}",
@@ -3963,6 +4242,11 @@ async def _record_task_deliverable(
         "version": 1,
         "status": artifact_status,
         "uri": content_uri,
+        "storage": "filesystem",
+        "contentMime": "text/markdown; charset=utf-8",
+        "contentSizeBytes": content_size,
+        "contentHash": content_hash,
+        "contentStatus": "available",
         "tags": ["engine", "deliverable", dept["id"]],
         "links": [f"atrium://task/{task['id']}"],
         "preview": {"kind": "md", "uri": content_uri},
@@ -3983,6 +4267,12 @@ async def _record_task_deliverable(
         "note": "engine generated deliverable",
         "parent": None,
         "uri": content_uri,
+        "storage": "filesystem",
+        "contentMime": "text/markdown; charset=utf-8",
+        "contentSizeBytes": content_size,
+        "contentHash": content_hash,
+        "contentStatus": "available",
+        "preview": {"kind": "md", "uri": content_uri},
     }
     decision_info = decision or {}
     decision_record = {
@@ -4086,6 +4376,19 @@ async def _record_handoff_packet_artifact(
         "## Minimum Context",
         _minimum_handoff_packet(dept=dept, target=target, task=task, handoff=handoff, reason=handoff.get("reason") or packet),
         "",
+        "## Retrieval Manifest",
+        "This packet is the complete handoff record; receiving departments may read it in excerpts per work round without losing the full artifact reference.",
+        f"- Packet artifact id: `{artifact_id}`",
+        f"- Full content API: `/api/artifacts/{artifact_id}/content`",
+        f"- Download API: `/api/artifacts/{artifact_id}/download`",
+        f"- Preview API: `/api/artifacts/{artifact_id}/preview`",
+        f"- Version API: `/api/artifacts/{artifact_id}/versions`",
+        "- Existing deliverable APIs:",
+        "\n".join(
+            f"  - `{existing_id}`: content `/api/artifacts/{existing_id}/content`, download `/api/artifacts/{existing_id}/download`"
+            for existing_id in related_deliverables
+        ) or "  - none",
+        "",
         "## Version",
         f"- Filename: `{filename}`",
         f"- Version: v{version}",
@@ -4121,6 +4424,9 @@ async def _record_handoff_packet_artifact(
     ])
     with open(uri, "w", encoding="utf-8") as f:
         f.write(content)
+    content_path = Path(uri)
+    content_size = content_path.stat().st_size if content_path.exists() else len(content.encode("utf-8"))
+    content_hash = _file_sha256(content_path) if content_path.exists() else hashlib.sha256(content.encode("utf-8")).hexdigest()
     artifact = {
         "id": artifact_id,
         "name": f"Handoff Packet v{version}: {dept.get('name', dept['id'])} → {target.get('name', target['id'])}",
@@ -4134,6 +4440,9 @@ async def _record_handoff_packet_artifact(
         "uri": uri,
         "storage": "filesystem",
         "contentMime": "text/markdown; charset=utf-8",
+        "contentSizeBytes": content_size,
+        "contentHash": content_hash,
+        "contentStatus": "available",
         "tags": [
             "engine",
             "handoff",
@@ -4169,6 +4478,9 @@ async def _record_handoff_packet_artifact(
         "uri": uri,
         "storage": "filesystem",
         "contentMime": "text/markdown; charset=utf-8",
+        "contentSizeBytes": content_size,
+        "contentHash": content_hash,
+        "contentStatus": "available",
         "preview": {"kind": "md", "uri": uri},
     }
     await repo.put_entity("artifact", artifact, dept=dept["id"], project=task.get("projectId"), status="approved", ts=now)
@@ -4669,6 +4981,16 @@ def _task_payload(task: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+async def _task_payload_with_context(repo: Repo, task: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    payload = _task_payload(task)
+    artifact_ids = _task_context_artifact_ids(task)
+    if not artifact_ids:
+        return payload, None
+    artifact_context, next_paging = await _task_artifact_context(repo, task)
+    payload["artifactContext"] = artifact_context
+    return payload, next_paging
+
+
 async def _llm_work_step(
     repo: Repo,
     dept: dict[str, Any],
@@ -4690,12 +5012,18 @@ async def _llm_work_step(
             "\"approvalDetail\":string|null,\"draftDeliverableMarkdown\":string|null}. "
             "progressDelta เป็น 0.04-0.35; ถ้างานพร้อมตรวจให้ status=review. "
             "log ต้องเป็นบันทึกสั้น ๆ ว่าทำอะไร/สถานะอะไร ไม่ต้องอธิบายเหตุผลหรือแผนยาว และไม่เกิน 160 ตัวอักษร. "
+            "payload อาจมี artifactContext แบบ paged_artifact_manifest: ให้ถือ artifact ids, contentApi, downloadApi, "
+            "previewApi, versionsApi เป็น reference งานเต็ม และใช้ excerpt ในรอบนี้เป็นหน้าที่เปิดให้อ่าน ไม่ใช่เนื้อหาทั้งหมด. "
+            "ห้ามตั้ง status=blocked เพียงเพราะ excerpt ถูกตัดหรือยังไม่ได้อ่านทุกหน้า; ให้ทำต่อจาก title/detail/log/draft/excerpt "
+            "และบันทึก draftDeliverableMarkdown ที่มีประโยชน์. ถ้า contentStatus เป็น empty/missing ให้ระบุ artifact id และสิ่งที่ยังขาดแบบเจาะจง; "
+            "block ได้เฉพาะเมื่องานเดินต่อไม่ได้จริงจากข้อมูล task/context ที่มีอยู่. "
             "หากต้องเผยแพร่/เรียก API/ใช้เงิน/ทำ action ภายนอก ให้ระบุ needsApproval=true เพื่อให้ระบบสร้าง audit/checkpoint metadata; "
             "ไม่ต้องรอ approval gate."
         ),
         memory_context,
     )
-    messages = [LLMMessage(role="user", content=json.dumps(_task_payload(task), ensure_ascii=False))]
+    payload, next_context_paging = await _task_payload_with_context(repo, task)
+    messages = [LLMMessage(role="user", content=json.dumps(payload, ensure_ascii=False))]
     settings = get_settings()
     result = await _complete_runtime_turn(
         repo,
@@ -4723,6 +5051,8 @@ async def _llm_work_step(
         data = {"log": result.text, "status": "in_progress", "progressDelta": 0.12}
     data["_rawText"] = result.text
     data["_skillIds"] = skill_ids
+    if next_context_paging is not None:
+        data["_contextPaging"] = next_context_paging
     return data
 
 
@@ -4748,11 +5078,15 @@ async def _llm_review_task(
             "\"handoffRecommendation\":{\"toDept\":string,\"kind\":\"delegate\"|\"consult\"|\"collaborate\"|\"return\","
             "\"reason\":string}|null}. "
             "ถ้ายังไม่ผ่าน ให้ approved=false และ revisionNote ระบุสิ่งที่ต้องแก้. "
-            "ถ้าผ่าน deliverableMarkdown ต้องเป็นรายงาน markdown ที่เปิดดูย้อนหลังได้."
+            "ถ้าผ่าน deliverableMarkdown ต้องเป็นรายงาน markdown ที่เปิดดูย้อนหลังได้. "
+            "payload อาจมี artifactContext แบบ paged_artifact_manifest; ใช้ excerpt เป็นหน้าบริบทของรอบนี้ "
+            "และถือ contentApi/downloadApi/previewApi/versionsApi เป็นทางเปิดรายละเอียดเต็ม. "
+            "อย่า reject หรือ handoff เพียงเพราะ excerpt ถูกตัด ถ้า artifact reference ยังเปิดดูเต็มได้."
         ),
         memory_context,
     )
-    payload = {"task": _task_payload(task), "peerDepartments": peer_departments}
+    task_payload, next_context_paging = await _task_payload_with_context(repo, task)
+    payload = {"task": task_payload, "peerDepartments": peer_departments}
     messages = [LLMMessage(role="user", content=json.dumps(payload, ensure_ascii=False))]
     settings = get_settings()
     result = await _complete_runtime_turn(
@@ -4781,6 +5115,8 @@ async def _llm_review_task(
     if not data:
         data = {"approved": True, "deliverableMarkdown": result.text}
     data["_rawText"] = result.text
+    if next_context_paging is not None:
+        data["_contextPaging"] = next_context_paging
     return data
 
 
@@ -5137,6 +5473,8 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
             task["draftDeliverableMarkdown"] = _clip_text(step["draftDeliverableMarkdown"], 30000)
         if step.get("_skillIds"):
             task["activeSkillIds"] = list(dict.fromkeys([*task.get("activeSkillIds", []), *step["_skillIds"]]))[:12]
+        if isinstance(step.get("_contextPaging"), dict):
+            task["contextPaging"] = step["_contextPaging"]
         task["log"] = [*task.get("log", []), log_line]
         if step.get("needsApproval"):
             await _create_approval(
@@ -5282,6 +5620,8 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
             review = await _llm_review_task(repo, dept, task, departments, now)
             if review is None:
                 return False
+            if isinstance(review.get("_contextPaging"), dict):
+                task["contextPaging"] = review["_contextPaging"]
             approved = review.get("approved")
             if approved is False:
                 note = _clip_text(review.get("revisionNote"), 800) or "review ขอแก้ก่อนปิดงาน"

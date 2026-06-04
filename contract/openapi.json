@@ -519,6 +519,17 @@
             ],
             "title": "Contentsizebytes"
           },
+          "contentStatus": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contentstatus"
+          },
           "contextArgs": {
             "anyOf": [
               {
@@ -1070,6 +1081,17 @@
             ],
             "title": "Contentsizebytes"
           },
+          "contentStatus": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contentstatus"
+          },
           "note": {
             "title": "Note",
             "type": "string"
@@ -1233,6 +1255,7 @@
                 "type": "null"
               }
             ],
+            "description": "Owner review reminder interval in milliseconds. Omit for the priority-based default; pass 0 to disable.",
             "title": "Reviewintervalms"
           },
           "title": {
@@ -10246,6 +10269,18 @@
             ],
             "title": "Blockedretryguard"
           },
+          "contextPaging": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Contextpaging"
+          },
           "createdAt": {
             "title": "Createdat",
             "type": "integer"
@@ -12016,6 +12051,7 @@
                 "type": "null"
               }
             ],
+            "description": "Owner review reminder interval in milliseconds. Null, 0, or negative disables reminders.",
             "title": "Reviewintervalms"
           }
         },

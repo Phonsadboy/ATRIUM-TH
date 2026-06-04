@@ -306,6 +306,9 @@ class RuntimeJobStabilityTest(unittest.IsolatedAsyncioTestCase):
         packet_text = packet_path.read_text(encoding="utf-8")
         self.assertIn("# Handoff Packet v1", packet_text)
         self.assertIn("## Minimum Context", packet_text)
+        self.assertIn("## Retrieval Manifest", packet_text)
+        self.assertIn(f"/api/artifacts/{artifact['id']}/content", packet_text)
+        self.assertIn(f"/api/artifacts/{artifact['id']}/download", packet_text)
         self.assertIn("งานนี้คือ:", packet_text)
         self.assertIn("Need target context", packet_text)
         self.assertIn("Source draft v0.9", packet_text)
@@ -317,6 +320,102 @@ class RuntimeJobStabilityTest(unittest.IsolatedAsyncioTestCase):
             (message.get("input") or {}).get("visibilityEvent") == "handoff_requested"
             for message in repo.messages
         ))
+
+    async def test_task_payload_inlines_paged_artifact_context(self) -> None:
+        from app import engine
+
+        tmpdir = tempfile.TemporaryDirectory(prefix="atrium-task-context-")
+        self.addCleanup(tmpdir.cleanup)
+        artifact_path = Path(tmpdir.name) / "long.md"
+        page_chars = engine.TASK_ARTIFACT_CONTEXT_PAGE_CHARS
+        artifact_path.write_text("A" * page_chars + "SECOND_PAGE_MARKER\n" + "B" * 100, encoding="utf-8")
+
+        class FakeRepo:
+            async def get_entity(self, type_, entity_id):
+                if type_ == "artifact" and entity_id == "art_long":
+                    return {
+                        "id": "art_long",
+                        "name": "Long context",
+                        "kind": "report",
+                        "status": "approved",
+                        "version": 1,
+                        "ownerDept": "source",
+                        "uri": str(artifact_path),
+                        "storage": "filesystem",
+                        "contentMime": "text/markdown; charset=utf-8",
+                        "preview": {"kind": "md", "uri": str(artifact_path)},
+                        "taskIds": ["task_1"],
+                    }
+                return None
+
+        task = {
+            "id": "task_1",
+            "title": "Read artifact context",
+            "detail": "Use the attached report",
+            "status": "in_progress",
+            "priority": "normal",
+            "progress": 0.2,
+            "log": [],
+            "handoffs": [],
+            "waitingOn": None,
+            "deliverables": ["art_long"],
+            "contextPaging": {"artifactPages": {"art_long": 1}},
+        }
+
+        payload, next_paging = await engine._task_payload_with_context(FakeRepo(), task)
+
+        context = payload["artifactContext"]
+        self.assertEqual(context["mode"], "paged_artifact_manifest")
+        self.assertEqual(context["artifactIds"], ["art_long"])
+        entry = context["artifacts"][0]
+        self.assertEqual(entry["contentStatus"], "available")
+        self.assertEqual(entry["pageIndex"], 1)
+        self.assertIn("SECOND_PAGE_MARKER", entry["excerpt"]["text"])
+        self.assertEqual(entry["contentApi"], "/api/artifacts/art_long/content")
+        self.assertEqual(entry["downloadApi"], "/api/artifacts/art_long/download")
+        self.assertGreater(entry["contentSizeBytes"], 0)
+        self.assertRegex(entry["contentHash"], r"^[0-9a-f]{64}$")
+        self.assertEqual(next_paging["artifactPages"]["art_long"], 0)
+
+    async def test_task_payload_marks_empty_placeholder_artifact(self) -> None:
+        from app import engine
+
+        class FakeRepo:
+            async def get_entity(self, type_, entity_id):
+                if type_ == "artifact" and entity_id == "art_empty":
+                    return {
+                        "id": "art_empty",
+                        "name": "Empty placeholder",
+                        "kind": "memo",
+                        "status": "draft",
+                        "version": 1,
+                        "ownerDept": "source",
+                        "uri": "atrium://artifact/art_empty",
+                        "preview": None,
+                        "taskIds": ["task_1"],
+                    }
+                return None
+
+        task = {
+            "id": "task_1",
+            "title": "Do not treat placeholders as evidence",
+            "detail": "Task detail is still available",
+            "status": "in_progress",
+            "priority": "normal",
+            "progress": 0.1,
+            "log": [],
+            "handoffs": [],
+            "waitingOn": None,
+            "deliverables": ["art_empty"],
+        }
+
+        payload, _ = await engine._task_payload_with_context(FakeRepo(), task)
+
+        context = payload["artifactContext"]
+        entry = context["artifacts"][0]
+        self.assertEqual(entry["contentStatus"], "empty")
+        self.assertIn("art_empty", context["emptyArtifactIds"])
+        self.assertEqual(entry["contentApi"], "/api/artifacts/art_empty/content")
 
     async def test_work_status_notice_routes_and_dedupes(self) -> None:
         from app.work_visibility import emit_work_status_notice

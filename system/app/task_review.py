@@ -8,6 +8,20 @@ TASK_REVIEW_REMINDER_KIND = "task_review_reminder"
 TASK_TERMINAL_STATUSES = {"done", "cancelled"}
 MIN_REVIEW_INTERVAL_MS = 60_000
 MAX_REVIEW_INTERVAL_MS = 7 * 24 * 60 * 60_000
+DEFAULT_REVIEW_INTERVAL_MS = 5 * 60_000
+RECOMMENDED_REVIEW_INTERVAL_BY_PRIORITY_MS = {
+    "urgent": 2 * 60_000,
+    "high": 3 * 60_000,
+    "normal": DEFAULT_REVIEW_INTERVAL_MS,
+    "low": 10 * 60_000,
+}
+
+
+def recommended_review_interval_ms(priority: Any = None) -> int:
+    return RECOMMENDED_REVIEW_INTERVAL_BY_PRIORITY_MS.get(
+        str(priority or "normal").strip().lower(),
+        DEFAULT_REVIEW_INTERVAL_MS,
+    )
 
 
 def normalize_review_interval_ms(value: Any) -> int | None:
@@ -20,6 +34,12 @@ def normalize_review_interval_ms(value: Any) -> int | None:
     if interval <= 0:
         return None
     return max(MIN_REVIEW_INTERVAL_MS, min(interval, MAX_REVIEW_INTERVAL_MS))
+
+
+def review_interval_for_new_task(value: Any, *, priority: Any = None) -> int | None:
+    if value is None or value == "":
+        return recommended_review_interval_ms(priority)
+    return normalize_review_interval_ms(value)
 
 
 def review_interval_label(interval_ms: int | None) -> str:

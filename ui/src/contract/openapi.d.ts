@@ -2794,6 +2794,8 @@ export interface components {
             contentMime?: string | null;
             /** Contentsizebytes */
             contentSizeBytes?: number | null;
+            /** Contentstatus */
+            contentStatus?: string | null;
             /** Contextargs */
             contextArgs?: {
                 [key: string]: unknown;
@@ -2964,6 +2966,8 @@ export interface components {
             contentMime?: string | null;
             /** Contentsizebytes */
             contentSizeBytes?: number | null;
+            /** Contentstatus */
+            contentStatus?: string | null;
             /** Note */
             note: string;
             /** Parent */
@@ -2996,7 +3000,10 @@ export interface components {
             priority?: ("low" | "normal" | "high" | "urgent") | null;
             /** Projectid */
             projectId?: string | null;
-            /** Reviewintervalms */
+            /**
+             * Reviewintervalms
+             * @description Owner review reminder interval in milliseconds. Omit for the priority-based default; pass 0 to disable.
+             */
             reviewIntervalMs?: number | null;
             /** Title */
             title: string;
@@ -5889,6 +5896,10 @@ export interface components {
             blockedRetryGuard?: {
                 [key: string]: unknown;
             } | null;
+            /** Contextpaging */
+            contextPaging?: {
+                [key: string]: unknown;
+            } | null;
             /** Createdat */
             createdAt: number;
             /** Deadlineat */
@@ -6405,7 +6416,10 @@ export interface components {
         };
         /** UpdateTaskReviewScheduleInput */
         UpdateTaskReviewScheduleInput: {
-            /** Reviewintervalms */
+            /**
+             * Reviewintervalms
+             * @description Owner review reminder interval in milliseconds. Null, 0, or negative disables reminders.
+             */
             reviewIntervalMs?: number | null;
         };
         /** UpdateTriggerInput */
