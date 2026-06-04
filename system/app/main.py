@@ -1721,6 +1721,72 @@ async def _link_child_task(repo: Repo, parent_task_id: str | None, child_task_id
         await repo.save_task(parent)
 
 
+async def _wake_department_for_assigned_task(
+    repo: Repo,
+    dept: dict[str, Any],
+    task: dict[str, Any],
+    now: int,
+    *,
+    reason: str = "หลังรับมอบหมาย",
+) -> bool:
+    if is_exec(str(dept.get("id") or "")):
+        return False
+    current_task_id = str(dept.get("currentTaskId") or "").strip()
+    if current_task_id and current_task_id != str(task.get("id") or ""):
+        return False
+    if str(dept.get("state") or "idle") not in {"idle", "handoff", "blocked"}:
+        return False
+    if task.get("status") not in {"assigned", "backlog", "revising", "in_progress"}:
+        return False
+    task["status"] = "in_progress"
+    task["updatedAt"] = now
+    task["log"] = [*task.get("log", []), f"ปลุกแผนกให้เริ่มงานทันที{reason}"]
+    dept["state"] = "working"
+    dept["currentTaskId"] = task["id"]
+    await repo.save_task(task)
+    await repo.save_department(dept)
+    await repo.add_activity(_activity(
+        f"{dept.get('agentName', dept['id'])} เริ่มงาน “{task['title']}” ทันที{reason}",
+        type_="task_assigned",
+        department_id=dept["id"],
+        severity="good",
+        ts=now,
+    ))
+    msg = system_chat_message(
+        thread_id_for(EXEC_ID),
+        f"ฝ่าย{dept.get('name', dept['id'])}เริ่มทำงานทันที{reason}: “{task['title']}”",
+        department_id=dept["id"],
+        flow={
+            "kind": "department_work",
+            "title": f"ฝ่าย{dept.get('name', dept.get('id'))}: {task.get('title')}",
+            "steps": [{
+                "kind": "task_started",
+                "label": "task started",
+                "departmentId": dept.get("id"),
+                "taskId": task.get("id"),
+            }],
+            "refs": {
+                "departmentId": dept.get("id"),
+                "threadId": thread_id_for(str(dept.get("id") or "")),
+                "taskId": task.get("id"),
+                "status": task.get("status"),
+                "progress": task.get("progress"),
+            },
+        },
+        severity="good",
+        ts=now,
+    )
+    await repo.add_message(msg)
+    hub.pulse({
+        "kind": "chat_activity",
+        "threadId": thread_id_for(EXEC_ID),
+        "msgId": msg["id"],
+        "departmentId": dept["id"],
+        "message": msg,
+    })
+    return True
+
+
 async def _delete_department_now(
     repo: Repo,
     dept_id: str,
@@ -8783,6 +8849,16 @@ async def _apply_handoff_message_to_tasks(
             task["updatedAt"] = now
             task["log"] = [*task.get("log", []), f"handoff {handoff_id}: {message['act']}"]
             await repo.save_task(task)
+            if task.get("status") in {"assigned", "backlog", "revising", "in_progress"} and not task.get("waitingOn"):
+                dept = await repo.get_department(str(task.get("departmentId") or ""))
+                if dept:
+                    await _wake_department_for_assigned_task(
+                        repo,
+                        dept,
+                        task,
+                        now,
+                        reason="หลัง handoff ปลดบล็อก",
+                    )
             touched = True
     if not touched:
         raise HTTPException(status_code=404, detail="handoff not found")
@@ -9107,9 +9183,10 @@ async def assign_task(input: AssignTaskInput) -> dict[str, Any]:
             task["log"].append(f"ตั้งรอบปลุกผู้บริหารตรวจงานทุก {review_interval_label(interval_ms)}")
         await _link_child_task(repo, input.parent_task_id, task["id"])
         await repo.save_task(task)
+        woke = await _wake_department_for_assigned_task(repo, dept, task, now)
         await enqueue_task_review_reminder(repo, task, now=now)
         await repo.add_activity(_activity(
-            f"งานใหม่ “{task['title']}” → ฝ่าย{dept['name']}",
+            f"งานใหม่ “{task['title']}” → ฝ่าย{dept['name']}" + (" และเริ่มทำทันที" if woke else ""),
             type_="task_created",
             department_id=input.department_id,
         ))

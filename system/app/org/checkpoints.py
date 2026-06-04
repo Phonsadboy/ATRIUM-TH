@@ -25,7 +25,7 @@ def _restore_department_spec(spec: dict[str, Any], existing: dict[str, Any] | No
     dept.setdefault("emoji", "R")
     dept.setdefault("accent", "teal")
     dept.setdefault("providerId", "claude_code")
-    dept.setdefault("model", "claude-sonnet-4-7")
+    dept.setdefault("model", "claude-sonnet-4-6")
     dept.setdefault("thinkingEffort", "high")
     dept.setdefault("speed", "standard")
     dept.setdefault("agentName", f"{dept.get('name') or dept_id} Agent"[:120])

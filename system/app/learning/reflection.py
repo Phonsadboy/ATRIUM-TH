@@ -155,7 +155,7 @@ async def generate_reflection_lesson(
         result = await provider.complete(
             system=system,
             messages=[LLMMessage(role="user", content=user)],
-            model=dept.get("model", "claude-sonnet-4-7"),
+            model=dept.get("model", "claude-sonnet-4-6"),
             effort="medium",
             speed=dept.get("speed", "standard"),
         )

@@ -139,7 +139,7 @@ class EvalHarness:
         missing_tools = [tool for tool in task.expected_tools if tool not in tools_used]
         dept = department or {}
         provider_id = str(dept.get("providerId") or "claude_code")
-        model = str(dept.get("model") or "claude-sonnet-4-7")
+        model = str(dept.get("model") or "claude-sonnet-4-6")
         speed = str(dept.get("speed") or "standard")
         system = (
             "You are ATRIUM's eval judge. Grade one response to one golden task. "

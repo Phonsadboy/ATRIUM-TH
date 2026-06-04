@@ -941,6 +941,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/host-bridge/parity": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Host Bridge Parity */
+        get: operations["get_host_bridge_parity_api_host_bridge_parity_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/images/generate": {
         parameters: {
             query?: never;
@@ -2059,6 +2076,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/tasks/{task_id}/review-schedule": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Update Task Review Schedule */
+        patch: operations["update_task_review_schedule_api_tasks__task_id__review_schedule_patch"];
+        trace?: never;
+    };
+    "/api/telegram/webhook": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Telegram Webhook */
+        post: operations["telegram_webhook_api_telegram_webhook_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/threads/{thread_id}/cost": {
         parameters: {
             query?: never;
@@ -2945,6 +2996,8 @@ export interface components {
             priority?: ("low" | "normal" | "high" | "urgent") | null;
             /** Projectid */
             projectId?: string | null;
+            /** Reviewintervalms */
+            reviewIntervalMs?: number | null;
             /** Title */
             title: string;
             /** Watchers */
@@ -3200,7 +3253,7 @@ export interface components {
              * Kind
              * @enum {string}
              */
-            kind: "activity" | "handoff" | "war_room" | "meeting" | "cost" | "status";
+            kind: "activity" | "handoff" | "war_room" | "meeting" | "cost" | "status" | "department_work";
             /** Refs */
             refs?: {
                 [key: string]: unknown;
@@ -3375,6 +3428,8 @@ export interface components {
             companyName: string;
             /** Departments */
             departments: components["schemas"]["Department"][];
+            /** Executivequeue */
+            executiveQueue?: components["schemas"]["ExecutiveQueueItem"][];
             /** Now */
             now: number;
             /** Objectives */
@@ -3411,6 +3466,20 @@ export interface components {
             localFallback: boolean;
             /** Name */
             name: string;
+            /** Proofdetails */
+            proofDetails?: {
+                [key: string]: unknown;
+            };
+            /** Proofgaps */
+            proofGaps?: string[];
+            /**
+             * Proofstatus
+             * @default not_required
+             * @enum {string}
+             */
+            proofStatus: "not_required" | "local_blocked" | "cross_os_unverified" | "cross_os_verified";
+            /** Proofsummary */
+            proofSummary?: string | null;
             /**
              * Readready
              * @default true
@@ -3601,7 +3670,7 @@ export interface components {
              * Model
              * @enum {string}
              */
-            model: "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-sonnet-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4-mini" | "gpt-5.3-codex";
+            model: "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4-mini" | "gpt-5.3-codex";
             /** Name */
             name: string;
             /**
@@ -3967,7 +4036,7 @@ export interface components {
              * Model
              * @enum {string}
              */
-            model: "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-sonnet-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4-mini" | "gpt-5.3-codex";
+            model: "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4-mini" | "gpt-5.3-codex";
             /** Mood */
             mood: number;
             /** Name */
@@ -4031,7 +4100,7 @@ export interface components {
             /** Emoji */
             emoji?: string | null;
             /** Model */
-            model?: ("claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-sonnet-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4-mini" | "gpt-5.3-codex") | null;
+            model?: ("claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4-mini" | "gpt-5.3-codex") | null;
             /** Name */
             name?: string | null;
             /** Providerid */
@@ -4140,7 +4209,7 @@ export interface components {
              * Model
              * @enum {string}
              */
-            model: "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-sonnet-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4-mini" | "gpt-5.3-codex";
+            model: "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4-mini" | "gpt-5.3-codex";
             /**
              * Providerid
              * @enum {string}
@@ -4163,6 +4232,50 @@ export interface components {
             tools?: string[];
             /** Workspacepath */
             workspacePath?: string | null;
+        };
+        /** ExecutiveQueueItem */
+        ExecutiveQueueItem: {
+            /**
+             * Attempts
+             * @default 0
+             */
+            attempts: number;
+            /**
+             * Createdat
+             * @default 0
+             */
+            createdAt: number;
+            /** Departmentid */
+            departmentId?: string | null;
+            /** Detail */
+            detail?: string | null;
+            /** Id */
+            id: string;
+            /** Kind */
+            kind: string;
+            /** Lasterror */
+            lastError?: string | null;
+            /** Priority */
+            priority: number;
+            /** Replymessageid */
+            replyMessageId?: string | null;
+            /** Runafter */
+            runAfter: number;
+            /** Status */
+            status: string;
+            /** Taskid */
+            taskId?: string | null;
+            /** Threadid */
+            threadId?: string | null;
+            /** Title */
+            title: string;
+            /**
+             * Updatedat
+             * @default 0
+             */
+            updatedAt: number;
+            /** Usermessageid */
+            userMessageId?: string | null;
         };
         /** GenerateImageInput */
         GenerateImageInput: {
@@ -4472,6 +4585,52 @@ export interface components {
             provider: {
                 [key: string]: unknown;
             };
+        };
+        /** HostBridgeParityConnectorProof */
+        HostBridgeParityConnectorProof: {
+            /** Id */
+            id: string;
+            /** Proofdetails */
+            proofDetails?: {
+                [key: string]: unknown;
+            };
+            /** Proofgaps */
+            proofGaps?: string[];
+            /**
+             * Proofstatus
+             * @enum {string}
+             */
+            proofStatus: "not_required" | "local_blocked" | "cross_os_unverified" | "cross_os_verified";
+            /** Proofsummary */
+            proofSummary?: string | null;
+        };
+        /** HostBridgeParityStatusResponse */
+        HostBridgeParityStatusResponse: {
+            /** Commands */
+            commands?: {
+                [key: string]: string;
+            };
+            /** Connectors */
+            connectors?: components["schemas"]["HostBridgeParityConnectorProof"][];
+            /** Gaps */
+            gaps?: string[];
+            /** Local */
+            local?: {
+                [key: string]: unknown;
+            };
+            /** Ok */
+            ok: boolean;
+            /** Report */
+            report?: {
+                [key: string]: unknown;
+            };
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "local_blocked" | "cross_os_unverified" | "cross_os_verified";
+            /** Summary */
+            summary: string;
         };
         /** ImageArtifactLocation */
         ImageArtifactLocation: {
@@ -5009,7 +5168,7 @@ export interface components {
              * Model
              * @enum {string}
              */
-            model: "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-sonnet-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4-mini" | "gpt-5.3-codex";
+            model: "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4-mini" | "gpt-5.3-codex";
         };
         /** Notification */
         Notification: {
@@ -5142,9 +5301,9 @@ export interface components {
             id?: string | null;
             /**
              * Model
-             * @default claude-sonnet-4-7
+             * @default claude-sonnet-4-6
              */
-            model: ("claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-sonnet-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4-mini" | "gpt-5.3-codex") | null;
+            model: ("claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4-mini" | "gpt-5.3-codex") | null;
             /** Name */
             name: string;
             /**
@@ -5714,8 +5873,12 @@ export interface components {
             handoffs?: components["schemas"]["Handoff"][];
             /** Id */
             id: string;
+            /** Lastreviewreminderat */
+            lastReviewReminderAt?: number | null;
             /** Log */
             log?: string[];
+            /** Nextreviewat */
+            nextReviewAt?: number | null;
             /** Origin */
             origin: {
                 [key: string]: unknown;
@@ -5735,6 +5898,15 @@ export interface components {
             result?: {
                 [key: string]: unknown;
             } | null;
+            /** Reviewintervalms */
+            reviewIntervalMs?: number | null;
+            /**
+             * Reviewremindercount
+             * @default 0
+             */
+            reviewReminderCount: number;
+            /** Reviewscheduletoken */
+            reviewScheduleToken?: string | null;
             /**
              * Status
              * @enum {string}
@@ -6194,6 +6366,11 @@ export interface components {
             sharedNotes?: string | null;
             /** Status */
             status?: ("active" | "paused" | "done" | "archived") | null;
+        };
+        /** UpdateTaskReviewScheduleInput */
+        UpdateTaskReviewScheduleInput: {
+            /** Reviewintervalms */
+            reviewIntervalMs?: number | null;
         };
         /** UpdateTriggerInput */
         UpdateTriggerInput: {
@@ -8506,6 +8683,26 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_host_bridge_parity_api_host_bridge_parity_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HostBridgeParityStatusResponse"];
                 };
             };
         };
@@ -11109,6 +11306,63 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_task_review_schedule_api_tasks__task_id__review_schedule_patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateTaskReviewScheduleInput"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Task"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    telegram_webhook_api_telegram_webhook_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
                 };
             };
         };

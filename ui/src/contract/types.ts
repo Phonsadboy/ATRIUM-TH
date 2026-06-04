@@ -31,7 +31,6 @@ export type ModelId =
   | 'claude-sonnet-4-6'
   | 'claude-opus-4-6'
   | 'claude-opus-4-7'
-  | 'claude-sonnet-4-7'
   | 'claude-opus-4-8'
   | 'gpt-5.5'
   | 'gpt-5.4-mini'

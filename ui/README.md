@@ -30,10 +30,9 @@ Configured models:
 
 - `claude-sonnet-4-6`
 - `claude-opus-4-7`
-- `claude-sonnet-4-7`
 - `claude-opus-4-8`
 
-The create-department default is Claude Code `claude-sonnet-4-7` with thinking
+The create-department default is Claude Code `claude-sonnet-4-6` with thinking
 effort `high`.
 
 Thinking uses Claude adaptive thinking where supported. The selectable effort

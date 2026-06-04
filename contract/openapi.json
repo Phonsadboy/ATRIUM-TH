@@ -1222,6 +1222,17 @@
             ],
             "title": "Projectid"
           },
+          "reviewIntervalMs": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reviewintervalms"
+          },
           "title": {
             "title": "Title",
             "type": "string"
@@ -1880,7 +1891,8 @@
               "war_room",
               "meeting",
               "cost",
-              "status"
+              "status",
+              "department_work"
             ],
             "title": "Kind",
             "type": "string"
@@ -2710,6 +2722,13 @@
             "title": "Departments",
             "type": "array"
           },
+          "executiveQueue": {
+            "items": {
+              "$ref": "#/components/schemas/ExecutiveQueueItem"
+            },
+            "title": "Executivequeue",
+            "type": "array"
+          },
           "now": {
             "title": "Now",
             "type": "integer"
@@ -2808,6 +2827,40 @@
           "name": {
             "title": "Name",
             "type": "string"
+          },
+          "proofDetails": {
+            "additionalProperties": true,
+            "title": "Proofdetails",
+            "type": "object"
+          },
+          "proofGaps": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Proofgaps",
+            "type": "array"
+          },
+          "proofStatus": {
+            "default": "not_required",
+            "enum": [
+              "not_required",
+              "local_blocked",
+              "cross_os_unverified",
+              "cross_os_verified"
+            ],
+            "title": "Proofstatus",
+            "type": "string"
+          },
+          "proofSummary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proofsummary"
           },
           "readReady": {
             "default": true,
@@ -3373,7 +3426,6 @@
               "claude-sonnet-4-6",
               "claude-opus-4-6",
               "claude-opus-4-7",
-              "claude-sonnet-4-7",
               "claude-opus-4-8",
               "gpt-5.5",
               "gpt-5.4-mini",
@@ -4432,7 +4484,6 @@
               "claude-sonnet-4-6",
               "claude-opus-4-6",
               "claude-opus-4-7",
-              "claude-sonnet-4-7",
               "claude-opus-4-8",
               "gpt-5.5",
               "gpt-5.4-mini",
@@ -4671,7 +4722,6 @@
                   "claude-sonnet-4-6",
                   "claude-opus-4-6",
                   "claude-opus-4-7",
-                  "claude-sonnet-4-7",
                   "claude-opus-4-8",
                   "gpt-5.5",
                   "gpt-5.4-mini",
@@ -5055,7 +5105,6 @@
               "claude-sonnet-4-6",
               "claude-opus-4-6",
               "claude-opus-4-7",
-              "claude-sonnet-4-7",
               "claude-opus-4-8",
               "gpt-5.5",
               "gpt-5.4-mini",
@@ -5128,6 +5177,136 @@
           "dailyBudgetUsd"
         ],
         "title": "Executive",
+        "type": "object"
+      },
+      "ExecutiveQueueItem": {
+        "properties": {
+          "attempts": {
+            "default": 0,
+            "title": "Attempts",
+            "type": "integer"
+          },
+          "createdAt": {
+            "default": 0,
+            "title": "Createdat",
+            "type": "integer"
+          },
+          "departmentId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Departmentid"
+          },
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Detail"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "lastError": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lasterror"
+          },
+          "priority": {
+            "title": "Priority",
+            "type": "integer"
+          },
+          "replyMessageId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Replymessageid"
+          },
+          "runAfter": {
+            "title": "Runafter",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "taskId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Taskid"
+          },
+          "threadId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Threadid"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "updatedAt": {
+            "default": 0,
+            "title": "Updatedat",
+            "type": "integer"
+          },
+          "userMessageId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Usermessageid"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "status",
+          "title",
+          "runAfter",
+          "priority"
+        ],
+        "title": "ExecutiveQueueItem",
         "type": "object"
       },
       "GenerateImageInput": {
@@ -6134,6 +6313,112 @@
           "counts"
         ],
         "title": "HealthResponse",
+        "type": "object"
+      },
+      "HostBridgeParityConnectorProof": {
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "proofDetails": {
+            "additionalProperties": true,
+            "title": "Proofdetails",
+            "type": "object"
+          },
+          "proofGaps": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Proofgaps",
+            "type": "array"
+          },
+          "proofStatus": {
+            "enum": [
+              "not_required",
+              "local_blocked",
+              "cross_os_unverified",
+              "cross_os_verified"
+            ],
+            "title": "Proofstatus",
+            "type": "string"
+          },
+          "proofSummary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Proofsummary"
+          }
+        },
+        "required": [
+          "id",
+          "proofStatus"
+        ],
+        "title": "HostBridgeParityConnectorProof",
+        "type": "object"
+      },
+      "HostBridgeParityStatusResponse": {
+        "properties": {
+          "commands": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Commands",
+            "type": "object"
+          },
+          "connectors": {
+            "items": {
+              "$ref": "#/components/schemas/HostBridgeParityConnectorProof"
+            },
+            "title": "Connectors",
+            "type": "array"
+          },
+          "gaps": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Gaps",
+            "type": "array"
+          },
+          "local": {
+            "additionalProperties": true,
+            "title": "Local",
+            "type": "object"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "report": {
+            "additionalProperties": true,
+            "title": "Report",
+            "type": "object"
+          },
+          "status": {
+            "enum": [
+              "local_blocked",
+              "cross_os_unverified",
+              "cross_os_verified"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "summary": {
+            "title": "Summary",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "status",
+          "summary"
+        ],
+        "title": "HostBridgeParityStatusResponse",
         "type": "object"
       },
       "ImageArtifactLocation": {
@@ -7752,7 +8037,6 @@
               "claude-sonnet-4-6",
               "claude-opus-4-6",
               "claude-opus-4-7",
-              "claude-sonnet-4-7",
               "claude-opus-4-8",
               "gpt-5.5",
               "gpt-5.4-mini",
@@ -8097,7 +8381,6 @@
                   "claude-sonnet-4-6",
                   "claude-opus-4-6",
                   "claude-opus-4-7",
-                  "claude-sonnet-4-7",
                   "claude-opus-4-8",
                   "gpt-5.5",
                   "gpt-5.4-mini",
@@ -8109,7 +8392,7 @@
                 "type": "null"
               }
             ],
-            "default": "claude-sonnet-4-7",
+            "default": "claude-sonnet-4-6",
             "title": "Model"
           },
           "name": {
@@ -9839,12 +10122,34 @@
             "title": "Id",
             "type": "string"
           },
+          "lastReviewReminderAt": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Lastreviewreminderat"
+          },
           "log": {
             "items": {
               "type": "string"
             },
             "title": "Log",
             "type": "array"
+          },
+          "nextReviewAt": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nextreviewat"
           },
           "origin": {
             "additionalProperties": true,
@@ -9898,6 +10203,33 @@
               }
             ],
             "title": "Result"
+          },
+          "reviewIntervalMs": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reviewintervalms"
+          },
+          "reviewReminderCount": {
+            "default": 0,
+            "title": "Reviewremindercount",
+            "type": "integer"
+          },
+          "reviewScheduleToken": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reviewscheduletoken"
           },
           "status": {
             "enum": [
@@ -11465,6 +11797,23 @@
           }
         },
         "title": "UpdateProjectInput",
+        "type": "object"
+      },
+      "UpdateTaskReviewScheduleInput": {
+        "properties": {
+          "reviewIntervalMs": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reviewintervalms"
+          }
+        },
+        "title": "UpdateTaskReviewScheduleInput",
         "type": "object"
       },
       "UpdateTriggerInput": {
@@ -15392,6 +15741,24 @@
         "summary": "Create Handoff Message"
       }
     },
+    "/api/host-bridge/parity": {
+      "get": {
+        "operationId": "get_host_bridge_parity_api_host_bridge_parity_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HostBridgeParityStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Host Bridge Parity"
+      }
+    },
     "/api/images/generate": {
       "post": {
         "operationId": "generate_image_api_images_generate_post",
@@ -19207,6 +19574,75 @@
           }
         },
         "summary": "Request Task Close"
+      }
+    },
+    "/api/tasks/{task_id}/review-schedule": {
+      "patch": {
+        "operationId": "update_task_review_schedule_api_tasks__task_id__review_schedule_patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTaskReviewScheduleInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Task"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Task Review Schedule"
+      }
+    },
+    "/api/telegram/webhook": {
+      "post": {
+        "operationId": "telegram_webhook_api_telegram_webhook_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Telegram Webhook Api Telegram Webhook Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Telegram Webhook"
       }
     },
     "/api/threads/{thread_id}/cost": {

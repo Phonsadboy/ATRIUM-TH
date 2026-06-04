@@ -102,17 +102,6 @@ export const MODELS: Record<ModelId, ModelInfo> = {
     contextWindowTokens: 1_000_000,
     blurb: 'เร็ว ฉลาด สมดุล เหมาะกับงานทั่วไปและ agent loop',
   },
-  'claude-sonnet-4-7': {
-    id: 'claude-sonnet-4-7',
-    label: 'Sonnet 4.7',
-    tier: 'sonnet',
-    providerIds: ['claude_code'],
-    inputPerMTok: 3,
-    outputPerMTok: 15,
-    supportedSpeeds: ['standard'],
-    contextWindowTokens: 1_000_000,
-    blurb: 'รุ่น Sonnet สำหรับทดสอบ/ใช้งานจริง',
-  },
   'claude-opus-4-7': {
     id: 'claude-opus-4-7',
     label: 'Opus 4.7',
@@ -189,7 +178,6 @@ export const MODELS: Record<ModelId, ModelInfo> = {
 
 export const MODEL_LIST: ModelInfo[] = [
   MODELS['claude-sonnet-4-6'],
-  MODELS['claude-sonnet-4-7'],
   MODELS['claude-opus-4-6'],
   MODELS['claude-opus-4-7'],
   MODELS['claude-opus-4-8'],
@@ -198,7 +186,7 @@ export const MODEL_LIST: ModelInfo[] = [
   MODELS['gpt-5.3-codex'],
 ]
 
-export const DEFAULT_MODEL: ModelId = 'claude-sonnet-4-7'
+export const DEFAULT_MODEL: ModelId = 'claude-sonnet-4-6'
 
 export const THINKING_EFFORTS: Record<ThinkingEffort, ThinkingEffortInfo> = {
   off: {

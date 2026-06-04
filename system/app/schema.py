@@ -42,7 +42,6 @@ ModelId = Literal[
     "claude-sonnet-4-6",
     "claude-opus-4-6",
     "claude-opus-4-7",
-    "claude-sonnet-4-7",
     "claude-opus-4-8",
     "gpt-5.5",
     "gpt-5.4-mini",
@@ -1002,7 +1001,7 @@ class OrgPlanDepartment(Schema):
     charter: Optional[str] = None
     agent_name: Optional[str] = None
     provider_id: AiProviderId
-    model: Optional[ModelId] = "claude-sonnet-4-7"
+    model: Optional[ModelId] = "claude-sonnet-4-6"
     thinking_effort: Optional[ThinkingEffort] = "high"
     speed: Optional[ModelSpeed] = "standard"
     emoji: Optional[str] = None

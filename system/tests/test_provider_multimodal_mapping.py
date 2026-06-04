@@ -90,7 +90,7 @@ class ProviderMultimodalMappingTest(unittest.TestCase):
 
             args = ClaudeCodeCliProvider("claude_code")._args(
                 command="claude",
-                model="claude-sonnet-4-7",
+                model="claude-sonnet-4-6",
                 effort="low",
                 system_prompt="system",
                 stream=False,

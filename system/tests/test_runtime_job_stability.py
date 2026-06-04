@@ -175,6 +175,146 @@ class RuntimeJobStabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(changed, 2)
         self.assertEqual(max_running, 2)
 
+    async def test_handoff_task_blocks_source_and_wakes_idle_target(self) -> None:
+        from app import engine
+
+        class FakeRepo:
+            def __init__(self) -> None:
+                self.departments = {
+                    "target": {
+                        "id": "target",
+                        "name": "Target",
+                        "agentName": "Target Agent",
+                        "state": "idle",
+                        "currentTaskId": None,
+                    }
+                }
+                self.saved_tasks: list[dict] = []
+                self.saved_departments: list[dict] = []
+                self.activities: list[dict] = []
+                self.messages: list[dict] = []
+                self.entities: list[tuple[str, dict]] = []
+
+            async def get_department(self, dept_id):
+                return self.departments.get(dept_id)
+
+            async def save_department(self, dept):
+                self.departments[dept["id"]] = dict(dept)
+                self.saved_departments.append(dict(dept))
+
+            async def save_task(self, task):
+                self.saved_tasks.append(dict(task))
+
+            async def add_activity(self, activity):
+                self.activities.append(activity)
+
+            async def put_entity(self, type_, data, **kwargs):
+                self.entities.append((type_, dict(data)))
+
+            async def add_message(self, message):
+                self.messages.append(message)
+
+            async def thread_messages(self, thread_id, limit=500):
+                return []
+
+        repo = FakeRepo()
+        dept = {
+            "id": "source",
+            "name": "Source",
+            "agentName": "Source Agent",
+            "state": "review",
+            "currentTaskId": "task_1",
+        }
+        task = {
+            "id": "task_1",
+            "title": "Need specialist",
+            "detail": "Original task",
+            "status": "review",
+            "priority": "normal",
+            "departmentId": "source",
+            "progress": 0.8,
+            "createdAt": 100,
+            "updatedAt": 100,
+            "handoffs": [],
+            "log": [],
+            "deliverables": [],
+        }
+
+        next_task = await engine._create_handoff_task(
+            repo,
+            dept,
+            repo.departments["target"],
+            task,
+            reason="Need target context",
+            kind="consult",
+            now=123,
+        )
+
+        self.assertIsNotNone(next_task)
+        self.assertEqual(task["status"], "blocked")
+        self.assertEqual(task["waitingOn"]["dept"], "target")
+        self.assertEqual(dept["state"], "handoff")
+        self.assertEqual(repo.departments["target"]["state"], "working")
+        self.assertEqual(repo.departments["target"]["currentTaskId"], next_task["id"])
+        self.assertEqual(next_task["status"], "in_progress")
+        self.assertTrue(task["handoffs"])
+        self.assertEqual(task["handoffs"][0]["targetTaskId"], next_task["id"])
+        self.assertTrue(any(kind == "handoff_message" for kind, _ in repo.entities))
+
+    async def test_idle_department_resumes_current_in_progress_task(self) -> None:
+        from app import engine
+
+        class FakeRepo:
+            def __init__(self) -> None:
+                self.saved_tasks: list[dict] = []
+                self.saved_departments: list[dict] = []
+                self.activities: list[dict] = []
+                self.messages: list[dict] = []
+
+            async def save_task(self, task):
+                self.saved_tasks.append(dict(task))
+
+            async def save_department(self, dept):
+                self.saved_departments.append(dict(dept))
+
+            async def add_activity(self, activity):
+                self.activities.append(activity)
+
+            async def thread_messages(self, thread_id, limit=500):
+                return []
+
+            async def add_message(self, message):
+                self.messages.append(message)
+
+        repo = FakeRepo()
+        dept = {
+            "id": "dept_a",
+            "name": "Dept A",
+            "agentName": "Agent A",
+            "state": "idle",
+            "currentTaskId": "task_a",
+            "mood": 0.5,
+        }
+        task = {
+            "id": "task_a",
+            "title": "Resume me",
+            "status": "in_progress",
+            "departmentId": "dept_a",
+            "progress": 0.4,
+            "createdAt": 100,
+            "updatedAt": 100,
+            "log": [],
+            "handoffs": [],
+        }
+
+        changed = await engine._advance_department(repo, dept, [task], [dept], 456)
+
+        self.assertTrue(changed)
+        self.assertEqual(dept["state"], "working")
+        self.assertEqual(dept["currentTaskId"], "task_a")
+        self.assertEqual(task["status"], "in_progress")
+        self.assertIn("resume จาก currentTaskId", task["log"][-1])
+
     def test_job_stale_threshold_uses_job_timeout_not_heartbeat_only(self) -> None:
         from app.main import _job_stale_after_ms
 

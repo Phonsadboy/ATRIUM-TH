@@ -3854,6 +3854,9 @@ async def _create_handoff_task(
     now: int,
 ) -> dict[str, Any] | None:
     settings = get_settings()
+    fresh_target = await repo.get_department(str(target.get("id") or ""))
+    if fresh_target:
+        target = fresh_target
     source_depths = [int(h.get("depth") or 0) for h in task.get("handoffs", [])]
     depth = (max(source_depths) if source_depths else 0) + 1
     normalized_kind = _choice(kind, {"delegate", "consult", "collaborate", "return"}, "delegate")
@@ -3962,19 +3965,49 @@ async def _create_handoff_task(
         handoff["warRoomId"] = war_room["id"]
     next_task["handoffs"] = [handoff]
     task["handoffs"] = [*task.get("handoffs", []), handoff]
-    if handoff["kind"] in {"consult", "collaborate"}:
-        task["status"] = "blocked"
-        task["progress"] = min(float(task.get("progress", 0.9)), 0.95)
-        task["waitingOn"] = {"dept": target["id"], "handoffId": handoff["id"]}
-        task["log"] = [*task.get("log", []), f"รอคำตอบจาก {target['name']} ({handoff['kind']})"]
+    task["status"] = "blocked"
+    task["progress"] = min(float(task.get("progress", 0.9)), 0.95)
+    task["waitingOn"] = {"dept": target["id"], "handoffId": handoff["id"]}
+    task["log"] = [*task.get("log", []), f"รอคำตอบจาก {target['name']} ({handoff['kind']})"]
+    dept["state"] = "handoff"
+    dept["currentTaskId"] = task["id"]
+    woke_target = False
+    if not target.get("currentTaskId") and str(target.get("state") or "idle") == "idle":
+        next_task["status"] = "in_progress"
+        next_task["updatedAt"] = now
+        next_task["log"] = [*next_task.get("log", []), "เริ่มทำทันทีจาก handoff"]
+        target["state"] = "working"
+        target["currentTaskId"] = next_task["id"]
+        await repo.save_department(target)
+        woke_target = True
     await repo.save_task(next_task)
     await repo.save_task(task)
+    await repo.save_department(dept)
     await repo.add_activity(_activity(
         f"ส่งต่องาน → {target['name']}: {reason}",
         type_="handoff",
         department_id=dept["id"],
         ts=now,
     ))
+    await _add_executive_watch_line(
+        repo,
+        dept,
+        task,
+        f"ฝ่าย{dept.get('name', dept['id'])}ส่งต่องาน “{task['title']}” ไปฝ่าย{target.get('name', target['id'])}: {reason}",
+        event="handoff",
+        severity="info",
+        now=now,
+    )
+    if woke_target:
+        await _add_executive_watch_line(
+            repo,
+            target,
+            next_task,
+            f"ฝ่าย{target.get('name', target['id'])}เริ่มทำงาน handoff ต่อทันที: “{next_task['title']}”",
+            event="task_started",
+            severity="good",
+            now=now,
+        )
     hub.pulse({"kind": "handoff", "departmentId": dept["id"], "toDepartmentId": target["id"]})
     return next_task
 
@@ -4122,6 +4155,33 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
                 hub.pulse({"kind": "state", "departmentId": dept["id"]})
                 return True
 
+            handoff_recommendation = review.get("handoffRecommendation")
+            if isinstance(handoff_recommendation, dict):
+                target_id = str(handoff_recommendation.get("toDept") or "").strip()
+                target = next(
+                    (
+                        item
+                        for item in departments
+                        if str(item.get("id") or "") == target_id
+                        and not is_exec(str(item.get("id") or ""))
+                        and str(item.get("id") or "") != dept["id"]
+                    ),
+                    None,
+                )
+                if target:
+                    reason = _clip_text(handoff_recommendation.get("reason"), 1200) or f"review recommends handoff from {dept['id']}"
+                    next_task = await _create_handoff_task(
+                        repo,
+                        dept,
+                        target,
+                        task,
+                        reason=reason,
+                        kind=str(handoff_recommendation.get("kind") or "delegate"),
+                        now=now,
+                    )
+                    if next_task:
+                        return True
+
             report = (
                 _clip_text(review.get("deliverableMarkdown"), 30000)
                 or _clip_text(task.get("draftDeliverableMarkdown"), 30000)
@@ -4174,6 +4234,33 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
             hub.pulse({"kind": "state", "departmentId": dept["id"]})
             return True
         return False
+
+    if task and task.get("status") in {"assigned", "backlog", "revising", "in_progress"}:
+        task["status"] = "in_progress"
+        task["updatedAt"] = now
+        task["log"] = [*task.get("log", []), "resume จาก currentTaskId หลัง state idle"]
+        dept["state"] = "working"
+        dept["currentTaskId"] = task["id"]
+        await repo.save_task(task)
+        await repo.save_department(dept)
+        await repo.add_activity(_activity(
+            f"{dept['agentName']} กลับมาทำงาน “{task['title']}” จาก current task",
+            type_="task_assigned",
+            department_id=dept["id"],
+            severity="good",
+            ts=now,
+        ))
+        await _add_executive_watch_line(
+            repo,
+            dept,
+            task,
+            f"ฝ่าย{dept.get('name', dept['id'])}กลับมาทำงาน “{task['title']}” ต่อจาก current task",
+            event="task_started",
+            severity="good",
+            now=now,
+        )
+        hub.pulse({"kind": "state", "departmentId": dept["id"]})
+        return True
 
     open_task = _open_task_for(dept["id"], tasks)
     if open_task:

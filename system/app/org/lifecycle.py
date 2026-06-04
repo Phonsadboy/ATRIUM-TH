@@ -74,7 +74,7 @@ async def spawn_department(
         "emoji": "🟣",
         "accent": ACCENTS[len(departments) % len(ACCENTS)],
         "providerId": "claude_code",
-        "model": "claude-sonnet-4-7",
+        "model": "claude-sonnet-4-6",
         "thinkingEffort": "high",
         "speed": "standard",
         "agentName": f"{name} Agent"[:120],

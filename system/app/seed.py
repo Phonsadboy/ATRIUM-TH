@@ -115,7 +115,7 @@ BLUEPRINTS: list[dict] = [
     {
         "id": EXEC_ID, "name": "ผู้บริหาร", "role": "วางแผน · มอบหมาย · ตรวจงาน",
         "charter": "รับโจทย์จากผู้ใช้ ตีโจทย์ แตกงานเป็นชิ้นเล็ก มอบหมายให้แผนกที่เหมาะสม สั่งส่งต่องาน ตรวจรับงาน และสรุปรายงานกลับ",
-        "emoji": "🦉", "accent": "amber", "providerId": "claude_code", "model": "claude-sonnet-4-7",
+        "emoji": "🦉", "accent": "amber", "providerId": "claude_code", "model": "claude-sonnet-4-6",
         "thinkingEffort": "high", "agentName": "ออตโต้", "state": "thinking", "mood": 0.82,
         "skills": ["วางกลยุทธ์", "แตกงาน", "ประสานแผนก", "ตรวจคุณภาพ"],
         "tools": ["มอบหมายงาน", "ส่งต่องาน", "สรุปรายงาน", "เปลี่ยนชื่อตัวเอง"], "autonomy": True,
@@ -174,7 +174,7 @@ BLUEPRINTS: list[dict] = [
     {
         "id": "design", "name": "ออกแบบ", "role": "UX · ภาพ · ระบบดีไซน์",
         "charter": "ออกแบบประสบการณ์ที่ใช้ง่ายและสวยงาม คุมโทนแบรนด์ให้สม่ำเสมอ",
-        "emoji": "🎨", "accent": "lavender", "providerId": "claude_code", "model": "claude-sonnet-4-7",
+        "emoji": "🎨", "accent": "lavender", "providerId": "claude_code", "model": "claude-sonnet-4-6",
         "thinkingEffort": "medium", "agentName": "จูโน", "state": "working", "mood": 0.78,
         "skills": ["UX", "UI", "ระบบดีไซน์", "ภาพประกอบ"], "tools": ["ฟิกมา", "สร้างภาพ", "โทเคนดีไซน์"], "autonomy": False,
         "room": {"x": 13, "y": 6, "w": 5, "h": 4},

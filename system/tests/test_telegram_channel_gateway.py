@@ -22,7 +22,7 @@ class FakeRepo:
                 "charter": "Run the company",
                 "agentName": "Executive AI",
                 "providerId": "claude_code",
-                "model": "claude-sonnet-4-7",
+                "model": "claude-sonnet-4-6",
                 "thinkingEffort": "high",
                 "speed": "standard",
             }

@@ -21,7 +21,6 @@ ModelId = Literal[
     "claude-sonnet-4-6",
     "claude-opus-4-6",
     "claude-opus-4-7",
-    "claude-sonnet-4-7",
     "claude-opus-4-8",
     "gpt-5.5",
     "gpt-5.4-mini",
@@ -126,16 +125,6 @@ MODELS: dict[str, dict] = {
         "contextWindowTokens": 1_000_000,
         "blurb": "รุ่น Opus legacy ที่รองรับ Claude Fast Mode",
     },
-    "claude-sonnet-4-7": {
-        "id": "claude-sonnet-4-7",
-        "label": "Sonnet 4.7",
-        "tier": "sonnet",
-        "providerIds": ["claude_code"],
-        "inputPerMTok": 3.0,
-        "outputPerMTok": 15.0,
-        "contextWindowTokens": 1_000_000,
-        "blurb": "รุ่น Sonnet สำหรับทดสอบ/ใช้งานจริง",
-    },
     "claude-opus-4-8": {
         "id": "claude-opus-4-8",
         "label": "Opus 4.8",
@@ -231,7 +220,7 @@ SPEED_ORDER: list[str] = ["standard", "fast"]
 _XHIGH_MODELS = {"claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8"}
 FAST_MODE_MODELS = {"claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8"}
 
-DEFAULT_MODEL = "claude-sonnet-4-7"
+DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_SPEED = "standard"
 
 
