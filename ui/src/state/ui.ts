@@ -95,6 +95,8 @@ interface UIState {
   setRoomPosition: (roomIndex: number, pos: { x: number; y: number }) => void
   /** add one empty room beyond the current count (pass the live room count) */
   addOfficeRoom: (currentRoomCount?: number) => void
+  /** remove an empty room and shift later room indexes down by one */
+  removeOfficeRoom: (roomIndex: number, currentRoomCount?: number) => void
   applyOfficePlan: (plan: OfficeLayoutPlan) => void
   toggleArrange: (on?: boolean) => void
   toggleLeft: (on?: boolean) => void
@@ -236,6 +238,16 @@ function persistOfficeRoomIndex(roomIndex: number) {
   } catch {
     /* ignore quota/availability errors */
   }
+}
+
+function shiftIndexedRecord<T>(items: Record<string, T>, removedRoomIndex: number): Record<string, T> {
+  const next: Record<string, T> = {}
+  for (const [rawKey, value] of Object.entries(items)) {
+    const roomIndex = sanitizeRoomIndex(Number(rawKey))
+    if (roomIndex === removedRoomIndex) continue
+    next[String(roomIndex > removedRoomIndex ? roomIndex - 1 : roomIndex)] = value
+  }
+  return next
 }
 
 const LAYOUT_KEY = 'atrium.layout'
@@ -393,6 +405,45 @@ export const useUI = create<UIState>((set, get) => ({
       persistOfficeRoomCount(next)
       persistOfficeRoomIndex(next - 1)
       return { officeRoomCount: next, officeRoomIndex: next - 1 }
+    }),
+  removeOfficeRoom: (roomIndex, currentRoomCount) =>
+    set((s) => {
+      const removedRoomIndex = sanitizeRoomIndex(roomIndex)
+      const used = Object.values(s.departmentRooms)
+      const maxUsed = used.length ? Math.max(...used.map((n) => sanitizeRoomIndex(n))) + 1 : 0
+      const existing = Math.max(s.officeRoomCount, maxUsed, currentRoomCount ?? 0)
+      if (existing <= 1) return s
+
+      const nextRooms: Record<string, number> = {}
+      for (const [deptId, rawRoomIndex] of Object.entries(s.departmentRooms)) {
+        const deptRoomIndex = sanitizeRoomIndex(rawRoomIndex)
+        if (deptRoomIndex === removedRoomIndex) continue
+        nextRooms[deptId] = deptRoomIndex > removedRoomIndex ? deptRoomIndex - 1 : deptRoomIndex
+      }
+
+      const nextBackgrounds = shiftIndexedRecord(s.officeRoomBackgrounds, removedRoomIndex)
+      const nextPositions = shiftIndexedRecord(s.roomPositions, removedRoomIndex)
+      const nextRoomCount = Math.max(0, existing - 1)
+      const currentFocus = sanitizeRoomIndex(s.officeRoomIndex)
+      const nextOfficeRoomIndex =
+        currentFocus === removedRoomIndex
+          ? Math.min(removedRoomIndex, Math.max(0, nextRoomCount - 1))
+          : currentFocus > removedRoomIndex
+            ? currentFocus - 1
+            : currentFocus
+
+      persistDepartmentRooms(nextRooms)
+      persistOfficeRoomBackgrounds(nextBackgrounds)
+      persistRoomPositions(nextPositions)
+      persistOfficeRoomCount(nextRoomCount)
+      persistOfficeRoomIndex(nextOfficeRoomIndex)
+      return {
+        departmentRooms: nextRooms,
+        officeRoomBackgrounds: nextBackgrounds,
+        roomPositions: nextPositions,
+        officeRoomCount: nextRoomCount,
+        officeRoomIndex: nextOfficeRoomIndex,
+      }
     }),
   applyOfficePlan: (plan) =>
     set((s) => {

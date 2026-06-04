@@ -11,15 +11,18 @@ import contextlib
 import difflib
 import gzip
 import hashlib
+import hmac
 import json
 import locale
 import logging
 import os
 import plistlib
 import re
+import shlex
 import shutil
 import subprocess
 import sys
+import uuid
 import urllib.error
 import urllib.request
 from contextlib import asynccontextmanager
@@ -148,6 +151,7 @@ from .handoffs import (
     handoff_status_for_act,
     make_handoff_message,
 )
+from .host_bridge_proof import host_bridge_parity_proof_id, host_bridge_source_provenance
 from .engine import (
     approve_task_close_request,
     engine_runtime_snapshot,
@@ -179,9 +183,13 @@ from .provider.registry import get_provider, provider_health
 from .tools.host_bridge import HostBridge
 from .tools.visual_bridge import (
     browser_profile_from_args,
+    execute_browser_act,
     execute_browser_open,
+    execute_browser_snapshot,
     execute_activate_app,
     execute_click,
+    execute_desktop_act,
+    execute_desktop_snapshot,
     execute_keypress as execute_visual_keypress,
     execute_list_apps,
     execute_notification,
@@ -252,6 +260,7 @@ from .schema import (
     GenerateImageResponse,
     GuardedActionResponse,
     HandoffMessage,
+    HostBridgeParityStatusResponse,
     ImportFileInput,
     ImportFileResponse,
     InputEstimate,
@@ -330,6 +339,7 @@ from .scheduling import (
     resolve_trigger_cadence,
 )
 from .threads import dept_id_from_thread, is_exec, thread_id_for
+from .telegram_gateway import handle_telegram_update, run_telegram_polling_loop, telegram_webhook_secret
 
 logger = logging.getLogger(__name__)
 
@@ -636,6 +646,11 @@ async def lifespan(_: FastAPI):
     chat_worker = asyncio.create_task(_run_delayed_background(6.0, lambda: run_chat_reply_loop(settings))) if settings.engine_enabled else None
     image_worker = asyncio.create_task(_run_delayed_background(8.0, lambda: run_image_generation_loop(settings))) if settings.engine_enabled else None
     trigger_scheduler = asyncio.create_task(_run_delayed_background(8.0, lambda: run_trigger_scheduler_loop(settings))) if settings.engine_enabled else None
+    telegram_worker = (
+        asyncio.create_task(_run_delayed_background(4.0, lambda: run_telegram_polling_loop(settings, store_file=_store_file_artifact)))
+        if settings.engine_enabled
+        else None
+    )
     approval_sweeper = asyncio.create_task(_run_delayed_background(8.0, _run_full_auto_approval_sweeper))
     try:
         yield
@@ -659,6 +674,10 @@ async def lifespan(_: FastAPI):
             trigger_scheduler.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await trigger_scheduler
+        if telegram_worker:
+            telegram_worker.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await telegram_worker
         approval_sweeper.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await approval_sweeper
@@ -1926,6 +1945,7 @@ MUTATING_TOOLS = {
     "sandbox.exec",
     "git.commit",
     "git.push",
+    "browser.act",
     "browser.open",
     "browser.click",
     "browser.type",
@@ -1933,6 +1953,7 @@ MUTATING_TOOLS = {
     "browser.paste_text",
     "browser.scroll",
     "desktop.click",
+    "desktop.act",
     "desktop.open_app",
     "desktop.activate_app",
     "desktop.quit_app",
@@ -2338,11 +2359,11 @@ def _tool_risk_class(run: dict[str, Any]) -> ToolRiskClass:
             if not inside:
                 return "host_write"
         return "credential" if contains_credential else "local_write"
-    if tool in {"git.status", "git.diff", "logs.query", "browser.screenshot", "desktop.screenshot", "desktop.apps"}:
+    if tool in {"git.status", "git.diff", "logs.query", "browser.snapshot", "browser.screenshot", "desktop.snapshot", "desktop.screenshot", "desktop.apps"}:
         return "credential" if contains_credential else "safe_read"
     if tool == "desktop.quit_app" and args.get("force"):
         return "credential" if contains_credential else "destructive"
-    if tool in {"browser.open", "browser.click", "browser.type", "browser.keypress", "browser.paste_text", "browser.scroll", "desktop.open_app", "desktop.activate_app", "desktop.quit_app", "desktop.click", "desktop.type", "desktop.keypress", "desktop.paste_text", "desktop.scroll"}:
+    if tool in {"browser.open", "browser.act", "browser.click", "browser.type", "browser.keypress", "browser.paste_text", "browser.scroll", "desktop.open_app", "desktop.activate_app", "desktop.quit_app", "desktop.act", "desktop.click", "desktop.type", "desktop.keypress", "desktop.paste_text", "desktop.scroll"}:
         return "credential" if contains_credential else "desktop"
     if tool == "mcp.call":
         return "credential" if contains_credential else ("external_send" if args.get("changesExternalState") else "network")
@@ -2405,19 +2426,515 @@ def _tool_runtime_block_reason(run: dict[str, Any]) -> str | None:
     return None
 
 
+_HOST_BRIDGE_PARITY_PROOF_GAP = (
+    "Run ops/host_bridge_parity_report.py with macOS and Windows --full probe artifacts before claiming cross-OS HostBridge parity."
+)
+_HOST_BRIDGE_PARITY_REPORT_SCHEMA_VERSION = 1
+_HOST_BRIDGE_PARITY_PROOF_SCHEMA_VERSION = 1
+_HOST_BRIDGE_PARITY_RESULT_LABELS = {"macos", "windows"}
+_HOST_BRIDGE_PARITY_RESULT_PLATFORMS = {"macos": "darwin", "windows": "win32"}
+_HOST_BRIDGE_PARITY_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{2,127}$")
+_COMMON_HOST_BRIDGE_PROOF_FACETS = {
+    "browserOpen": "browser.open proof",
+    "browserOpenIsolatedProfile": "browser.open isolated ATRIUM profile proof",
+    "browserSnapshot": "browser.snapshot DOM-ref proof",
+    "browserSnapshotIsolatedPlaywright": "browser.snapshot Playwright isolated profile proof",
+    "browserAct": "browser.act DOM-ref click proof",
+    "browserActIsolatedPlaywright": "browser.act Playwright isolated profile proof",
+    "browserActVerified": "browser.act post-click DOM verification",
+    "appsDiscovery": "desktop.apps proof",
+    "screenshotFile": "screenshot file proof",
+    "notification": "notification proof",
+    "desktopAutomationReady": "desktop automation readiness proof",
+}
+_REQUIRED_HOST_BRIDGE_PROOF_FACETS = {
+    "macos": {
+        **_COMMON_HOST_BRIDGE_PROOF_FACETS,
+        "foregroundSession": "macOS foreground session proof",
+        "appleScriptClipboard": "macOS AppleScript clipboard proof",
+        "foregroundSnapshotNative": "macOS native foreground snapshot proof",
+        "appsNativeNSWorkspace": "macOS native app discovery proof",
+        "calculatorNativeAct": "macOS Calculator native AXPress display proof",
+        "textEditNativeAct": "macOS TextEdit native setValue proof",
+    },
+    "windows": {
+        **_COMMON_HOST_BRIDGE_PROOF_FACETS,
+        "interactiveSession": "Windows interactive session proof",
+        "windowsInteractiveSessionIdentity": "Windows interactive session identity proof",
+        "windowsVisualPreflight": "Windows visual preflight proof",
+        "helperSelftest": "Windows SendInput/UI helper selftest proof",
+        "powershellPreflight": "Windows PowerShell visual preflight proof",
+        "windowsDpiAwareness": "Windows DPI awareness proof",
+        "windowsVirtualScreen": "Windows virtual screen bounds proof",
+        "windowsForegroundActivation": "Windows Notepad foreground activation proof",
+        "windowsUnicodeTyping": "Windows Unicode typing proof",
+        "windowsKeyboardShortcut": "Windows keyboard shortcut mapping proof",
+        "notepadNativeAct": "Windows Notepad native UIAutomation ValuePattern text proof",
+        "clipboardRoundTrip": "Windows Notepad clipboard round-trip proof",
+    },
+}
+
+
+def _host_bridge_parity_report_proof(settings: Any) -> dict[str, Any]:
+    raw_path = getattr(settings, "host_bridge_parity_report_path", None) or Path("./data/host-bridge-parity-report.json")
+    path = Path(raw_path).expanduser()
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {
+            "present": False,
+            "ok": False,
+            "path": str(path),
+            "summary": "No persisted HostBridge parity report is available.",
+            "findings": [_HOST_BRIDGE_PARITY_PROOF_GAP],
+            "details": {"reportPath": str(path), "reportPresent": False},
+        }
+    except (json.JSONDecodeError, OSError) as exc:
+        return {
+            "present": True,
+            "ok": False,
+            "path": str(path),
+            "summary": "Persisted HostBridge parity report could not be read.",
+            "findings": [f"Persisted parity report is unreadable: {type(exc).__name__}: {exc}"],
+            "details": {"reportPath": str(path), "reportPresent": True, "reportReadable": False},
+        }
+    if not isinstance(loaded, dict):
+        return {
+            "present": True,
+            "ok": False,
+            "path": str(path),
+            "summary": "Persisted HostBridge parity report is invalid.",
+            "findings": ["Persisted parity report root must be a JSON object."],
+            "details": {"reportPath": str(path), "reportPresent": True, "reportReadable": False},
+        }
+
+    findings: list[str] = []
+    details: dict[str, Any] = {
+        "reportPath": str(path),
+        "reportPresent": True,
+        "reportReadable": True,
+        "reportOk": loaded.get("ok"),
+        "proofId": loaded.get("proofId"),
+        "reportGeneratedAt": loaded.get("generatedAt"),
+        "reportSummary": loaded.get("summary"),
+    }
+    if loaded.get("schemaVersion") != _HOST_BRIDGE_PARITY_REPORT_SCHEMA_VERSION:
+        findings.append("Persisted parity report schemaVersion is not 1; regenerate with ops/host_bridge_parity_report.py --output.")
+    if loaded.get("proofSchemaVersion") != _HOST_BRIDGE_PARITY_PROOF_SCHEMA_VERSION:
+        findings.append("Persisted parity report proofSchemaVersion is not 1; regenerate with ops/host_bridge_parity_report.py --output.")
+    proof_id = loaded.get("proofId")
+    if loaded.get("ok") is True and (not isinstance(proof_id, str) or len(proof_id) != 64):
+        findings.append("Persisted parity report proofId is missing or invalid; regenerate with ops/host_bridge_parity_report.py --output.")
+    generated_at = loaded.get("generatedAt")
+    if not isinstance(generated_at, int):
+        findings.append("Persisted parity report is missing generatedAt; regenerate with ops/host_bridge_parity_report.py --output.")
+    else:
+        now = now_ms()
+        if generated_at > now + 5 * 60 * 1000:
+            findings.append("Persisted parity report generatedAt is in the future; regenerate with ops/host_bridge_parity_report.py --output.")
+        max_age_hours = float(getattr(settings, "host_bridge_parity_report_max_age_hours", 24.0) or 0.0)
+        if max_age_hours > 0:
+            max_age_ms = int(max_age_hours * 60 * 60 * 1000)
+            age_ms = now - generated_at
+            if age_ms > max_age_ms:
+                findings.append(
+                    f"Persisted parity report is stale; regenerate with ops/host_bridge_parity_report.py --output. "
+                    f"ageHours={age_ms / 3600000:.1f}; maxAgeHours={max_age_hours:.1f}"
+                )
+    results = loaded.get("results") if isinstance(loaded.get("results"), dict) else {}
+    result_labels = {str(label) for label in results} if isinstance(results, dict) else set()
+    unexpected_result_labels = sorted(result_labels - _HOST_BRIDGE_PARITY_RESULT_LABELS)
+    missing_result_labels = sorted(_HOST_BRIDGE_PARITY_RESULT_LABELS - result_labels)
+    if unexpected_result_labels:
+        findings.append(
+            "Persisted parity report has unexpected OS result labels; regenerate with ops/host_bridge_parity_report.py --output. "
+            f"labels={', '.join(unexpected_result_labels)}"
+        )
+    if missing_result_labels:
+        findings.append(
+            "Persisted parity report is missing required OS result labels; regenerate with ops/host_bridge_parity_report.py --output. "
+            f"labels={', '.join(missing_result_labels)}"
+        )
+    source_fingerprints: dict[str, str] = {}
+    git_heads: dict[str, str] = {}
+    parity_run_ids: dict[str, str] = {}
+    host_fingerprints: dict[str, str] = {}
+    host_platforms: dict[str, str] = {}
+    host_names: dict[str, str] = {}
+    artifact_shas: dict[str, str] = {}
+    artifact_bytes_by_label: dict[str, int] = {}
+    artifact_generated_at_by_label: dict[str, int] = {}
+    result_ok_by_label: dict[str, Any] = {}
+    proofs_by_label: dict[str, dict[str, Any]] = {}
+    for label in ("macos", "windows"):
+        result = results.get(label) if isinstance(results, dict) else None
+        if not isinstance(result, dict) or result.get("present") is not True or result.get("ok") is not True:
+            findings.append(f"Persisted parity report does not prove {label}.")
+            result_ok_by_label[label] = result.get("ok") if isinstance(result, dict) else None
+            continue
+        result_ok_by_label[label] = result.get("ok")
+        artifact_sha = result.get("artifactSha256")
+        if not isinstance(artifact_sha, str) or len(artifact_sha) != 64:
+            findings.append(f"Persisted parity report {label} artifactSha256 is missing or invalid; regenerate with ops/host_bridge_parity_report.py --output.")
+        else:
+            artifact_shas[label] = artifact_sha
+        artifact_bytes = result.get("artifactBytes")
+        if not isinstance(artifact_bytes, int) or artifact_bytes <= 0:
+            findings.append(f"Persisted parity report {label} artifactBytes is missing or invalid; regenerate with ops/host_bridge_parity_report.py --output.")
+        else:
+            artifact_bytes_by_label[label] = artifact_bytes
+        if result.get("proofSchemaVersion") != _HOST_BRIDGE_PARITY_PROOF_SCHEMA_VERSION:
+            findings.append(f"Persisted parity report {label} proofSchemaVersion is not 1; regenerate with ops/host_bridge_parity_report.py --output.")
+        if result.get("schemaVersion") != 1:
+            findings.append(f"Persisted parity report {label} artifact schemaVersion is not 1; regenerate with ops/host_bridge_parity_report.py --output.")
+        artifact_generated_at = result.get("generatedAt")
+        if not isinstance(artifact_generated_at, int):
+            findings.append(f"Persisted parity report {label} artifact is missing generatedAt; regenerate with ops/host_bridge_parity_report.py --output.")
+        elif generated_at is not None:
+            artifact_generated_at_by_label[label] = artifact_generated_at
+            now = now_ms()
+            if artifact_generated_at > now + 5 * 60 * 1000:
+                findings.append(f"Persisted parity report {label} artifact generatedAt is in the future; regenerate with ops/host_bridge_parity_report.py --output.")
+            max_age_hours = float(getattr(settings, "host_bridge_parity_report_max_age_hours", 24.0) or 0.0)
+            if max_age_hours > 0:
+                max_age_ms = int(max_age_hours * 60 * 60 * 1000)
+                age_ms = now - artifact_generated_at
+                if age_ms > max_age_ms:
+                    findings.append(
+                        f"Persisted parity report {label} artifact is stale; regenerate with ops/host_bridge_parity_report.py --output. "
+                        f"ageHours={age_ms / 3600000:.1f}; maxAgeHours={max_age_hours:.1f}"
+                    )
+        fingerprint = result.get("sourceFingerprint")
+        if isinstance(fingerprint, str) and len(fingerprint) == 64:
+            source_fingerprints[label] = fingerprint
+        else:
+            findings.append(f"Persisted parity report {label} artifact sourceFingerprint is missing or invalid; regenerate with ops/host_bridge_parity_report.py --output.")
+        git_head = result.get("gitHead")
+        if isinstance(git_head, str) and len(git_head) == 40:
+            git_heads[label] = git_head
+        else:
+            findings.append(f"Persisted parity report {label} artifact gitHead is missing or invalid; regenerate with ops/host_bridge_parity_report.py --output.")
+        host_fingerprint = result.get("hostFingerprint")
+        if isinstance(host_fingerprint, str) and len(host_fingerprint) == 64:
+            host_fingerprints[label] = host_fingerprint
+        else:
+            findings.append(f"Persisted parity report {label} artifact hostFingerprint is missing or invalid; regenerate with ops/host_bridge_parity_report.py --output.")
+        host_platform = result.get("hostPlatform")
+        expected_host_platform = _HOST_BRIDGE_PARITY_RESULT_PLATFORMS[label]
+        if isinstance(host_platform, str) and host_platform == expected_host_platform:
+            host_platforms[label] = host_platform
+        else:
+            findings.append(
+                f"Persisted parity report {label} artifact hostPlatform must be {expected_host_platform}; "
+                "regenerate with ops/host_bridge_parity_report.py --output."
+            )
+        host_name = str(result.get("hostName") or "").strip()
+        if host_name:
+            host_names[label] = host_name
+        else:
+            findings.append(f"Persisted parity report {label} artifact hostName is missing; regenerate with ops/host_bridge_parity_report.py --output.")
+        parity_run_id = result.get("parityRunId")
+        if isinstance(parity_run_id, str) and _HOST_BRIDGE_PARITY_RUN_ID_RE.fullmatch(parity_run_id):
+            parity_run_ids[label] = parity_run_id
+        else:
+            findings.append(
+                f"Persisted parity report {label} artifact parityRunId is missing or invalid; "
+                "rerun both full probes with the same --parity-run-id and regenerate with ops/host_bridge_parity_report.py --output."
+            )
+        proofs = result.get("proofs") if isinstance(result.get("proofs"), dict) else {}
+        proofs_by_label[label] = proofs
+        for proof_key, proof_label in _REQUIRED_HOST_BRIDGE_PROOF_FACETS[label].items():
+            if proofs.get(proof_key) is not True:
+                findings.append(
+                    f"Persisted parity report {label} lacks required {proof_label}; "
+                    "regenerate with ops/host_bridge_parity_report.py --output."
+                )
+    if len(source_fingerprints) == 2 and len(set(source_fingerprints.values())) != 1:
+        findings.append("Persisted parity report sourceFingerprint mismatch; regenerate both macOS and Windows full probe artifacts from the same HostBridge source.")
+    if len(git_heads) == 2 and len(set(git_heads.values())) != 1:
+        findings.append("Persisted parity report gitHead mismatch; regenerate both macOS and Windows full probe artifacts from the same commit.")
+    if len(parity_run_ids) == 2 and len(set(parity_run_ids.values())) != 1:
+        findings.append("Persisted parity report parityRunId mismatch; rerun macOS and Windows full probe artifacts with the same --parity-run-id.")
+    if len(source_fingerprints) == 2 and len(set(source_fingerprints.values())) == 1:
+        details["sourceFingerprint"] = next(iter(source_fingerprints.values()))
+    if len(git_heads) == 2 and len(set(git_heads.values())) == 1:
+        details["gitHead"] = next(iter(git_heads.values()))
+    if len(parity_run_ids) == 2 and len(set(parity_run_ids.values())) == 1:
+        details["parityRunId"] = next(iter(parity_run_ids.values()))
+    details["hostFingerprint"] = host_fingerprints
+    details["hostPlatform"] = host_platforms
+    details["hostName"] = host_names
+    details["artifactSha256"] = artifact_shas
+    details["artifactBytes"] = artifact_bytes_by_label
+    details["artifactGeneratedAt"] = artifact_generated_at_by_label
+    details["resultOk"] = result_ok_by_label
+    details["proofs"] = proofs_by_label
+    report_findings = loaded.get("findings")
+    if loaded.get("ok") is not True:
+        if isinstance(report_findings, list) and report_findings:
+            findings.extend(str(item) for item in report_findings[:8])
+        else:
+            findings.append("Persisted parity report ok is not true.")
+    if not findings and loaded.get("ok") is True:
+        current_source = host_bridge_source_provenance()
+        current_fingerprint = current_source.get("sourceFingerprint")
+        current_git_head = current_source.get("gitHead")
+        details["currentSourceFingerprint"] = current_fingerprint
+        details["currentGitHead"] = current_git_head
+        details["currentGitDirty"] = current_source.get("gitDirty")
+        expected_proof_id = host_bridge_parity_proof_id(results, current_source, enforce_current_source=True)
+        details["expectedProofId"] = expected_proof_id
+        if proof_id != expected_proof_id:
+            findings.append(
+                "Persisted parity report proofId does not match its artifact inputs and current HostBridge source; "
+                "regenerate with ops/host_bridge_parity_report.py --output."
+            )
+        if isinstance(current_fingerprint, str) and len(source_fingerprints) == 2:
+            proved_fingerprint = next(iter(source_fingerprints.values()))
+            if proved_fingerprint != current_fingerprint:
+                findings.append(
+                    "Persisted parity report sourceFingerprint does not match current HostBridge source; "
+                    "regenerate macOS and Windows full probe artifacts from the current checkout."
+                )
+        if isinstance(current_git_head, str) and len(git_heads) == 2:
+            proved_git_head = next(iter(git_heads.values()))
+            if proved_git_head != current_git_head:
+                findings.append(
+                    "Persisted parity report gitHead does not match current checkout; "
+                    "regenerate macOS and Windows full probe artifacts from the current commit."
+                )
+
+    return {
+        "present": True,
+        "ok": not findings,
+        "path": str(path),
+        "summary": str(loaded.get("summary") or "Persisted HostBridge parity report is available."),
+        "generatedAt": generated_at,
+        "findings": findings,
+        "details": details,
+    }
+
+
+def _host_bridge_connector_proof(
+    *,
+    local_ready: bool,
+    runtime_status: str | None,
+    parity_report: dict[str, Any],
+) -> dict[str, Any]:
+    gaps = list(parity_report.get("findings") or [_HOST_BRIDGE_PARITY_PROOF_GAP])
+    detail = str(runtime_status or "").strip()
+    if detail and detail != "ready":
+        gaps.insert(0, detail)
+    if not local_ready:
+        if parity_report.get("ok") is True:
+            gaps.insert(0, "Persisted parity report is verified, but current local HostBridge runtime is blocked; rerun full proof after fixing this host.")
+        return {
+            "proof_status": "local_blocked",
+            "proof_summary": "Local HostBridge runtime is blocked; cross-OS parity proof cannot pass.",
+            "proof_gaps": gaps,
+            "proof_details": {**dict(parity_report.get("details") or {}), "localRuntimeStatus": runtime_status},
+        }
+    if parity_report.get("ok") is True:
+        return {
+            "proof_status": "cross_os_verified",
+            "proof_summary": f"Cross-OS HostBridge parity verified by {parity_report.get('path')}.",
+            "proof_gaps": [],
+            "proof_details": dict(parity_report.get("details") or {}),
+        }
+    return {
+        "proof_status": "cross_os_unverified",
+        "proof_summary": "Local HostBridge runtime is ready, but no verified macOS+Windows full parity report is attached.",
+        "proof_gaps": gaps,
+        "proof_details": {**dict(parity_report.get("details") or {}), "localRuntimeStatus": runtime_status},
+    }
+
+
+def _unique_host_bridge_gaps(values: list[Any]) -> list[str]:
+    seen: set[str] = set()
+    gaps: list[str] = []
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        gaps.append(text)
+    return gaps
+
+
+def _host_bridge_parity_commands() -> dict[str, str]:
+    parity_run_id = f"atrium-{now_ms()}-{uuid.uuid4()}"
+    source = host_bridge_source_provenance()
+    source_fingerprint = str(source.get("sourceFingerprint") or "")
+    macos_artifact = "/tmp/atrium_host_bridge_macos_live.json"
+    windows_artifact_on_windows = "C:\\Temp\\atrium_host_bridge_windows_live.json"
+    windows_artifact_local = "/tmp/atrium_host_bridge_windows_live.json"
+    output = "data/host-bridge-parity-report.json"
+    quoted_windows_source = shlex.quote(windows_artifact_on_windows)
+    return {
+        "parityRunId": parity_run_id,
+        "sourceFingerprint": source_fingerprint,
+        "macosRunIdExport": f"RUN_ID={parity_run_id}",
+        "macosSourceValidate": (
+            "uv --project system run python ops/host_bridge_source_summary.py "
+            f"--expect-source-fingerprint {source_fingerprint}"
+        ),
+        "windowsRunIdSet": f'$RunId = "{parity_run_id}"',
+        "windowsSourceValidate": (
+            "uv --project system run python ops/host_bridge_source_summary.py "
+            f"--expect-source-fingerprint {source_fingerprint}"
+        ),
+        "macosProbe": (
+            "uv --project system run python ops/macos_host_bridge_probe.py "
+            f"--full --parity-run-id {parity_run_id} "
+            f"--expect-source-fingerprint {source_fingerprint} --output {macos_artifact}"
+        ),
+        "macosArtifact": macos_artifact,
+        "macosArtifactValidate": (
+            "uv --project system run python ops/host_bridge_artifact_summary.py "
+            f"--label macos --expect-parity-run-id {parity_run_id} "
+            f"--expect-source-fingerprint {source_fingerprint} {macos_artifact}"
+        ),
+        "windowsProbe": (
+            "uv --project system run python ops/windows_host_bridge_probe.py "
+            f"--full --parity-run-id {parity_run_id} "
+            f"--expect-source-fingerprint {source_fingerprint} --output {windows_artifact_on_windows}"
+        ),
+        "windowsLiveProofRunner": (
+            "powershell -NoProfile -ExecutionPolicy Bypass -File .\\ops\\windows_host_bridge_live_proof.ps1 "
+            f"-ParityRunId {parity_run_id} "
+            f"-SourceFingerprint {source_fingerprint} "
+            f"-Output {windows_artifact_on_windows}"
+        ),
+        "windowsArtifactValidateOnWindows": (
+            "uv --project system run python ops/host_bridge_artifact_summary.py "
+            f"--label windows --expect-parity-run-id {parity_run_id} "
+            f"--expect-source-fingerprint {source_fingerprint} {windows_artifact_on_windows}"
+        ),
+        "windowsArtifactSource": windows_artifact_on_windows,
+        "windowsArtifactLocal": windows_artifact_local,
+        "windowsArtifactCopyHint": (
+            f"Copy the Windows full-probe artifact from {windows_artifact_on_windows} "
+            f"on the Windows host to {windows_artifact_local} on this repo host before running verify."
+        ),
+        "windowsArtifactValidateLocal": (
+            "uv --project system run python ops/host_bridge_artifact_summary.py "
+            f"--label windows --expect-parity-run-id {parity_run_id} "
+            f"--expect-source-fingerprint {source_fingerprint} {windows_artifact_local}"
+        ),
+        "verify": (
+            "uv --project system run python ops/host_bridge_parity_report.py "
+            f"--macos {macos_artifact} --windows {windows_artifact_local} "
+            f"--windows-source-path {quoted_windows_source} --output {output}"
+        ),
+    }
+
+
+def _host_bridge_parity_status_payload() -> dict[str, Any]:
+    settings = get_settings()
+    host_bridge = HostBridge(settings).status().to_dict()
+    parity_report = _host_bridge_parity_report_proof(settings)
+    connectors_by_id = {connector["id"]: connector for connector in _connector_catalog()}
+    bridge_connectors = [connectors_by_id.get("browser") or {}, connectors_by_id.get("desktop") or {}]
+    proof_connectors = [
+        {
+            "id": str(connector.get("id") or ""),
+            "proof_status": connector.get("proofStatus") or "not_required",
+            "proof_summary": connector.get("proofSummary"),
+            "proof_gaps": list(connector.get("proofGaps") or []),
+            "proof_details": dict(connector.get("proofDetails") or {}),
+        }
+        for connector in bridge_connectors
+        if connector
+    ]
+    proof_statuses = [str(item.get("proof_status") or "") for item in proof_connectors]
+    if any(status == "local_blocked" for status in proof_statuses):
+        status = "local_blocked"
+        summary = "Local HostBridge runtime is blocked; full macOS+Windows parity proof cannot pass."
+    elif proof_statuses and all(status == "cross_os_verified" for status in proof_statuses):
+        status = "cross_os_verified"
+        summary = f"Cross-OS HostBridge parity verified by {parity_report.get('path')}."
+    else:
+        status = "cross_os_unverified"
+        summary = "HostBridge local runtime is ready, but no verified macOS+Windows full parity report is attached."
+    gaps = _unique_host_bridge_gaps(
+        [
+            gap
+            for connector in bridge_connectors
+            for gap in (connector.get("proofGaps") if connector else []) or []
+        ]
+        + list(parity_report.get("findings") or [])
+    )
+    report_details = dict(parity_report.get("details") or {})
+    report_payload = {
+        **report_details,
+        "path": parity_report.get("path"),
+        "present": bool(parity_report.get("present")),
+        "ok": bool(parity_report.get("ok")),
+        "summary": parity_report.get("summary"),
+        "generatedAt": parity_report.get("generatedAt"),
+        "findings": list(parity_report.get("findings") or []),
+    }
+    browser_connector = connectors_by_id.get("browser") or {}
+    desktop_connector = connectors_by_id.get("desktop") or {}
+    local_payload = {
+        "platform": host_bridge.get("platform") or sys.platform,
+        "browser": {
+            "status": browser_connector.get("status"),
+            "runtimeStatus": browser_connector.get("runtimeStatus"),
+            "readReady": browser_connector.get("readReady"),
+            "writeReady": browser_connector.get("writeReady"),
+            "proofStatus": browser_connector.get("proofStatus"),
+        },
+        "desktop": {
+            "status": desktop_connector.get("status"),
+            "runtimeStatus": desktop_connector.get("runtimeStatus"),
+            "readReady": desktop_connector.get("readReady"),
+            "writeReady": desktop_connector.get("writeReady"),
+            "proofStatus": desktop_connector.get("proofStatus"),
+        },
+        "browserAutomationReady": host_bridge.get("browserAutomationReady"),
+        "desktopAutomationReady": host_bridge.get("desktopAutomationReady"),
+        "macosVisualPreflight": {
+            "checked": host_bridge.get("macosVisualPreflightChecked"),
+            "ok": host_bridge.get("macosVisualPreflightOk"),
+            "error": host_bridge.get("macosVisualPreflightError"),
+            "checks": host_bridge.get("macosVisualPreflightChecks"),
+        },
+        "windowsVisualPreflight": {
+            "checked": host_bridge.get("windowsVisualPreflightChecked"),
+            "ok": host_bridge.get("windowsVisualPreflightOk"),
+            "error": host_bridge.get("windowsVisualPreflightError"),
+            "checks": host_bridge.get("windowsVisualPreflightChecks"),
+        },
+    }
+    return HostBridgeParityStatusResponse(
+        ok=status == "cross_os_verified",
+        status=status,
+        summary=summary,
+        gaps=gaps,
+        report=report_payload,
+        local=local_payload,
+        connectors=proof_connectors,
+        commands=_host_bridge_parity_commands(),
+    ).dump()
+
+
 def _connector_catalog() -> list[dict[str, Any]]:
     settings = get_settings()
     host_bridge = HostBridge(settings).status().to_dict()
+    parity_report = _host_bridge_parity_report_proof(settings)
     host_platform = str(host_bridge.get("platform") or sys.platform)
     has_browser = bool(host_bridge.get("browserBridge"))
     browser_ready = bool(host_bridge.get("browserAutomationReady"))
     has_desktop = bool(host_bridge.get("desktopBridge"))
     desktop_ready = bool(host_bridge.get("desktopAutomationReady"))
-    browser_available = browser_ready if host_platform == "win32" else has_browser
-    desktop_available = desktop_ready if host_platform == "win32" else has_desktop
+    browser_available = browser_ready if host_platform in {"win32", "darwin"} else has_browser
+    desktop_available = desktop_ready if host_platform in {"win32", "darwin"} else has_desktop
     browser_read_ready = True if host_platform == "win32" else has_browser
     desktop_read_ready = has_desktop
     isolated_browser_ready = bool(host_bridge.get("isolatedBrowserProfileReady"))
+    browser_playwright_runtime_ready = bool(host_bridge.get("browserPlaywrightReady"))
+    browser_playwright_error = str(host_bridge.get("browserPlaywrightError") or "").strip()
     windows_visual_preflight_failed = (
         host_platform == "win32"
         and host_bridge.get("windowsVisualPreflightChecked") is True
@@ -2427,6 +2944,15 @@ def _connector_catalog() -> list[dict[str, Any]]:
     windows_visual_preflight_runtime = "Windows visual automation preflight failed"
     if windows_visual_preflight_error:
         windows_visual_preflight_runtime = f"{windows_visual_preflight_runtime}: {windows_visual_preflight_error}"
+    macos_visual_preflight_failed = (
+        host_platform == "darwin"
+        and host_bridge.get("macosVisualPreflightChecked") is True
+        and host_bridge.get("macosVisualPreflightOk") is False
+    )
+    macos_visual_preflight_error = str(host_bridge.get("macosVisualPreflightError") or "").strip()
+    macos_visual_preflight_runtime = "macOS visual automation preflight failed"
+    if macos_visual_preflight_error:
+        macos_visual_preflight_runtime = f"{macos_visual_preflight_runtime}: {macos_visual_preflight_error}"
     browser_runtime = "ready" if browser_ready else (
         f"{host_platform} browser bridge unavailable" if not has_browser else f"{host_platform} browser automation bridge incomplete"
     )
@@ -2442,21 +2968,38 @@ def _connector_catalog() -> list[dict[str, Any]]:
         )
     if browser_ready and not isolated_browser_ready:
         browser_runtime = "default browser ready; isolated browser profile app missing"
+    elif browser_ready and isolated_browser_ready and not browser_playwright_runtime_ready:
+        detail = browser_playwright_error or "Playwright package missing"
+        browser_runtime = f"browser bridge ready; browser.snapshot/browser.act blocked: {detail}"
     desktop_runtime = "ready" if desktop_ready else (
         f"{host_platform} desktop bridge unavailable" if not has_desktop else f"{host_platform} desktop automation bridge incomplete"
     )
     if host_platform == "win32" and not desktop_ready and has_desktop and windows_visual_preflight_failed:
         desktop_runtime = windows_visual_preflight_runtime
+    if host_platform == "darwin" and not desktop_ready and has_desktop and macos_visual_preflight_failed:
+        desktop_runtime = macos_visual_preflight_runtime
+    browser_proof_ready = browser_ready
+    browser_proof_runtime = browser_runtime
+    if host_platform == "win32" and windows_visual_preflight_failed:
+        browser_proof_ready = False
+        browser_proof_runtime = windows_visual_preflight_runtime
+    if host_platform == "darwin" and macos_visual_preflight_failed:
+        browser_proof_ready = False
+        browser_proof_runtime = macos_visual_preflight_runtime
     browser_requires = (
         ["PowerShell", "Win32 input APIs", "interactive user session", "DPI-aware visual preflight"]
         if host_platform == "win32"
-        else ["open", "screencapture", "osascript", "pbcopy"]
+        else ["open", "screencapture", "osascript"]
     )
     if not isolated_browser_ready:
         browser_requires = [*browser_requires, "Chrome/Edge/Brave/Chromium for isolated profile"]
+    if not (shutil.which("node") or shutil.which("node.exe")):
+        browser_requires = [*browser_requires, "Node.js for browser.snapshot/browser.act"]
+    browser_requires = [*browser_requires, "Playwright package for browser.snapshot/browser.act"]
     browser_capabilities = [
         "profiles",
         *(['own_profile'] if isolated_browser_ready else []),
+        *(['dom_snapshot', 'ref_action'] if browser_playwright_runtime_ready else []),
         "open_url",
         "screenshot",
         "coordinate_click",
@@ -2468,7 +3011,7 @@ def _connector_catalog() -> list[dict[str, Any]]:
     desktop_requires = (
         ["PowerShell", "Win32 input APIs", "interactive user session", "DPI-aware visual preflight"]
         if host_platform == "win32"
-        else ["osascript", "screencapture", "pbcopy"]
+        else ["osascript", "screencapture", "macOS Accessibility permission", "foreground-controllable user session"]
     )
     sandbox_available, sandbox_runtime_status = _sandbox_runtime_status()
     mcp_endpoint = _mcp_gateway_endpoint()
@@ -2561,28 +3104,38 @@ def _connector_catalog() -> list[dict[str, Any]]:
             name="Browser bridge",
             kind="browser",
             status="available" if browser_available else "blocked_by_runtime",
-            description="Open browser targets, capture visible state, and route keyboard/mouse/scroll input through the local OS automation bridge when permitted.",
-            tools=["browser.profiles", "browser.open", "browser.screenshot", "browser.click", "browser.type", "browser.keypress", "browser.paste_text", "browser.scroll"],
+            description="Open browser targets, inspect DOM snapshots in an isolated profile, capture visible state, and route keyboard/mouse/scroll input through the local OS automation bridge when permitted.",
+            tools=["browser.profiles", "browser.open", "browser.snapshot", "browser.act", "browser.screenshot", "browser.click", "browser.type", "browser.keypress", "browser.paste_text", "browser.scroll"],
             capabilities=browser_capabilities,
             requires=browser_requires,
             runtime_status=browser_runtime,
             read_ready=browser_read_ready,
             write_ready=browser_ready,
             local_fallback=True,
+            **_host_bridge_connector_proof(
+                local_ready=browser_proof_ready,
+                runtime_status=browser_proof_runtime,
+                parity_report=parity_report,
+            ),
         ),
         Connector(
             id="desktop",
             name="Desktop bridge",
             kind="desktop",
             status="available" if desktop_available else "blocked_by_runtime",
-            description="Use screenshots, local notifications, and keyboard/mouse input through the local OS automation bridge.",
-            tools=["desktop.apps", "desktop.open_app", "desktop.activate_app", "desktop.quit_app", "desktop.screenshot", "desktop.click", "desktop.type", "desktop.keypress", "desktop.paste_text", "desktop.scroll", "notify.send"],
-            capabilities=["apps", "open_app", "activate_app", "quit_app", "screenshot", "click", "type_text", "keypress", "paste_text", "scroll", "notification"],
+            description="Use app discovery, accessibility/UIA snapshots, screenshots, local notifications, and keyboard/mouse input through the local OS automation bridge.",
+            tools=["desktop.apps", "desktop.snapshot", "desktop.act", "desktop.open_app", "desktop.activate_app", "desktop.quit_app", "desktop.screenshot", "desktop.click", "desktop.type", "desktop.keypress", "desktop.paste_text", "desktop.scroll", "notify.send"],
+            capabilities=["apps", "accessibility_snapshot", "ref_action", "open_app", "activate_app", "quit_app", "screenshot", "click", "type_text", "keypress", "paste_text", "scroll", "notification"],
             requires=desktop_requires,
             runtime_status=desktop_runtime,
             read_ready=desktop_read_ready,
             write_ready=desktop_ready,
             local_fallback=True,
+            **_host_bridge_connector_proof(
+                local_ready=desktop_ready,
+                runtime_status=desktop_runtime,
+                parity_report=parity_report,
+            ),
         ),
         Connector(
             id="mcp",
@@ -3544,8 +4097,16 @@ def _execute_tool_sync(run: dict[str, Any]) -> dict[str, Any]:
         return _run_process(command, cwd=cwd, timeout=max(5.0, min(float(args.get("timeoutSeconds", 20)), 120.0)))
     if tool == "browser.open":
         return execute_browser_open(args, _run_process)
+    if tool == "browser.snapshot":
+        return execute_browser_snapshot(args, _run_process)
+    if tool == "browser.act":
+        return execute_browser_act(args, _run_process)
     if tool == "desktop.apps":
         return execute_list_apps(args, _run_process)
+    if tool == "desktop.snapshot":
+        return execute_desktop_snapshot(args, _run_process)
+    if tool == "desktop.act":
+        return execute_desktop_act(args, _run_process)
     if tool == "desktop.open_app":
         return execute_open_app(args, _run_process)
     if tool == "desktop.activate_app":
@@ -3765,6 +4326,14 @@ async def _execute_repo_tool(repo: Repo, run: dict[str, Any]) -> dict[str, Any] 
         )
     if tool == "browser.profiles":
         return list_browser_profiles()
+    if tool == "browser.snapshot":
+        return await asyncio.to_thread(execute_browser_snapshot, args, _run_process)
+    if tool == "browser.act":
+        return await asyncio.to_thread(execute_browser_act, args, _run_process)
+    if tool == "desktop.snapshot":
+        return await asyncio.to_thread(execute_desktop_snapshot, args, _run_process)
+    if tool == "desktop.act":
+        return await asyncio.to_thread(execute_desktop_act, args, _run_process)
     if tool in {"browser.screenshot", "desktop.screenshot"}:
         path = _tool_target_path(run["departmentId"], args.get("path"), default=f"screenshots/{uid('shot')}.png")
         result = await asyncio.to_thread(execute_screenshot_capture, path, _run_process)
@@ -7776,6 +8345,11 @@ async def list_connectors() -> list[dict[str, Any]]:
     return _connector_catalog()
 
 
+@app.get("/api/host-bridge/parity", response_model=HostBridgeParityStatusResponse)
+async def get_host_bridge_parity() -> dict[str, Any]:
+    return _host_bridge_parity_status_payload()
+
+
 @app.get("/api/tools/runs/{run_id}", response_model=ToolRun)
 async def get_tool_run(run_id: str) -> dict[str, Any]:
     async with session_scope() as s:
@@ -8724,6 +9298,28 @@ async def stop_generation(
             hub.mark_dirty()
 
     return {"stopped": stopped, "messageId": stopped_msg_id, "queuedCancelled": queued_cancelled}
+
+
+@app.post("/api/telegram/webhook")
+async def telegram_webhook(request: Request) -> dict[str, Any]:
+    settings = get_settings()
+    secret = telegram_webhook_secret(settings)
+    if secret:
+        supplied = str(request.headers.get("X-Telegram-Bot-Api-Secret-Token") or "").strip()
+        if not hmac.compare_digest(supplied, secret):
+            raise HTTPException(status_code=401, detail="invalid Telegram webhook secret")
+    try:
+        update = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid Telegram update JSON") from exc
+    if not isinstance(update, dict):
+        raise HTTPException(status_code=400, detail="Telegram update must be an object")
+    async with session_scope() as s:
+        repo = Repo(s)
+        result = await handle_telegram_update(repo, update, settings=settings, store_file=_store_file_artifact)
+    if result.get("status") in {"queued", "blocked", "sent", "retry_queued"}:
+        hub.mark_dirty()
+    return result
 
 
 @app.post("/api/messages/{thread_id}", response_model=SendMessageResponse)

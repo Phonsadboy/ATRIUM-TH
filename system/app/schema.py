@@ -106,6 +106,8 @@ BUILTIN_TOOL_NAMES = (
     "git.push",
     "browser.profiles",
     "browser.open",
+    "browser.snapshot",
+    "browser.act",
     "browser.screenshot",
     "browser.click",
     "browser.type",
@@ -114,6 +116,8 @@ BUILTIN_TOOL_NAMES = (
     "browser.scroll",
     "desktop.screenshot",
     "desktop.apps",
+    "desktop.snapshot",
+    "desktop.act",
     "desktop.open_app",
     "desktop.activate_app",
     "desktop.quit_app",
@@ -956,6 +960,8 @@ LessonSource = Literal["reject", "heavy_edit", "low_rating"]
 PreviewKind = Literal["md", "diff", "image", "screenshot", "sheet", "pdf"]
 ConnectorStatus = Literal["available", "configured", "blocked_by_runtime"]
 ConnectorKind = Literal["local_file", "git", "http", "web", "browser", "desktop", "sandbox", "mcp"]
+ConnectorProofStatus = Literal["not_required", "local_blocked", "cross_os_unverified", "cross_os_verified"]
+HostBridgeParityStatus = Literal["local_blocked", "cross_os_unverified", "cross_os_verified"]
 OrgPlanStatus = Literal["proposed", "approved", "rejected", "applied"]
 
 
@@ -1425,6 +1431,29 @@ class Connector(Schema):
     write_ready: bool = False
     local_fallback: bool = False
     external_write_requires: list[str] = Field(default_factory=list)
+    proof_status: ConnectorProofStatus = "not_required"
+    proof_summary: Optional[str] = None
+    proof_gaps: list[str] = Field(default_factory=list)
+    proof_details: dict[str, Any] = Field(default_factory=dict)
+
+
+class HostBridgeParityConnectorProof(Schema):
+    id: str
+    proof_status: ConnectorProofStatus
+    proof_summary: Optional[str] = None
+    proof_gaps: list[str] = Field(default_factory=list)
+    proof_details: dict[str, Any] = Field(default_factory=dict)
+
+
+class HostBridgeParityStatusResponse(Schema):
+    ok: bool
+    status: HostBridgeParityStatus
+    summary: str
+    gaps: list[str] = Field(default_factory=list)
+    report: dict[str, Any] = Field(default_factory=dict)
+    local: dict[str, Any] = Field(default_factory=dict)
+    connectors: list[HostBridgeParityConnectorProof] = Field(default_factory=list)
+    commands: dict[str, str] = Field(default_factory=dict)
 
 
 class CreateHandoffMessageInput(Schema):

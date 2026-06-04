@@ -31,9 +31,20 @@ const TOOL_LABEL: Partial<Record<ToolName, string>> = {
   'git.diff': 'Git diff',
   'git.commit': 'Git commit',
   'git.push': 'Git push',
+  'browser.profiles': 'โปรไฟล์เบราว์เซอร์',
   'browser.open': 'เปิดเบราว์เซอร์',
+  'browser.snapshot': 'อ่านหน้าเว็บ',
+  'browser.act': 'สั่งงานหน้าเว็บ',
+  'browser.screenshot': 'จับภาพเบราว์เซอร์',
   'browser.click': 'คลิกเบราว์เซอร์',
+  'browser.scroll': 'เลื่อนเบราว์เซอร์',
   'desktop.screenshot': 'จับภาพหน้าจอ',
+  'desktop.apps': 'รายการแอป',
+  'desktop.snapshot': 'อ่านหน้าแอป',
+  'desktop.act': 'สั่งงานแอป',
+  'desktop.open_app': 'เปิดแอป',
+  'desktop.activate_app': 'โฟกัสแอป',
+  'desktop.quit_app': 'ปิดแอป',
   'desktop.click': 'คลิกหน้าจอ',
   'http.get': 'HTTP GET',
   'http.post': 'HTTP POST',
@@ -85,9 +96,20 @@ function defaultArgsText(tool: ToolName): string {
     : tool === 'git.diff' ? { cwd: '.', staged: false }
     : tool === 'git.commit' ? { cwd: '.', message: '' }
     : tool === 'git.push' ? { cwd: '.', remote: 'origin' }
+    : tool === 'browser.profiles' ? {}
     : tool === 'browser.open' ? { url: 'http://127.0.0.1:5173' }
+    : tool === 'browser.snapshot' ? { url: 'http://127.0.0.1:5173', profile: 'atrium', maxElements: 80 }
+    : tool === 'browser.act' ? { ref: 'b1', action: 'click', profile: 'atrium' }
+    : tool === 'browser.screenshot' ? { path: 'browser.png', profile: 'atrium' }
     : tool === 'browser.click' || tool === 'desktop.click' ? { x: 0, y: 0 }
+    : tool === 'browser.scroll' ? { direction: 'down', amount: 1, unit: 'page' }
     : tool === 'desktop.screenshot' ? { path: 'screenshot.png' }
+    : tool === 'desktop.apps' ? { includeRunning: true, includeInstalled: true, limit: 80 }
+    : tool === 'desktop.snapshot' ? { maxElements: 120, maxDepth: 4 }
+    : tool === 'desktop.act' ? { ref: 'd1', action: 'click', snapshotAfter: true }
+    : tool === 'desktop.open_app' ? { appName: 'TextEdit' }
+    : tool === 'desktop.activate_app' ? { appName: 'TextEdit' }
+    : tool === 'desktop.quit_app' ? { appName: 'TextEdit', force: false }
     : tool === 'http.get' || tool === 'http_get' ? { url: 'https://example.com' }
     : tool === 'http.post' ? { url: 'https://example.com', json: {} }
     : tool === 'mcp.call' ? { server: '', tool: '', arguments: {} }

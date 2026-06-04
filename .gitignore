@@ -55,6 +55,7 @@ ops/QA_AGENT_RESULTS/
 ops/screenshots/
 ops/db-backups/
 ops/*_probe.py
+!ops/macos_host_bridge_probe.py
 !ops/windows_host_bridge_probe.py
 ops/*_audit.py
 ops/QA_*.md

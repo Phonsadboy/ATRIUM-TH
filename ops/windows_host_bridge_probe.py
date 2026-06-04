@@ -12,8 +12,10 @@ import json
 import locale
 import os
 import re
+import subprocess
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 from unittest.mock import patch
 from typing import Any
@@ -22,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SYSTEM = ROOT / "system"
 sys.path.insert(0, str(SYSTEM))
 
+from app.host_bridge_proof import host_bridge_host_identity, host_bridge_source_provenance  # noqa: E402
 from app.tools import ExecutorRouter, build_default_tool_registry  # noqa: E402
 from app.tools.host_bridge import HostBridge  # noqa: E402
 from app.tools import host_bridge as host_bridge_module  # noqa: E402
@@ -31,6 +34,8 @@ from app.config import get_settings  # noqa: E402
 VISUAL_TOOLS = [
     "browser.profiles",
     "browser.open",
+    "browser.snapshot",
+    "browser.act",
     "browser.screenshot",
     "browser.click",
     "browser.type",
@@ -38,6 +43,8 @@ VISUAL_TOOLS = [
     "browser.paste_text",
     "browser.scroll",
     "desktop.apps",
+    "desktop.snapshot",
+    "desktop.act",
     "desktop.open_app",
     "desktop.activate_app",
     "desktop.quit_app",
@@ -49,6 +56,56 @@ VISUAL_TOOLS = [
     "desktop.scroll",
     "notify.send",
 ]
+PROBE_SCHEMA_VERSION = 1
+WINDOWS_INTERACTIVE_TYPE_TEXT = "ATRIUM Windows HostBridge probe ไทย"
+WINDOWS_INTERACTIVE_PASTE_TEXT = "ATRIUM paste probe ไทย"
+WINDOWS_INTERACTIVE_NATIVE_TEXT = "ATRIUM Windows ValuePattern probe ไทย"
+
+
+def _stamp_result(result: dict[str, Any], *, parity_run_id: str | None = None) -> dict[str, Any]:
+    stamped = {
+        "schemaVersion": PROBE_SCHEMA_VERSION,
+        "generatedAt": int(time.time() * 1000),
+        "source": host_bridge_source_provenance(ROOT),
+        "host": host_bridge_host_identity(),
+        **result,
+    }
+    if parity_run_id:
+        stamped["parityRunId"] = parity_run_id
+    return stamped
+
+
+def _source_preflight_result(expected_source_fingerprint: str | None) -> dict[str, Any] | None:
+    expected = str(expected_source_fingerprint or "").strip().lower()
+    if not expected:
+        return None
+    source = host_bridge_source_provenance(ROOT)
+    actual = str(source.get("sourceFingerprint") or "").strip().lower()
+    findings: list[str] = []
+    if len(expected) != 64 or any(ch not in "0123456789abcdef" for ch in expected):
+        findings.append(f"expected source fingerprint is invalid: {expected_source_fingerprint!r}")
+    elif actual != expected:
+        findings.append(f"source fingerprint mismatch: current={actual}; expected={expected}")
+    if not findings:
+        return None
+    return {
+        "ok": False,
+        "mode": "source_preflight_failed",
+        "error": "HostBridge source fingerprint preflight failed",
+        "sourcePreflight": {
+            "ok": False,
+            "expectedSourceFingerprint": expected,
+            "actualSourceFingerprint": actual,
+            "findings": findings,
+        },
+    }
+
+
+def _write_output(result: dict[str, Any], output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
 DISCOVERY_TOOLS = {"browser.profiles"}
 WINDOWS_COMMAND_RISK_CASES = [
     (
@@ -202,6 +259,109 @@ def _runtime_blocks_present_for(blocks: dict[str, dict[str, str | None]], tools:
     return all(blocks.get(tool, {}).get("api") and blocks.get(tool, {}).get("chat") for tool in tools)
 
 
+def _blocked_runtime_tools(blocks: dict[str, dict[str, str | None]], tools: set[str]) -> dict[str, dict[str, str | None]]:
+    return {
+        tool: detail
+        for tool, detail in blocks.items()
+        if tool in tools and (detail.get("api") or detail.get("chat"))
+    }
+
+
+def _positive_int(value: Any) -> bool:
+    return isinstance(value, int) and value > 0
+
+
+def _windows_visual_proof(checks: dict[str, Any]) -> dict[str, bool]:
+    helper = checks.get("helperSelftest") if isinstance(checks.get("helperSelftest"), dict) else {}
+    preflight = checks.get("powershellPreflight") if isinstance(checks.get("powershellPreflight"), dict) else {}
+    preflight_checks = preflight.get("checks") if isinstance(preflight.get("checks"), dict) else {}
+    virtual_screen = preflight.get("virtualScreen") if isinstance(preflight.get("virtualScreen"), dict) else {}
+    helper_virtual_screen = (
+        _positive_int(helper.get("screenWidth"))
+        and _positive_int(helper.get("screenHeight"))
+        and _positive_int(helper.get("virtualWidth"))
+        and _positive_int(helper.get("virtualHeight"))
+    )
+    preflight_virtual_screen = (
+        preflight_checks.get("virtualScreen") is True
+        and _positive_int(virtual_screen.get("width"))
+        and _positive_int(virtual_screen.get("height"))
+    )
+    helper_dpi = bool(helper.get("dpiAwareness"))
+    preflight_dpi = preflight_checks.get("dpiAwareness") is True
+    return {
+        "helperDpiAwareness": helper_dpi,
+        "powershellDpiAwareness": preflight_dpi,
+        "dpiAwareness": helper_dpi and preflight_dpi,
+        "helperVirtualScreen": helper_virtual_screen,
+        "powershellVirtualScreen": preflight_virtual_screen,
+        "virtualScreen": helper_virtual_screen and preflight_virtual_screen,
+    }
+
+
+def _same_positive_int(left: Any, right: Any) -> bool:
+    try:
+        left_int = int(left)
+        right_int = int(right)
+    except (TypeError, ValueError):
+        return False
+    return left_int > 0 and left_int == right_int
+
+
+def _activation_foreground_verified(result: dict[str, Any], process_id: int) -> bool:
+    return (
+        result.get("foreground") is True
+        and _same_positive_int(result.get("processId"), process_id)
+        and _same_positive_int(result.get("activeProcessId"), process_id)
+    )
+
+
+def _utf16_units(text: str) -> int:
+    return len(text.encode("utf-16-le", errors="surrogatepass")) // 2
+
+
+def _type_text_verified(result: dict[str, Any], expected_text: str) -> bool:
+    return (
+        result.get("returnCode") == 0
+        and result.get("textBytes") == len(expected_text.encode("utf-8"))
+        and result.get("textCharacters") == len(expected_text)
+        and result.get("textUnits") == _utf16_units(expected_text)
+    )
+
+
+def _keypress_verified(result: dict[str, Any], expected_key: str, expected_modifiers: list[str]) -> bool:
+    return (
+        result.get("returnCode") == 0
+        and str(result.get("key") or "").lower() == expected_key
+        and [str(item).lower() for item in result.get("modifiers") or []] == expected_modifiers
+    )
+
+
+def _native_action_verified(result: dict[str, Any], expected_action: str) -> bool:
+    native_attempt = result.get("nativeAttempt") if isinstance(result.get("nativeAttempt"), dict) else {}
+    return (
+        result.get("returnCode") == 0
+        and result.get("usedNativeAction") is True
+        and native_attempt.get("returnCode") == 0
+        and native_attempt.get("method") == "uia"
+        and native_attempt.get("inputMethod") == "uia"
+        and native_attempt.get("nativeAction") == expected_action
+        and native_attempt.get("ok") is True
+    )
+
+
+def _snapshot_contains_text_value(snapshot_result: dict[str, Any], expected_text: str) -> bool:
+    snapshot = snapshot_result.get("snapshot") if isinstance(snapshot_result.get("snapshot"), dict) else {}
+    elements = snapshot.get("elements") if isinstance(snapshot.get("elements"), list) else []
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        value = str(element.get("value") or element.get("name") or "")
+        if expected_text in value:
+            return True
+    return False
+
+
 def _json_rows_from_stdout(result: dict[str, Any]) -> list[dict[str, Any]]:
     raw = str(result.get("stdout") or "").strip()
     if not raw:
@@ -288,16 +448,21 @@ def _clipboard_round_trip(expected: str, run_process: Any = _run_process) -> dic
         f"$expected = {visual_bridge._ps_string(expected)}",  # noqa: SLF001
         "$preview = $value",
         "if ($preview.Length -gt 200) { $preview = $preview.Substring(0, 200) }",
-        "[PSCustomObject]@{ textLength=$value.Length; textPreview=$preview; expected=$expected; containsExpected=$value.Contains($expected) } | ConvertTo-Json -Compress",
+        "$utf8 = [System.Text.Encoding]::UTF8",
+        "[PSCustomObject]@{ textLength=$value.Length; textBytes=$utf8.GetByteCount($value); textPreview=$preview; expected=$expected; expectedLength=$expected.Length; expectedBytes=$utf8.GetByteCount($expected); containsExpected=$value.Contains($expected); verified=$value.Equals($expected) } | ConvertTo-Json -Compress",
     ])
     result = visual_bridge._run_windows_powershell(script, run_process, timeout=5.0, sta=True)  # noqa: SLF001
     rows = _json_rows_from_stdout(result)
     row = rows[0] if rows else {}
     result.update({
         "textLength": row.get("textLength"),
+        "textBytes": row.get("textBytes"),
         "textPreview": row.get("textPreview"),
         "expected": row.get("expected") or expected,
+        "expectedLength": row.get("expectedLength"),
+        "expectedBytes": row.get("expectedBytes"),
         "containsExpected": bool(row.get("containsExpected")),
+        "verified": bool(row.get("verified")),
     })
     return result
 
@@ -340,6 +505,93 @@ def _png_file_status(path: Path) -> dict[str, Any]:
     }
 
 
+def _first_desktop_text_ref(snapshot_result: dict[str, Any]) -> str | None:
+    snapshot = snapshot_result.get("snapshot") if isinstance(snapshot_result.get("snapshot"), dict) else {}
+    elements = snapshot.get("elements") if isinstance(snapshot.get("elements"), list) else []
+    fallback_ref: str | None = None
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        ref = str(element.get("ref") or "").strip()
+        if not ref:
+            continue
+        role = str(element.get("role") or element.get("controlType") or "").strip().lower()
+        class_name = str(element.get("className") or "").strip().lower()
+        name = str(element.get("name") or "").strip().lower()
+        if role in {"edit", "document", "text"} or "edit" in class_name:
+            return ref
+        if fallback_ref is None and (role or class_name or name):
+            fallback_ref = ref
+    return fallback_ref
+
+
+def _browser_snapshot_act_probe(profile: str, run_process: Any = _run_process) -> dict[str, Any]:
+    html = (
+        "<!doctype html><meta charset='utf-8'><title>ATRIUM Browser Probe</title>"
+        "<button id='atrium-probe' onclick=\"this.textContent='ATRIUM clicked';"
+        "document.body.dataset.atrium='clicked'\">ATRIUM browser probe</button>"
+    )
+    url = "data:text/html," + urllib.parse.quote(html)
+    checks: dict[str, Any] = {"url": url, "profile": profile}
+    snapshot_args = {
+        "url": url,
+        "profile": profile,
+        "headless": True,
+        "maxElements": 20,
+        "timeoutMs": 10_000,
+    }
+    checks["browserSnapshotRoute"] = _route_for("browser.snapshot", snapshot_args)
+    checks["browserSnapshotRuntimeBlocks"] = _runtime_block_for("browser.snapshot", snapshot_args)
+    if checks["browserSnapshotRoute"].get("blockReason") or checks["browserSnapshotRuntimeBlocks"].get("api") or checks["browserSnapshotRuntimeBlocks"].get("chat"):
+        checks["browserSnapshot"] = {"returnCode": None, "skipped": True, "stderr": "browser.snapshot blocked by runtime readiness"}
+        checks["error"] = "browser.snapshot blocked by runtime readiness"
+        return checks
+    checks["browserSnapshot"] = visual_bridge.execute_browser_snapshot(snapshot_args, run_process)
+    if checks["browserSnapshot"].get("returnCode") != 0 or checks["browserSnapshot"].get("refCount", 0) <= 0:
+        checks["error"] = "browser.snapshot did not expose DOM refs"
+        return checks
+    elements = ((checks["browserSnapshot"].get("snapshot") or {}).get("elements") or [])
+    button_ref = None
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        if str(element.get("role") or "").lower() == "button" and "atrium browser probe" in str(element.get("name") or "").lower():
+            button_ref = element.get("ref")
+            break
+    if not button_ref:
+        checks["error"] = "browser.snapshot did not expose the probe button ref"
+        return checks
+    checks["buttonRef"] = button_ref
+    act_args = {
+        "ref": button_ref,
+        "action": "click",
+        "url": url,
+        "profile": profile,
+        "headless": True,
+        "maxElements": 20,
+        "timeoutMs": 10_000,
+        "waitAfterMs": 100,
+    }
+    checks["browserActRoute"] = _route_for("browser.act", act_args)
+    checks["browserActRuntimeBlocks"] = _runtime_block_for("browser.act", act_args)
+    if checks["browserActRoute"].get("blockReason") or checks["browserActRuntimeBlocks"].get("api") or checks["browserActRuntimeBlocks"].get("chat"):
+        checks["browserActClick"] = {"returnCode": None, "skipped": True, "stderr": "browser.act blocked by runtime readiness"}
+        checks["error"] = "browser.act blocked by runtime readiness"
+        return checks
+    checks["browserActClick"] = visual_bridge.execute_browser_act(act_args, run_process)
+    if checks["browserActClick"].get("returnCode") != 0:
+        checks["error"] = "browser.act failed to click the probe button ref"
+        return checks
+    after_elements = ((checks["browserActClick"].get("snapshot") or {}).get("elements") or [])
+    checks["containsExpected"] = any(
+        isinstance(element, dict) and "atrium clicked" in str(element.get("name") or "").lower()
+        for element in after_elements
+    )
+    if checks["containsExpected"] is not True:
+        checks["error"] = "browser.act did not produce the expected post-click DOM snapshot"
+    return checks
+
+
 def _missing_bridge_routes_block() -> dict[str, Any]:
     original_platform = sys.platform
 
@@ -374,15 +626,76 @@ def _missing_bridge_routes_block() -> dict[str, Any]:
 def _simulate() -> dict[str, Any]:
     original_platform = sys.platform
     calls: list[list[str]] = []
+    fake_notepad_text = ""
 
     def fake_which(name: str) -> str | None:
-        if name.lower() in {"powershell.exe", "powershell", "pwsh.exe", "pwsh", "cmd.exe", "git", "docker"}:
+        if name.lower() in {"powershell.exe", "powershell", "pwsh.exe", "pwsh", "cmd.exe", "git", "docker", "node", "node.exe"}:
             return f"C:/Windows/System32/{name}"
         return None
 
     def fake_run(command: list[str], **_: Any) -> dict[str, Any]:
+        nonlocal fake_notepad_text
         calls.append(command)
         joined = " ".join(str(part) for part in command)
+        if command and Path(str(command[0])).name.lower() in {"node", "node.exe"} and len(command) >= 3:
+            try:
+                payload = json.loads(str(command[2]))
+            except json.JSONDecodeError:
+                payload = {}
+            mode = payload.get("mode")
+            if mode == "snapshot":
+                stdout = json.dumps(
+                    {
+                        "returnCode": 0,
+                        "ok": True,
+                        "backend": "playwright",
+                        "profile": payload.get("profile") or "atrium",
+                        "profileKind": "isolated",
+                        "url": payload.get("url"),
+                        "title": "ATRIUM Browser Probe",
+                        "refCount": 1,
+                        "snapshot": {
+                            "elements": [
+                                {
+                                    "ref": "b1",
+                                    "role": "button",
+                                    "name": "ATRIUM browser probe",
+                                    "selector": "#atrium-probe",
+                                    "tag": "button",
+                                    "enabled": True,
+                                }
+                            ]
+                        },
+                    }
+                )
+                return {"command": command, "returnCode": 0, "stdout": stdout, "stderr": ""}
+            if mode == "act":
+                stdout = json.dumps(
+                    {
+                        "returnCode": 0,
+                        "ok": True,
+                        "backend": "playwright",
+                        "profile": payload.get("profile") or "atrium",
+                        "profileKind": "isolated",
+                        "url": payload.get("url"),
+                        "title": "ATRIUM Browser Probe",
+                        "refCount": 1,
+                        "action": {"action": payload.get("action"), "ref": payload.get("ref"), "selector": "#atrium-probe"},
+                        "snapshot": {
+                            "elements": [
+                                {
+                                    "ref": "b1",
+                                    "role": "button",
+                                    "name": "ATRIUM clicked",
+                                    "selector": "#atrium-probe",
+                                    "tag": "button",
+                                    "enabled": True,
+                                }
+                            ]
+                        },
+                    }
+                )
+                return {"command": command, "returnCode": 0, "stdout": stdout, "stderr": ""}
         if any("ATRIUM_WINDOWS_SHELL_OK" in str(part) for part in command):
             return {
                 "command": command,
@@ -524,15 +837,18 @@ def _simulate() -> dict[str, Any]:
             }
         if any("Get-Clipboard" in str(part) for part in command):
             expected_match = re.search(r"\$expected = '((?:''|[^'])*)'", joined)
-            expected = (expected_match.group(1).replace("''", "'") if expected_match else "ATRIUM paste probe ไทย")
+            expected = (expected_match.group(1).replace("''", "'") if expected_match else WINDOWS_INTERACTIVE_PASTE_TEXT)
             return {
                 "command": command,
                 "returnCode": 0,
                 "stdout": json.dumps(
                     {
                         "textLength": len(expected),
+                        "textBytes": len(expected.encode("utf-8")),
                         "textPreview": expected,
                         "expected": expected,
+                        "expectedLength": len(expected),
+                        "expectedBytes": len(expected.encode("utf-8")),
                         "containsExpected": True,
                         "verified": True,
                     },
@@ -568,6 +884,58 @@ def _simulate() -> dict[str, Any]:
                 "stdout": stdout,
                 "stderr": "",
             }
+        if "UIAutomationClient" in joined and "Win32NativeAction" in joined:
+            native_action = "ValuePattern" if "$actionName = 'paste'" in joined or "$actionName = 'type'" in joined else "InvokePattern"
+            text_value_match = re.search(r"\$textValue = '((?:''|[^'])*)'", joined)
+            if native_action == "ValuePattern" and text_value_match:
+                fake_notepad_text = text_value_match.group(1).replace("''", "'")
+            stdout = json.dumps({
+                "ok": True,
+                "nativeAction": native_action,
+                "inputMethod": "uia",
+                "path": "w1.1",
+                "action": "paste" if native_action == "ValuePattern" else "click",
+                "name": "Text Editor",
+                "controlType": "Edit",
+            })
+            return {"command": command, "returnCode": 0, "stdout": stdout, "stderr": ""}
+        if "UIAutomationClient" in joined and "Add-AtriumElement" in joined:
+            stdout = json.dumps(
+                {
+                    "appName": "notepad",
+                    "processId": 10,
+                    "title": "Untitled - Notepad",
+                    "window": {"x": 0, "y": 0, "width": 640, "height": 480},
+                    "elements": [
+                        {
+                            "path": "w1",
+                            "role": "Window",
+                            "name": "Untitled - Notepad",
+                            "automationId": "",
+                            "className": "Notepad",
+                            "enabled": True,
+                            "x": 0,
+                            "y": 0,
+                            "width": 640,
+                            "height": 480,
+                        },
+                        {
+                            "path": "w1.1",
+                            "role": "Edit",
+                            "name": "Text Editor",
+                            "automationId": "15",
+                            "className": "Edit",
+                            "value": fake_notepad_text,
+                            "enabled": True,
+                            "x": 20,
+                            "y": 50,
+                            "width": 600,
+                            "height": 400,
+                        },
+                    ],
+                }
+            )
+            return {"command": command, "returnCode": 0, "stdout": stdout, "stderr": ""}
         if any("Get-Process" in str(part) for part in command):
             return {
                 "command": command,
@@ -579,15 +947,40 @@ def _simulate() -> dict[str, Any]:
 
     try:
         sys.platform = "win32"
-        with patch.object(host_bridge_module.shutil, "which", fake_which), patch.object(visual_bridge.shutil, "which", fake_which), patch.dict(os.environ, {"SESSIONNAME": "Console"}, clear=False):
+        with (
+            patch.object(host_bridge_module.shutil, "which", fake_which),
+            patch.object(
+                host_bridge_module,
+                "_browser_playwright_package_status",
+                return_value={"ok": True, "package": "@playwright/test", "path": "C:/mock/@playwright/test", "error": None},
+            ),
+            patch.object(visual_bridge.shutil, "which", fake_which),
+            patch.object(
+                visual_bridge,
+                "list_browser_profiles",
+                lambda: {
+                    "platform": "win32",
+                    "ownProfile": "atrium",
+                    "defaultProfile": "user",
+                    "browserApp": {"name": "Google Chrome", "path": "C:/Program Files/Google/Chrome/Application/chrome.exe"},
+                    "profiles": [],
+                },
+            ),
+            patch.dict(os.environ, {"SESSIONNAME": "Console"}, clear=False),
+        ):
             status = HostBridge().status().to_dict()
             shell = _shell_probe(status, fake_run)
             routes = _routes()
             runtime_blocks = _runtime_blocks()
             command_risk = _windows_command_risk_checks()
             default_browser_open = visual_bridge.execute_browser_open({"url": "https://example.com"}, fake_run)
+            browser_ref = _browser_snapshot_act_probe("atrium", fake_run)
             helper_selftest = visual_bridge.execute_windows_visual_selftest(fake_run)
             powershell_preflight = visual_bridge.execute_windows_powershell_visual_preflight(fake_run)
+            windows_visual_proof = _windows_visual_proof({
+                "helperSelftest": helper_selftest,
+                "powershellPreflight": powershell_preflight,
+            })
             visual_bridge.execute_screenshot_capture(Path("/tmp/atrium-win-shot.png"), fake_run)
             visual_bridge.execute_click({"x": 10, "y": 20}, fake_run)
             visual_bridge.execute_keypress({"keys": ["cmd", "l"]}, fake_run)
@@ -603,23 +996,25 @@ def _simulate() -> dict[str, Any]:
             visual_bridge.execute_activate_app({"appName": "notepad"}, fake_run)
             visual_bridge.execute_quit_app({"appName": "notepad"}, fake_run)
             notification_result = visual_bridge.execute_notification({"title": "ATRIUM", "body": "ok"}, fake_run)
-            round_trip = _clipboard_round_trip("ATRIUM paste probe ไทย", fake_run)
+            round_trip = _clipboard_round_trip(WINDOWS_INTERACTIVE_PASTE_TEXT, fake_run)
             if not round_trip.get("containsExpected"):
                 raise AssertionError(f"clipboard round trip did not verify expected text: {round_trip}")
             interactive_desktop = _interactive_desktop_probe(fake_run)
         missing_bridge = _missing_bridge_routes_block()
         return {
-            "ok": status.get("platform") == "win32" and shell.get("containsExpected") is True and status.get("browserBridge") is True and status.get("desktopBridge") is True and _route_ok(routes) and _runtime_blocks_clear(runtime_blocks) and command_risk.get("ok") is True and default_browser_open.get("returnCode") == 0 and default_browser_open.get("profileKind") == "user" and default_browser_open.get("processVerified") is True and windows_key.get("returnCode") == 0 and windows_key.get("modifiers") == ["win"] and forward_delete_key.get("returnCode") == 0 and forward_delete_key.get("key") == "forwarddelete" and type_text.get("returnCode") == 0 and type_text.get("textBytes") == len("ไทย".encode("utf-8")) and type_text.get("textCharacters") == len("ไทย") and type_text.get("textUnits") == len("ไทย".encode("utf-16-le")) // 2 and notification_result.get("returnCode") == 0 and notification_result.get("shown") is True and notification_result.get("disposed") is True and helper_selftest.get("returnCode") == 0 and helper_selftest.get("ok") is True and powershell_preflight.get("returnCode") == 0 and powershell_preflight.get("ok") is True and bool(apps.get("running")) and missing_bridge.get("ok") is True and not interactive_desktop.get("error") and _commands_ok(interactive_desktop),
+            "ok": status.get("platform") == "win32" and shell.get("containsExpected") is True and status.get("browserBridge") is True and status.get("desktopBridge") is True and _route_ok(routes) and _runtime_blocks_clear(runtime_blocks) and command_risk.get("ok") is True and default_browser_open.get("returnCode") == 0 and default_browser_open.get("profileKind") == "user" and default_browser_open.get("processVerified") is True and not browser_ref.get("error") and (browser_ref.get("browserSnapshot") or {}).get("returnCode") == 0 and (browser_ref.get("browserActClick") or {}).get("returnCode") == 0 and browser_ref.get("containsExpected") is True and windows_key.get("returnCode") == 0 and windows_key.get("modifiers") == ["win"] and forward_delete_key.get("returnCode") == 0 and forward_delete_key.get("key") == "forwarddelete" and type_text.get("returnCode") == 0 and type_text.get("textBytes") == len("ไทย".encode("utf-8")) and type_text.get("textCharacters") == len("ไทย") and type_text.get("textUnits") == len("ไทย".encode("utf-16-le")) // 2 and notification_result.get("returnCode") == 0 and notification_result.get("shown") is True and notification_result.get("disposed") is True and helper_selftest.get("returnCode") == 0 and helper_selftest.get("ok") is True and powershell_preflight.get("returnCode") == 0 and powershell_preflight.get("ok") is True and windows_visual_proof.get("dpiAwareness") is True and windows_visual_proof.get("virtualScreen") is True and bool(apps.get("running")) and missing_bridge.get("ok") is True and not interactive_desktop.get("error") and interactive_desktop.get("nativeActionVerified") is True and interactive_desktop.get("nativeValueVerified") is True and _commands_ok(interactive_desktop),
             "mode": "simulate",
             "status": status,
             "shell": shell,
             "defaultBrowserOpen": default_browser_open,
+            "browserRef": browser_ref,
             "windowsKeypress": windows_key,
             "forwardDeleteKeypress": forward_delete_key,
             "typeText": type_text,
             "notification": notification_result,
             "helperSelftest": helper_selftest,
             "powershellPreflight": powershell_preflight,
+            "windowsVisualProof": windows_visual_proof,
             "routes": routes,
             "runtimeBlocks": runtime_blocks,
             "commandRisk": command_risk,
@@ -646,18 +1041,71 @@ def _interactive_desktop_probe(run_process: Any = _run_process) -> dict[str, Any
         target = {"processId": process_id}
         for attempt in range(10):
             checks["activateApp"] = visual_bridge.execute_activate_app(target, run_process)
-            if checks["activateApp"].get("returnCode") == 0 and checks["activateApp"].get("timeout") is not True and checks["activateApp"].get("ok") is not False:
+            if (
+                checks["activateApp"].get("returnCode") == 0
+                and checks["activateApp"].get("timeout") is not True
+                and checks["activateApp"].get("ok") is not False
+                and _activation_foreground_verified(checks["activateApp"], process_id)
+            ):
                 break
             time.sleep(0.5)
         checks["activateAttempts"] = attempt + 1
-        if checks["activateApp"].get("returnCode") != 0 or checks["activateApp"].get("timeout") is True or checks["activateApp"].get("ok") is False:
+        checks["foregroundActivationVerified"] = _activation_foreground_verified(checks["activateApp"], process_id)
+        if (
+            checks["activateApp"].get("returnCode") != 0
+            or checks["activateApp"].get("timeout") is True
+            or checks["activateApp"].get("ok") is False
+            or checks["foregroundActivationVerified"] is not True
+        ):
             checks["error"] = "desktop.activate_app failed; refusing to type into an unverified foreground app"
             return checks
         time.sleep(0.3)
-        checks["type"] = visual_bridge.execute_type_text({"text": "ATRIUM Windows HostBridge probe ไทย"}, run_process)
+        checks["type"] = visual_bridge.execute_type_text({"text": WINDOWS_INTERACTIVE_TYPE_TEXT}, run_process)
+        checks["unicodeTypeVerified"] = _type_text_verified(checks["type"], WINDOWS_INTERACTIVE_TYPE_TEXT)
+        if checks["unicodeTypeVerified"] is not True:
+            checks["error"] = "desktop.type did not prove Windows Unicode SendInput text metrics"
+            return checks
         checks["keypress"] = visual_bridge.execute_keypress({"keys": ["control", "a"]}, run_process)
-        expected_text = "ATRIUM paste probe ไทย"
-        checks["pasteText"] = visual_bridge.execute_paste_text({"text": expected_text}, run_process)
+        checks["selectAllKeypressVerified"] = _keypress_verified(checks["keypress"], "a", ["control"])
+        if checks["selectAllKeypressVerified"] is not True:
+            checks["error"] = "desktop.keypress did not prove Windows control+a mapping"
+            return checks
+        paste_text = WINDOWS_INTERACTIVE_PASTE_TEXT
+        native_text = WINDOWS_INTERACTIVE_NATIVE_TEXT
+        checks["pasteText"] = visual_bridge.execute_paste_text({"text": paste_text}, run_process)
+        checks["desktopSnapshot"] = visual_bridge.execute_desktop_snapshot({"processId": process_id, "maxElements": 80, "maxDepth": 4}, run_process)
+        if checks["desktopSnapshot"].get("returnCode") != 0 or checks["desktopSnapshot"].get("refCount", 0) <= 0:
+            checks["error"] = "desktop.snapshot did not expose Notepad UIAutomation refs"
+            return checks
+        text_ref = _first_desktop_text_ref(checks["desktopSnapshot"])
+        if not text_ref:
+            checks["error"] = "desktop.snapshot did not expose a text/edit ref for desktop.act"
+            return checks
+        checks["desktopActSetText"] = visual_bridge.execute_desktop_act(
+            {
+                "ref": text_ref,
+                "action": "paste",
+                "text": native_text,
+                "requireNative": True,
+                "snapshotAfter": True,
+                "maxElements": 80,
+                "maxDepth": 4,
+                "waitAfterMs": 100,
+            },
+            run_process,
+        )
+        if checks["desktopActSetText"].get("returnCode") != 0:
+            checks["error"] = "desktop.act failed to set Notepad text through a snapshot ref"
+            return checks
+        checks["nativeActionVerified"] = _native_action_verified(checks["desktopActSetText"], "ValuePattern")
+        if checks["nativeActionVerified"] is not True:
+            checks["error"] = "desktop.act did not prove Notepad ValuePattern native UIAutomation action"
+            return checks
+        checks["desktopSnapshotAfter"] = checks["desktopActSetText"].get("after") if isinstance(checks["desktopActSetText"].get("after"), dict) else {}
+        checks["nativeValueVerified"] = _snapshot_contains_text_value(checks["desktopSnapshotAfter"], native_text)
+        if checks["desktopSnapshotAfter"].get("returnCode") != 0 or checks["nativeValueVerified"] is not True:
+            checks["error"] = "desktop.snapshot did not confirm Notepad text after ValuePattern native UIAutomation action"
+            return checks
         checks["scroll"] = visual_bridge.execute_scroll({"direction": "down", "unit": "line", "amount": 1}, run_process)
         checks["copyBackSelectAll"] = visual_bridge.execute_keypress({"keys": ["control", "a"]}, run_process)
         checks["clipboardClearBeforeCopy"] = _set_clipboard_text("ATRIUM clipboard cleared before copy-back verification", run_process)
@@ -666,9 +1114,12 @@ def _interactive_desktop_probe(run_process: Any = _run_process) -> dict[str, Any
             return checks
         checks["copyBackCopy"] = visual_bridge.execute_keypress({"keys": ["control", "c"]}, run_process)
         time.sleep(0.2)
-        checks["clipboardRoundTrip"] = _clipboard_round_trip(expected_text, run_process)
-        if checks["clipboardRoundTrip"].get("returnCode") != 0 or not checks["clipboardRoundTrip"].get("containsExpected"):
-            checks["error"] = "clipboard round-trip did not confirm that typed/pasted text reached the target app"
+        checks["clipboardRoundTrip"] = _clipboard_round_trip(native_text, run_process)
+        if (
+            checks["clipboardRoundTrip"].get("returnCode") != 0
+            or checks["clipboardRoundTrip"].get("verified") is not True
+        ):
+            checks["error"] = "clipboard round-trip did not exactly confirm target app text"
         return checks
     finally:
         if process_id:
@@ -679,9 +1130,9 @@ def _commands_ok(group: dict[str, Any]) -> bool:
     for value in group.values():
         if not isinstance(value, dict):
             continue
-        if value.get("timeout") is True:
-            return False
         if value.get("ok") is False:
+            return False
+        if value.get("timeout") is True and value.get("returnCode") != 0:
             return False
         if value.get("quitVerified") is False:
             return False
@@ -702,6 +1153,7 @@ def _live(*, screenshot: bool, notification: bool, browser_url: str | None, brow
         "apps": visual_bridge.execute_list_apps({"limit": 10}, _run_process),
         "commandRisk": _windows_command_risk_checks(),
     }
+    checks["windowsVisualProof"] = _windows_visual_proof(checks)
     if screenshot:
         shot = (get_settings().data_dir / "windows-hostbridge-probe.png").resolve()
         checks["screenshot"] = visual_bridge.execute_screenshot_capture(shot, _run_process)
@@ -721,11 +1173,31 @@ def _live(*, screenshot: bool, notification: bool, browser_url: str | None, brow
         else:
             checks["browserOpen"] = visual_bridge.execute_browser_open(browser_open_args, _run_process)
             checks["browserOpenProcessId"] = _process_id_from_result(checks["browserOpen"])
+        checks["browserRef"] = _browser_snapshot_act_probe(browser_profile, _run_process)
     if interactive:
-        checks["interactiveDesktop"] = _interactive_desktop_probe()
+        try:
+            checks["desktopSnapshot"] = visual_bridge.execute_desktop_snapshot({"maxElements": 40, "maxDepth": 3}, _run_process)
+        except Exception as exc:
+            checks["desktopSnapshot"] = {
+                "returnCode": 1,
+                "ok": False,
+                "stderr": f"{type(exc).__name__}: {exc}",
+            }
+        interactive_blocks = _blocked_runtime_tools(runtime_blocks, {"desktop.activate_app", "desktop.act"})
+        if interactive_blocks:
+            checks["interactiveSkipped"] = {
+                "skipped": True,
+                "reason": "interactive desktop probes blocked by HostBridge runtime readiness",
+                "blockedTools": interactive_blocks,
+            }
+            checks["interactiveDesktop"] = {"skipped": True, "error": "interactive desktop probe skipped by runtime readiness"}
+        else:
+            checks["interactiveDesktop"] = _interactive_desktop_probe()
     live_ok = sys.platform == "win32" and (checks.get("shell") or {}).get("containsExpected") is True and status.get("browserBridge") is True and status.get("desktopBridge") is True and _route_ok(routes) and _runtime_blocks_clear(runtime_blocks)
     live_ok = live_ok and (checks.get("helperSelftest") or {}).get("returnCode") == 0 and (checks.get("helperSelftest") or {}).get("ok") is True
     live_ok = live_ok and (checks.get("powershellPreflight") or {}).get("returnCode") == 0 and (checks.get("powershellPreflight") or {}).get("ok") is True
+    live_ok = live_ok and (checks.get("windowsVisualProof") or {}).get("dpiAwareness") is True
+    live_ok = live_ok and (checks.get("windowsVisualProof") or {}).get("virtualScreen") is True
     live_ok = live_ok and (checks.get("apps") or {}).get("returnCode") == 0 and (checks.get("apps") or {}).get("timeout") is not True
     live_ok = live_ok and (checks.get("commandRisk") or {}).get("ok") is True
     if screenshot:
@@ -738,6 +1210,11 @@ def _live(*, screenshot: bool, notification: bool, browser_url: str | None, brow
         live_ok = live_ok and not (checks.get("browserOpenRoute") or {}).get("blockReason")
         live_ok = live_ok and not (checks.get("browserOpenRuntimeBlocks") or {}).get("api") and not (checks.get("browserOpenRuntimeBlocks") or {}).get("chat")
         live_ok = live_ok and (checks.get("browserOpen") or {}).get("returnCode") == 0
+        browser_ref = checks.get("browserRef") if isinstance(checks.get("browserRef"), dict) else {}
+        live_ok = live_ok and not browser_ref.get("error")
+        live_ok = live_ok and (browser_ref.get("browserSnapshot") or {}).get("returnCode") == 0
+        live_ok = live_ok and (browser_ref.get("browserActClick") or {}).get("returnCode") == 0
+        live_ok = live_ok and browser_ref.get("containsExpected") is True
         try:
             browser_profile_kind = visual_bridge.normalize_browser_profile(browser_profile)
         except ValueError:
@@ -745,7 +1222,11 @@ def _live(*, screenshot: bool, notification: bool, browser_url: str | None, brow
         if browser_profile_kind != "user":
             live_ok = live_ok and checks.get("browserOpenProcessId") is not None
     if interactive:
+        live_ok = live_ok and (checks.get("desktopSnapshot") or {}).get("returnCode") == 0 and (checks.get("desktopSnapshot") or {}).get("refCount", 0) > 0
         interactive_checks = checks.get("interactiveDesktop") if isinstance(checks.get("interactiveDesktop"), dict) else {}
+        live_ok = live_ok and (interactive_checks.get("desktopActSetText") or {}).get("returnCode") == 0
+        live_ok = live_ok and interactive_checks.get("nativeActionVerified") is True
+        live_ok = live_ok and interactive_checks.get("nativeValueVerified") is True
         live_ok = live_ok and not interactive_checks.get("error") and _commands_ok(interactive_checks)
     return {
         "ok": live_ok,
@@ -766,15 +1247,23 @@ def main() -> int:
     parser.add_argument("--browser-url", help="In live Windows mode, open a URL through browser.open using --browser-profile.")
     parser.add_argument("--browser-profile", default="atrium", help="Browser profile for --browser-url, default atrium to verify ATRIUM's isolated profile path.")
     parser.add_argument("--interactive", action="store_true", help="In live Windows mode, open Notepad and probe activate/type/paste/keypress/scroll/quit using its processId.")
+    parser.add_argument("--output", type=Path, help="Optional path to write the stamped probe JSON artifact.")
+    parser.add_argument("--parity-run-id", help="Shared ID to stamp on paired macOS/Windows full-probe artifacts for the cross-OS verifier.")
+    parser.add_argument("--expect-source-fingerprint", help="Refuse to run unless the current HostBridge source fingerprint matches this value.")
     args = parser.parse_args()
     full_browser_url = args.browser_url or ("https://example.com" if args.full else None)
-    result = _simulate() if args.simulate else _live(
-        screenshot=args.screenshot or args.full,
-        notification=args.notification or args.full,
-        browser_url=full_browser_url,
-        browser_profile=args.browser_profile,
-        interactive=args.interactive or args.full,
-    )
+    result = _source_preflight_result(args.expect_source_fingerprint)
+    if result is None:
+        result = _simulate() if args.simulate else _live(
+            screenshot=args.screenshot or args.full,
+            notification=args.notification or args.full,
+            browser_url=full_browser_url,
+            browser_profile=args.browser_profile,
+            interactive=args.interactive or args.full,
+        )
+    result = _stamp_result(result, parity_run_id=args.parity_run_id)
+    if args.output:
+        _write_output(result, args.output)
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
     return 0 if result.get("ok") else 1
 

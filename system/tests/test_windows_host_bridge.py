@@ -13,11 +13,13 @@ from unittest import mock
 from app import chat_tools, mcp_local
 from app import main as main_module
 from app.db import repo as repo_module
+from app.host_bridge_proof import host_bridge_parity_proof_id
 from app.provider import chatgpt_oauth
 from app.tools import host_bridge, visual_bridge
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+WINDOWS_INTERACTIVE_NATIVE_TEXT = "ATRIUM Windows ValuePattern probe ไทย"
 
 
 def _fake_png(width: int = 100, height: int = 80) -> bytes:
@@ -56,10 +58,240 @@ def _windows_preflight_ok(_run_process: object) -> dict[str, object]:
             "getClipboardCommand": True,
             "dpiAwareness": True,
         },
+        "virtualScreen": {"left": 0, "top": 0, "width": 1920, "height": 1080},
     }
 
 
+def _windows_helper_selftest_ok(_run_process: object) -> dict[str, object]:
+    return {
+        "returnCode": 0,
+        "ok": True,
+        "dpiAwareness": "per_monitor_v2",
+        "screenWidth": 1920,
+        "screenHeight": 1080,
+        "virtualLeft": 0,
+        "virtualTop": 0,
+        "virtualWidth": 1920,
+        "virtualHeight": 1080,
+    }
+
+
+def _windows_foreground_activation_ok(process_id: int = 42) -> dict[str, object]:
+    return {
+        "returnCode": 0,
+        "processId": process_id,
+        "activeProcessId": process_id,
+        "foreground": True,
+        "stdout": "",
+        "stderr": "",
+    }
+
+
+def _utf16_units(text: str) -> int:
+    return len(text.encode("utf-16-le", errors="surrogatepass")) // 2
+
+
+def _windows_type_text_ok(text: str = "ATRIUM Windows HostBridge probe ไทย") -> dict[str, object]:
+    return {
+        "returnCode": 0,
+        "textBytes": len(text.encode("utf-8")),
+        "textCharacters": len(text),
+        "textUnits": _utf16_units(text),
+        "stdout": "",
+        "stderr": "",
+    }
+
+
+def _windows_keypress_ok(args: dict[str, object]) -> dict[str, object]:
+    keys = [str(item).lower() for item in args.get("keys") or []]
+    modifiers = [item for item in keys if item in {"control", "shift", "alt", "win"}]
+    key = next((item for item in keys if item not in modifiers), "")
+    return {
+        "returnCode": 0,
+        "key": key,
+        "modifiers": modifiers,
+        "stdout": "",
+        "stderr": "",
+    }
+
+
+def _windows_native_value_pattern_ok(text: str = WINDOWS_INTERACTIVE_NATIVE_TEXT) -> dict[str, object]:
+    return {
+        "returnCode": 0,
+        "usedNativeAction": True,
+        "nativeAttempt": {
+            "returnCode": 0,
+            "method": "uia",
+            "inputMethod": "uia",
+            "nativeAction": "ValuePattern",
+            "ok": True,
+        },
+        "after": {
+            "returnCode": 0,
+            "snapshot": {"elements": [{"role": "Edit", "value": text}]},
+        },
+    }
+
+
+def _verified_parity_proofs() -> dict[str, dict[str, bool]]:
+    common = {
+        "browserOpen": True,
+        "browserOpenIsolatedProfile": True,
+        "browserSnapshot": True,
+        "browserSnapshotIsolatedPlaywright": True,
+        "browserAct": True,
+        "browserActIsolatedPlaywright": True,
+        "browserActVerified": True,
+        "appsDiscovery": True,
+        "screenshotFile": True,
+        "notification": True,
+        "desktopAutomationReady": True,
+    }
+    return {
+        "macos": {
+            **common,
+            "foregroundSession": True,
+            "appleScriptClipboard": True,
+            "foregroundSnapshotNative": True,
+            "appsNativeNSWorkspace": True,
+            "macosNativeActionMetadata": True,
+            "calculatorNativeAct": True,
+            "textEditNativeAct": True,
+            "textEditNativeScroll": True,
+        },
+        "windows": {
+            **common,
+            "interactiveSession": True,
+            "windowsInteractiveSessionIdentity": True,
+            "windowsVisualPreflight": True,
+            "helperSelftest": True,
+            "powershellPreflight": True,
+            "windowsDpiAwareness": True,
+            "windowsVirtualScreen": True,
+            "windowsForegroundActivation": True,
+            "windowsUnicodeTyping": True,
+            "windowsKeyboardShortcut": True,
+            "notepadNativeAct": True,
+            "clipboardRoundTrip": True,
+        },
+    }
+
+
+def _verified_parity_report(
+    *,
+    generated_at: int | None = None,
+    macos_fingerprint: str = "a" * 64,
+    windows_fingerprint: str = "a" * 64,
+    macos_git_head: str = "b" * 40,
+    windows_git_head: str = "b" * 40,
+    include_artifact_provenance: bool = True,
+) -> dict[str, object]:
+    now = main_module.now_ms()
+    proofs = _verified_parity_proofs()
+    macos: dict[str, object] = {"present": True, "ok": True, "proofSchemaVersion": 1, "proofs": proofs["macos"]}
+    windows: dict[str, object] = {"present": True, "ok": True, "proofSchemaVersion": 1, "proofs": proofs["windows"]}
+    if include_artifact_provenance:
+        macos.update({
+            "schemaVersion": 1,
+            "generatedAt": now,
+            "artifactBytes": 1024,
+            "artifactSha256": "1" * 64,
+            "sourceFingerprint": macos_fingerprint,
+            "gitHead": macos_git_head,
+            "gitDirty": False,
+            "parityRunId": "parity-run-1",
+            "hostFingerprint": "c" * 64,
+            "hostPlatform": "darwin",
+            "hostName": "atrium-macos",
+            "hostMachine": "arm64",
+        })
+        windows.update({
+            "schemaVersion": 1,
+            "generatedAt": now,
+            "artifactBytes": 2048,
+            "artifactSha256": "2" * 64,
+            "sourceFingerprint": windows_fingerprint,
+            "gitHead": windows_git_head,
+            "gitDirty": False,
+            "parityRunId": "parity-run-1",
+            "hostFingerprint": "d" * 64,
+            "hostPlatform": "win32",
+            "hostName": "atrium-windows",
+            "hostMachine": "AMD64",
+        })
+    report = {
+        "schemaVersion": 1,
+        "proofSchemaVersion": 1,
+        "generatedAt": now if generated_at is None else generated_at,
+        "ok": True,
+        "summary": "full live HostBridge parity proof is complete",
+        "findings": [],
+        "results": {
+            "macos": macos,
+            "windows": windows,
+        },
+    }
+    report["proofId"] = host_bridge_parity_proof_id(
+        report["results"],
+        {"sourceFingerprint": "a" * 64, "gitHead": "b" * 40, "gitDirty": False},
+        enforce_current_source=True,
+    )
+    return report
+
+
 class WindowsHostBridgeTest(unittest.TestCase):
+    def _connector_catalog_for_test(
+        self,
+        fake_host_bridge: object,
+        fake_profiles: dict[str, object],
+        *,
+        parity_report: dict[str, object] | None = None,
+        current_source: dict[str, object] | None = None,
+    ) -> dict[str, dict[str, object]]:
+        with tempfile.TemporaryDirectory() as tmp:
+            report_path = Path(tmp) / "host-bridge-parity-report.json"
+            if parity_report is not None:
+                report_path.write_text(json.dumps(parity_report), encoding="utf-8")
+            settings = main_module.get_settings().model_copy(update={"host_bridge_parity_report_path": report_path})
+            source = current_source or {
+                "sourceFingerprint": "a" * 64,
+                "gitHead": "b" * 40,
+                "gitDirty": False,
+            }
+            with (
+                mock.patch.object(main_module, "HostBridge", fake_host_bridge),
+                mock.patch.object(main_module, "list_browser_profiles", lambda: fake_profiles),
+                mock.patch.object(main_module, "get_settings", lambda: settings),
+                mock.patch.object(main_module, "host_bridge_source_provenance", lambda: source),
+            ):
+                return {item["id"]: item for item in main_module._connector_catalog()}
+
+    def _host_bridge_parity_status_for_test(
+        self,
+        fake_host_bridge: object,
+        fake_profiles: dict[str, object],
+        *,
+        parity_report: dict[str, object] | None = None,
+        current_source: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        with tempfile.TemporaryDirectory() as tmp:
+            report_path = Path(tmp) / "host-bridge-parity-report.json"
+            if parity_report is not None:
+                report_path.write_text(json.dumps(parity_report), encoding="utf-8")
+            settings = main_module.get_settings().model_copy(update={"host_bridge_parity_report_path": report_path})
+            source = current_source or {
+                "sourceFingerprint": "a" * 64,
+                "gitHead": "b" * 40,
+                "gitDirty": False,
+            }
+            with (
+                mock.patch.object(main_module, "HostBridge", fake_host_bridge),
+                mock.patch.object(main_module, "list_browser_profiles", lambda: fake_profiles),
+                mock.patch.object(main_module, "get_settings", lambda: settings),
+                mock.patch.object(main_module, "host_bridge_source_provenance", lambda: source),
+            ):
+                return main_module._host_bridge_parity_status_payload()
+
     def test_host_bridge_uses_known_windows_shell_paths_without_path_env(self) -> None:
         powershell = "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
         cmd = "C:/Windows/System32/cmd.exe"
@@ -242,6 +474,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
                 bridge = host_bridge.HostBridge()
                 status = bridge.status().to_dict()
                 screenshot_allowed, screenshot_reason = bridge.can_run("browser.screenshot")
+                snapshot_allowed, snapshot_reason = bridge.can_run("desktop.snapshot")
                 open_allowed, open_reason = bridge.can_run("browser.open", {"profile": "user"})
                 apps_allowed, apps_reason = bridge.can_run("desktop.apps")
         finally:
@@ -255,6 +488,8 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertFalse(status["desktopAutomationReady"])
         self.assertFalse(screenshot_allowed)
         self.assertEqual(screenshot_reason, "win32 visual automation preflight failed: failed checks: dpiAwareness")
+        self.assertFalse(snapshot_allowed)
+        self.assertEqual(snapshot_reason, "win32 visual automation preflight failed: failed checks: dpiAwareness")
         self.assertTrue(open_allowed)
         self.assertIsNone(open_reason)
         self.assertTrue(apps_allowed)
@@ -387,6 +622,115 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertIn("sendInputHelper: helper failed", result["error"])
         self.assertIn("failed checks: sendInputHelper", result["error"])
 
+    def test_host_bridge_macos_visual_preflight_blocks_accessibility_refs_when_disabled(self) -> None:
+        def fake_which(name: str) -> str | None:
+            if name in {"bash", "open", "osascript", "screencapture"}:
+                return f"/usr/bin/{name}"
+            return None
+
+        original_platform = sys.platform
+        original_cache = host_bridge._MACOS_PREFLIGHT_CACHE
+        original_accessibility_cache = host_bridge._MACOS_ACCESSIBILITY_CACHE
+        try:
+            sys.platform = "darwin"
+            host_bridge._MACOS_PREFLIGHT_CACHE = None
+            host_bridge._MACOS_ACCESSIBILITY_CACHE = None
+            with (
+                mock.patch.object(host_bridge.shutil, "which", fake_which),
+                mock.patch.object(host_bridge, "_macos_accessibility_enabled", return_value=False),
+                mock.patch.object(host_bridge, "_isolated_browser_profile_app", return_value=None),
+            ):
+                bridge = host_bridge.HostBridge()
+                status = bridge.status().to_dict()
+                snapshot_allowed, snapshot_reason = bridge.can_run("desktop.snapshot")
+                click_allowed, click_reason = bridge.can_run("desktop.click")
+        finally:
+            sys.platform = original_platform
+            host_bridge._MACOS_PREFLIGHT_CACHE = original_cache
+            host_bridge._MACOS_ACCESSIBILITY_CACHE = original_accessibility_cache
+
+        self.assertTrue(status["macosVisualPreflightChecked"])
+        self.assertFalse(status["macosVisualPreflightOk"])
+        self.assertFalse(status["macosVisualPreflightChecks"]["accessibility"])
+        self.assertFalse(status["desktopAutomationReady"])
+        self.assertFalse(snapshot_allowed)
+        self.assertIn("darwin visual automation preflight failed", snapshot_reason or "")
+        self.assertIn("accessibility", snapshot_reason or "")
+        self.assertTrue(click_allowed)
+        self.assertIsNone(click_reason)
+
+    def test_host_bridge_macos_visual_preflight_blocks_foreground_writes_in_loginwindow_session(self) -> None:
+        def fake_which(name: str) -> str | None:
+            if name in {"bash", "open", "osascript", "screencapture"}:
+                return f"/usr/bin/{name}"
+            return None
+
+        original_platform = sys.platform
+        original_cache = host_bridge._MACOS_PREFLIGHT_CACHE
+        original_accessibility_cache = host_bridge._MACOS_ACCESSIBILITY_CACHE
+        try:
+            sys.platform = "darwin"
+            host_bridge._MACOS_PREFLIGHT_CACHE = None
+            host_bridge._MACOS_ACCESSIBILITY_CACHE = None
+            with (
+                mock.patch.object(host_bridge.shutil, "which", fake_which),
+                mock.patch.object(host_bridge, "_macos_accessibility_enabled", return_value=True),
+                mock.patch.object(
+                    host_bridge,
+                    "_macos_foreground_session_status",
+                    return_value={
+                        "checked": True,
+                        "ok": False,
+                        "error": "macOS foreground session is loginwindow; user GUI session is not foreground-controllable",
+                        "details": {"appName": "loginwindow", "processId": 400, "windowCount": 1},
+                    },
+                ),
+                mock.patch.object(host_bridge, "_isolated_browser_profile_app", return_value=None),
+            ):
+                bridge = host_bridge.HostBridge()
+                status = bridge.status().to_dict()
+                snapshot_allowed, snapshot_reason = bridge.can_run("desktop.snapshot")
+                apps_allowed, apps_reason = bridge.can_run("desktop.apps")
+                activate_allowed, activate_reason = bridge.can_run("desktop.activate_app")
+                click_allowed, click_reason = bridge.can_run("desktop.click")
+                native_act_allowed, native_act_reason = bridge.can_run(
+                    "desktop.act",
+                    {"ref": "d1", "action": "click", "requireNative": True},
+                )
+                fallback_act_allowed, fallback_act_reason = bridge.can_run(
+                    "desktop.act",
+                    {"ref": "d1", "action": "click"},
+                )
+                browser_screenshot_allowed, browser_screenshot_reason = bridge.can_run("browser.screenshot")
+                browser_click_allowed, browser_click_reason = bridge.can_run("browser.click")
+        finally:
+            sys.platform = original_platform
+            host_bridge._MACOS_PREFLIGHT_CACHE = original_cache
+            host_bridge._MACOS_ACCESSIBILITY_CACHE = original_accessibility_cache
+
+        self.assertTrue(status["macosVisualPreflightChecked"])
+        self.assertFalse(status["macosVisualPreflightOk"])
+        self.assertFalse(status["desktopAutomationReady"])
+        self.assertFalse(status["macosVisualPreflightChecks"]["foregroundSession"])
+        self.assertEqual(status["macosVisualPreflightChecks"]["foregroundAppName"], "loginwindow")
+        self.assertTrue(snapshot_allowed)
+        self.assertIsNone(snapshot_reason)
+        self.assertTrue(apps_allowed)
+        self.assertIsNone(apps_reason)
+        self.assertFalse(activate_allowed)
+        self.assertIn("foregroundSession", activate_reason or "")
+        self.assertIn("loginwindow", activate_reason or "")
+        self.assertFalse(click_allowed)
+        self.assertIn("foregroundSession", click_reason or "")
+        self.assertTrue(native_act_allowed)
+        self.assertIsNone(native_act_reason)
+        self.assertFalse(fallback_act_allowed)
+        self.assertIn("foregroundSession", fallback_act_reason or "")
+        self.assertTrue(browser_screenshot_allowed)
+        self.assertIsNone(browser_screenshot_reason)
+        self.assertFalse(browser_click_allowed)
+        self.assertIn("foregroundSession", browser_click_reason or "")
+
     def test_host_bridge_blocks_visual_tools_in_windows_service_session(self) -> None:
         powershell = "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
         cmd = "C:/Windows/System32/cmd.exe"
@@ -411,7 +755,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
                 self.assertEqual(status["interactiveSessionName"], "Services")
                 self.assertTrue(bridge.can_run("browser.profiles")[0])
                 self.assertTrue(bridge.can_run("desktop.apps")[0])
-                for tool in ("browser.screenshot", "desktop.screenshot", "desktop.click", "notify.send"):
+                for tool in ("browser.screenshot", "desktop.screenshot", "desktop.snapshot", "desktop.click", "notify.send"):
                     with self.subTest(tool=tool):
                         allowed, reason = bridge.can_run(tool)
                         self.assertFalse(allowed)
@@ -1766,20 +2110,21 @@ class WindowsHostBridgeTest(unittest.TestCase):
                 return FakeStatus()
 
         fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
-        with (
-            mock.patch.object(main_module, "HostBridge", FakeHostBridge),
-            mock.patch.object(main_module, "list_browser_profiles", lambda: fake_profiles),
-        ):
-            connectors = {item["id"]: item for item in main_module._connector_catalog()}
+        connectors = self._connector_catalog_for_test(FakeHostBridge, fake_profiles)
 
         self.assertEqual(connectors["browser"]["status"], "blocked_by_runtime")
         self.assertTrue(connectors["browser"]["readReady"])
         self.assertFalse(connectors["browser"]["writeReady"])
         self.assertIn("profile discovery ready", connectors["browser"]["runtimeStatus"])
         self.assertIn("Win32 input APIs", connectors["browser"]["requires"])
+        self.assertEqual(connectors["browser"]["proofStatus"], "local_blocked")
+        self.assertIn("profile discovery ready", connectors["browser"]["proofGaps"][0])
+        self.assertIn("host_bridge_parity_report.py", connectors["browser"]["proofGaps"][-1])
         self.assertEqual(connectors["desktop"]["status"], "blocked_by_runtime")
         self.assertTrue(connectors["desktop"]["readReady"])
         self.assertFalse(connectors["desktop"]["writeReady"])
+        self.assertEqual(connectors["desktop"]["proofStatus"], "local_blocked")
+        self.assertIn("host_bridge_parity_report.py", connectors["desktop"]["proofGaps"][-1])
 
     def test_connector_catalog_reports_windows_visual_preflight_failure(self) -> None:
         class FakeStatus:
@@ -1803,11 +2148,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
                 return FakeStatus()
 
         fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
-        with (
-            mock.patch.object(main_module, "HostBridge", FakeHostBridge),
-            mock.patch.object(main_module, "list_browser_profiles", lambda: fake_profiles),
-        ):
-            connectors = {item["id"]: item for item in main_module._connector_catalog()}
+        connectors = self._connector_catalog_for_test(FakeHostBridge, fake_profiles)
 
         self.assertEqual(connectors["browser"]["status"], "blocked_by_runtime")
         self.assertTrue(connectors["browser"]["readReady"])
@@ -1815,11 +2156,53 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertIn("profile discovery ready", connectors["browser"]["runtimeStatus"])
         self.assertIn("visual automation preflight failed: failed checks: dpiAwareness", connectors["browser"]["runtimeStatus"])
         self.assertIn("DPI-aware visual preflight", connectors["browser"]["requires"])
+        self.assertEqual(connectors["browser"]["proofStatus"], "local_blocked")
+        self.assertIn("dpiAwareness", " ".join(connectors["browser"]["proofGaps"]))
         self.assertEqual(connectors["desktop"]["status"], "blocked_by_runtime")
         self.assertTrue(connectors["desktop"]["readReady"])
         self.assertFalse(connectors["desktop"]["writeReady"])
         self.assertEqual(connectors["desktop"]["runtimeStatus"], "Windows visual automation preflight failed: failed checks: dpiAwareness")
         self.assertIn("DPI-aware visual preflight", connectors["desktop"]["requires"])
+        self.assertEqual(connectors["desktop"]["proofStatus"], "local_blocked")
+        self.assertIn("host_bridge_parity_report.py", connectors["desktop"]["proofGaps"][-1])
+
+    def test_connector_catalog_reports_macos_visual_preflight_failure(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "darwin",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": False,
+                    "macosVisualPreflightChecked": True,
+                    "macosVisualPreflightOk": False,
+                    "macosVisualPreflightError": "accessibility: macOS Accessibility permission is disabled for System Events; failed checks: accessibility",
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        fake_profiles = {"browserApp": {"name": "Google Chrome", "path": "/Applications/Google Chrome.app"}}
+        connectors = self._connector_catalog_for_test(FakeHostBridge, fake_profiles)
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "local_blocked")
+        self.assertIn("Accessibility permission", " ".join(connectors["browser"]["proofGaps"]))
+        self.assertEqual(connectors["desktop"]["status"], "blocked_by_runtime")
+        self.assertTrue(connectors["desktop"]["readReady"])
+        self.assertFalse(connectors["desktop"]["writeReady"])
+        self.assertIn("macOS visual automation preflight failed", connectors["desktop"]["runtimeStatus"])
+        self.assertIn("Accessibility permission", connectors["desktop"]["runtimeStatus"])
+        self.assertIn("macOS Accessibility permission", connectors["desktop"]["requires"])
+        self.assertNotIn("pbcopy", connectors["desktop"]["requires"])
+        self.assertEqual(connectors["desktop"]["proofStatus"], "local_blocked")
+        self.assertIn("Accessibility permission", " ".join(connectors["desktop"]["proofGaps"]))
 
     def test_connector_catalog_does_not_claim_own_profile_without_browser_app(self) -> None:
         class FakeStatus:
@@ -1840,11 +2223,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
                 return FakeStatus()
 
         fake_profiles = {"browserApp": None, "profiles": []}
-        with (
-            mock.patch.object(main_module, "HostBridge", FakeHostBridge),
-            mock.patch.object(main_module, "list_browser_profiles", lambda: fake_profiles),
-        ):
-            browser = {item["id"]: item for item in main_module._connector_catalog()}["browser"]
+        browser = self._connector_catalog_for_test(FakeHostBridge, fake_profiles)["browser"]
 
         self.assertEqual(browser["status"], "available")
         self.assertTrue(browser["readReady"])
@@ -1853,6 +2232,787 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertIn("isolated browser profile app missing", browser["runtimeStatus"])
         self.assertIn("Win32 input APIs", browser["requires"])
         self.assertIn("Chrome/Edge/Brave/Chromium for isolated profile", browser["requires"])
+        self.assertEqual(browser["proofStatus"], "cross_os_unverified")
+        self.assertIn("isolated browser profile app missing", browser["proofGaps"][0])
+        self.assertIn("host_bridge_parity_report.py", browser["proofGaps"][-1])
+
+    def test_connector_catalog_marks_ready_host_bridge_as_cross_os_unverified(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+        connectors = self._connector_catalog_for_test(FakeHostBridge, fake_profiles)
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "cross_os_unverified")
+        self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_unverified")
+        self.assertIn("verified macOS+Windows full parity report", connectors["browser"]["proofSummary"])
+        self.assertIn("verified macOS+Windows full parity report", connectors["desktop"]["proofSummary"])
+        self.assertIn("host_bridge_parity_report.py", connectors["browser"]["proofGaps"][-1])
+        self.assertIn("host_bridge_parity_report.py", connectors["desktop"]["proofGaps"][-1])
+        self.assertEqual(connectors["local_file"]["proofStatus"], "not_required")
+
+    def test_connector_catalog_marks_ready_host_bridge_as_cross_os_verified_from_persisted_report(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+        report = _verified_parity_report()
+        connectors = self._connector_catalog_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=report,
+        )
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "cross_os_verified")
+        self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_verified")
+        self.assertEqual(connectors["browser"]["proofGaps"], [])
+        self.assertEqual(connectors["desktop"]["proofGaps"], [])
+        self.assertIn("host-bridge-parity-report.json", connectors["browser"]["proofSummary"])
+        self.assertEqual(connectors["browser"]["proofDetails"]["sourceFingerprint"], "a" * 64)
+        self.assertEqual(connectors["browser"]["proofDetails"]["proofId"], report["proofId"])
+        self.assertEqual(connectors["desktop"]["proofDetails"]["gitHead"], "b" * 40)
+        self.assertEqual(connectors["browser"]["proofDetails"]["artifactSha256"]["macos"], "1" * 64)
+        self.assertEqual(connectors["browser"]["proofDetails"]["artifactBytes"]["windows"], 2048)
+        self.assertEqual(connectors["browser"]["proofDetails"]["hostFingerprint"]["macos"], "c" * 64)
+        self.assertEqual(connectors["browser"]["proofDetails"]["hostPlatform"]["windows"], "win32")
+        self.assertEqual(connectors["browser"]["proofDetails"]["hostName"]["windows"], "atrium-windows")
+
+    def test_connector_catalog_rejects_verified_report_without_artifact_provenance(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+        connectors = self._connector_catalog_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=_verified_parity_report(include_artifact_provenance=False),
+        )
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "cross_os_unverified")
+        self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_unverified")
+        self.assertIn("sourceFingerprint", " ".join(connectors["browser"]["proofGaps"]))
+        self.assertIn("generatedAt", " ".join(connectors["desktop"]["proofGaps"]))
+        self.assertIn("reportGeneratedAt", connectors["browser"]["proofDetails"])
+        self.assertEqual(connectors["browser"]["proofDetails"]["resultOk"]["macos"], True)
+
+    def test_connector_catalog_rejects_verified_report_without_artifact_hashes(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        report = _verified_parity_report()
+        for item in report["results"].values():
+            item.pop("artifactSha256", None)
+            item.pop("artifactBytes", None)
+        fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+        connectors = self._connector_catalog_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=report,
+        )
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "cross_os_unverified")
+        self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_unverified")
+        self.assertIn("artifactSha256", " ".join(connectors["browser"]["proofGaps"]))
+        self.assertIn("artifactBytes", " ".join(connectors["desktop"]["proofGaps"]))
+
+    def test_connector_catalog_rejects_verified_report_without_host_identity(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        report = _verified_parity_report()
+        report["results"]["macos"].pop("hostFingerprint", None)
+        report["results"]["windows"]["hostPlatform"] = "darwin"
+        fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+        connectors = self._connector_catalog_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=report,
+        )
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "cross_os_unverified")
+        self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_unverified")
+        gaps = " ".join(connectors["browser"]["proofGaps"])
+        self.assertIn("hostFingerprint", gaps)
+        self.assertIn("hostPlatform", gaps)
+
+    def test_connector_catalog_rejects_verified_report_without_proof_id(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        report = _verified_parity_report()
+        report.pop("proofId", None)
+        fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+        connectors = self._connector_catalog_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=report,
+        )
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "cross_os_unverified")
+        self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_unverified")
+        self.assertIn("proofId", " ".join(connectors["browser"]["proofGaps"]))
+
+    def test_connector_catalog_rejects_verified_report_with_tampered_proof_id(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        report = _verified_parity_report()
+        report["proofId"] = "0" * 64
+        fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+        connectors = self._connector_catalog_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=report,
+        )
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "cross_os_unverified")
+        self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_unverified")
+        self.assertIn("proofId does not match", " ".join(connectors["browser"]["proofGaps"]))
+        self.assertRegex(connectors["browser"]["proofDetails"]["expectedProofId"], r"^[0-9a-f]{64}$")
+
+    def test_connector_catalog_rejects_verified_report_without_browser_ref_proof(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        current_source = {"sourceFingerprint": "a" * 64, "gitHead": "b" * 40, "gitDirty": False}
+        report = _verified_parity_report()
+        report["results"]["macos"]["proofs"]["browserActVerified"] = False
+        report["proofId"] = host_bridge_parity_proof_id(
+            report["results"],
+            current_source,
+            enforce_current_source=True,
+        )
+        fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+        connectors = self._connector_catalog_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=report,
+            current_source=current_source,
+        )
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "cross_os_unverified")
+        self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_unverified")
+        self.assertIn("browser.act post-click DOM verification", " ".join(connectors["browser"]["proofGaps"]))
+        self.assertFalse(connectors["browser"]["proofDetails"]["proofs"]["macos"]["browserActVerified"])
+        self.assertNotIn("proofId does not match", " ".join(connectors["browser"]["proofGaps"]))
+
+    def test_connector_catalog_rejects_verified_report_without_macos_applescript_clipboard_proof(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        current_source = {"sourceFingerprint": "a" * 64, "gitHead": "b" * 40, "gitDirty": False}
+        report = _verified_parity_report()
+        report["results"]["macos"]["proofs"].pop("appleScriptClipboard")
+        report["proofId"] = host_bridge_parity_proof_id(
+            report["results"],
+            current_source,
+            enforce_current_source=True,
+        )
+        fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+        connectors = self._connector_catalog_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=report,
+            current_source=current_source,
+        )
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "cross_os_unverified")
+        self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_unverified")
+        self.assertIn("macOS AppleScript clipboard proof", " ".join(connectors["desktop"]["proofGaps"]))
+        self.assertNotIn("proofId does not match", " ".join(connectors["browser"]["proofGaps"]))
+
+    def test_connector_catalog_rejects_verified_report_without_isolated_playwright_browser_proof(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        current_source = {"sourceFingerprint": "a" * 64, "gitHead": "b" * 40, "gitDirty": False}
+        report = _verified_parity_report()
+        report["results"]["windows"]["proofs"]["browserActIsolatedPlaywright"] = False
+        report["proofId"] = host_bridge_parity_proof_id(
+            report["results"],
+            current_source,
+            enforce_current_source=True,
+        )
+        fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+        connectors = self._connector_catalog_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=report,
+            current_source=current_source,
+        )
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "cross_os_unverified")
+        self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_unverified")
+        self.assertIn("browser.act Playwright isolated profile proof", " ".join(connectors["browser"]["proofGaps"]))
+        self.assertFalse(connectors["desktop"]["proofDetails"]["proofs"]["windows"]["browserActIsolatedPlaywright"])
+        self.assertNotIn("proofId does not match", " ".join(connectors["browser"]["proofGaps"]))
+
+    def test_connector_catalog_rejects_verified_report_without_windows_session_identity_proof(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        current_source = {"sourceFingerprint": "a" * 64, "gitHead": "b" * 40, "gitDirty": False}
+        report = _verified_parity_report()
+        report["results"]["windows"]["proofs"].pop("windowsInteractiveSessionIdentity")
+        report["proofId"] = host_bridge_parity_proof_id(
+            report["results"],
+            current_source,
+            enforce_current_source=True,
+        )
+        fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+        connectors = self._connector_catalog_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=report,
+            current_source=current_source,
+        )
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "cross_os_unverified")
+        self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_unverified")
+        self.assertIn("Windows interactive session identity proof", " ".join(connectors["desktop"]["proofGaps"]))
+        self.assertNotIn("proofId does not match", " ".join(connectors["browser"]["proofGaps"]))
+
+    def test_connector_catalog_rejects_verified_report_without_matching_parity_run_id(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        current_source = {"sourceFingerprint": "a" * 64, "gitHead": "b" * 40, "gitDirty": False}
+        report = _verified_parity_report()
+        report["results"]["macos"].pop("parityRunId")
+        report["results"]["windows"]["parityRunId"] = "other-run"
+        report["proofId"] = host_bridge_parity_proof_id(
+            report["results"],
+            current_source,
+            enforce_current_source=True,
+        )
+        fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+        connectors = self._connector_catalog_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=report,
+            current_source=current_source,
+        )
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "cross_os_unverified")
+        self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_unverified")
+        gaps = " ".join(connectors["desktop"]["proofGaps"])
+        self.assertIn("parityRunId", gaps)
+        self.assertNotIn("proofId does not match", gaps)
+
+    def test_connector_catalog_rejects_verified_report_with_unexpected_result_label(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        current_source = {"sourceFingerprint": "a" * 64, "gitHead": "b" * 40, "gitDirty": False}
+        report = _verified_parity_report()
+        report["results"]["linux"] = {
+            "present": True,
+            "ok": True,
+            "proofSchemaVersion": 1,
+            "artifactBytes": 512,
+            "artifactSha256": "3" * 64,
+            "generatedAt": main_module.now_ms(),
+            "sourceFingerprint": "a" * 64,
+            "gitHead": "b" * 40,
+            "gitDirty": False,
+            "mode": "live",
+            "platform": "linux",
+            "probeOk": True,
+            "desktopAutomationReady": True,
+            "proofs": {},
+        }
+        report["proofId"] = host_bridge_parity_proof_id(
+            report["results"],
+            current_source,
+            enforce_current_source=True,
+        )
+        fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+        connectors = self._connector_catalog_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=report,
+            current_source=current_source,
+        )
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "cross_os_unverified")
+        self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_unverified")
+        self.assertIn("unexpected OS result labels", " ".join(connectors["browser"]["proofGaps"]))
+        self.assertIn("linux", " ".join(connectors["desktop"]["proofGaps"]))
+        self.assertNotIn("proofId does not match", " ".join(connectors["browser"]["proofGaps"]))
+
+    def test_connector_catalog_rejects_verified_report_with_source_mismatch(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+        connectors = self._connector_catalog_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=_verified_parity_report(windows_fingerprint="c" * 64),
+        )
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "cross_os_unverified")
+        self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_unverified")
+        self.assertIn("sourceFingerprint mismatch", " ".join(connectors["browser"]["proofGaps"]))
+
+    def test_connector_catalog_rejects_verified_report_when_current_source_changed(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+        connectors = self._connector_catalog_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=_verified_parity_report(),
+            current_source={"sourceFingerprint": "c" * 64, "gitHead": "b" * 40, "gitDirty": True},
+        )
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "cross_os_unverified")
+        self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_unverified")
+        self.assertIn("current HostBridge source", " ".join(connectors["browser"]["proofGaps"]))
+        self.assertEqual(connectors["browser"]["proofDetails"]["currentSourceFingerprint"], "c" * 64)
+        self.assertEqual(connectors["desktop"]["proofDetails"]["currentGitDirty"], True)
+
+    def test_connector_catalog_refuses_verified_report_when_current_local_runtime_is_blocked(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "darwin",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": False,
+                    "macosVisualPreflightChecked": True,
+                    "macosVisualPreflightOk": False,
+                    "macosVisualPreflightError": "foregroundSession: macOS foreground session is loginwindow",
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        fake_profiles = {"browserApp": {"name": "Google Chrome", "path": "/Applications/Google Chrome.app"}}
+        connectors = self._connector_catalog_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=_verified_parity_report(),
+        )
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "local_blocked")
+        self.assertEqual(connectors["desktop"]["proofStatus"], "local_blocked")
+        self.assertIn("current local HostBridge runtime is blocked", " ".join(connectors["browser"]["proofGaps"]))
+        self.assertIn("loginwindow", " ".join(connectors["desktop"]["proofGaps"]))
+        self.assertIn("localRuntimeStatus", connectors["desktop"]["proofDetails"])
+
+    def test_connector_catalog_rejects_stale_verified_parity_report(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+        stale_generated_at = main_module.now_ms() - (25 * 60 * 60 * 1000)
+        connectors = self._connector_catalog_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=_verified_parity_report(generated_at=stale_generated_at),
+        )
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "cross_os_unverified")
+        self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_unverified")
+        self.assertIn("stale", " ".join(connectors["browser"]["proofGaps"]))
+
+    def test_host_bridge_parity_endpoint_is_registered(self) -> None:
+        paths = {getattr(route, "path", None) for route in main_module.app.routes}
+        self.assertIn("/api/host-bridge/parity", paths)
+
+    def test_host_bridge_parity_status_reports_local_blocked_runtime(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "darwin",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": False,
+                    "macosVisualPreflightChecked": True,
+                    "macosVisualPreflightOk": False,
+                    "macosVisualPreflightError": "foregroundSession: macOS foreground session is loginwindow",
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        fake_profiles = {"browserApp": {"name": "Google Chrome", "path": "/Applications/Google Chrome.app"}}
+        payload = self._host_bridge_parity_status_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=_verified_parity_report(),
+        )
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["status"], "local_blocked")
+        self.assertIn("loginwindow", " ".join(payload["gaps"]))
+        self.assertEqual(payload["local"]["platform"], "darwin")
+        self.assertEqual(payload["local"]["desktop"]["proofStatus"], "local_blocked")
+        self.assertEqual(payload["local"]["macosVisualPreflight"]["ok"], False)
+        self.assertRegex(payload["commands"]["parityRunId"], r"^atrium-\d+-[0-9a-f-]{36}$")
+        self.assertRegex(payload["commands"]["sourceFingerprint"], r"^[0-9a-f]{64}$")
+        self.assertIn(payload["commands"]["parityRunId"], payload["commands"]["macosRunIdExport"])
+        self.assertIn("ops/host_bridge_source_summary.py", payload["commands"]["macosSourceValidate"])
+        self.assertIn(payload["commands"]["sourceFingerprint"], payload["commands"]["macosSourceValidate"])
+        self.assertIn(payload["commands"]["parityRunId"], payload["commands"]["windowsRunIdSet"])
+        self.assertIn("ops/host_bridge_source_summary.py", payload["commands"]["windowsSourceValidate"])
+        self.assertIn(payload["commands"]["sourceFingerprint"], payload["commands"]["windowsSourceValidate"])
+        self.assertIn("ops/macos_host_bridge_probe.py --full", payload["commands"]["macosProbe"])
+        self.assertIn("--parity-run-id", payload["commands"]["macosProbe"])
+        self.assertIn("--expect-source-fingerprint", payload["commands"]["macosProbe"])
+        self.assertIn(payload["commands"]["sourceFingerprint"], payload["commands"]["macosProbe"])
+        self.assertIn(payload["commands"]["parityRunId"], payload["commands"]["macosProbe"])
+        self.assertIn("ops/host_bridge_artifact_summary.py", payload["commands"]["macosArtifactValidate"])
+        self.assertIn("--label macos", payload["commands"]["macosArtifactValidate"])
+        self.assertIn(payload["commands"]["parityRunId"], payload["commands"]["macosArtifactValidate"])
+        self.assertIn(payload["commands"]["sourceFingerprint"], payload["commands"]["macosArtifactValidate"])
+        self.assertIn("ops/windows_host_bridge_probe.py --full", payload["commands"]["windowsProbe"])
+        self.assertIn("--parity-run-id", payload["commands"]["windowsProbe"])
+        self.assertIn("--expect-source-fingerprint", payload["commands"]["windowsProbe"])
+        self.assertIn(payload["commands"]["sourceFingerprint"], payload["commands"]["windowsProbe"])
+        self.assertIn(payload["commands"]["parityRunId"], payload["commands"]["windowsProbe"])
+        self.assertIn("windows_host_bridge_live_proof.ps1", payload["commands"]["windowsLiveProofRunner"])
+        self.assertIn("-ParityRunId", payload["commands"]["windowsLiveProofRunner"])
+        self.assertIn("-SourceFingerprint", payload["commands"]["windowsLiveProofRunner"])
+        self.assertIn(payload["commands"]["parityRunId"], payload["commands"]["windowsLiveProofRunner"])
+        self.assertIn(payload["commands"]["sourceFingerprint"], payload["commands"]["windowsLiveProofRunner"])
+        self.assertIn("C:\\Temp\\atrium_host_bridge_windows_live.json", payload["commands"]["windowsLiveProofRunner"])
+        self.assertIn("ops/host_bridge_artifact_summary.py", payload["commands"]["windowsArtifactValidateOnWindows"])
+        self.assertIn("--label windows", payload["commands"]["windowsArtifactValidateOnWindows"])
+        self.assertIn(payload["commands"]["parityRunId"], payload["commands"]["windowsArtifactValidateOnWindows"])
+        self.assertIn(payload["commands"]["sourceFingerprint"], payload["commands"]["windowsArtifactValidateOnWindows"])
+        self.assertEqual(payload["commands"]["windowsArtifactSource"], "C:\\Temp\\atrium_host_bridge_windows_live.json")
+        self.assertEqual(payload["commands"]["windowsArtifactLocal"], "/tmp/atrium_host_bridge_windows_live.json")
+        self.assertIn("C:\\Temp\\atrium_host_bridge_windows_live.json", payload["commands"]["windowsArtifactCopyHint"])
+        self.assertIn("/tmp/atrium_host_bridge_windows_live.json", payload["commands"]["windowsArtifactCopyHint"])
+        self.assertIn("ops/host_bridge_artifact_summary.py", payload["commands"]["windowsArtifactValidateLocal"])
+        self.assertIn("--label windows", payload["commands"]["windowsArtifactValidateLocal"])
+        self.assertIn(payload["commands"]["parityRunId"], payload["commands"]["windowsArtifactValidateLocal"])
+        self.assertIn(payload["commands"]["sourceFingerprint"], payload["commands"]["windowsArtifactValidateLocal"])
+        self.assertIn("ops/host_bridge_parity_report.py", payload["commands"]["verify"])
+        self.assertIn("--windows /tmp/atrium_host_bridge_windows_live.json", payload["commands"]["verify"])
+        self.assertIn("--windows-source-path 'C:\\Temp\\atrium_host_bridge_windows_live.json'", payload["commands"]["verify"])
+
+    def test_host_bridge_parity_status_accepts_verified_report_and_endpoint_handler(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        report = _verified_parity_report()
+        with tempfile.TemporaryDirectory() as tmp:
+            report_path = Path(tmp) / "host-bridge-parity-report.json"
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+            settings = main_module.get_settings().model_copy(update={"host_bridge_parity_report_path": report_path})
+            fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+            with (
+                mock.patch.object(main_module, "HostBridge", FakeHostBridge),
+                mock.patch.object(main_module, "list_browser_profiles", lambda: fake_profiles),
+                mock.patch.object(main_module, "get_settings", lambda: settings),
+                mock.patch.object(
+                    main_module,
+                    "host_bridge_source_provenance",
+                    lambda: {"sourceFingerprint": "a" * 64, "gitHead": "b" * 40, "gitDirty": False},
+                ),
+            ):
+                payload = asyncio.run(main_module.get_host_bridge_parity())
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["status"], "cross_os_verified")
+        self.assertEqual(payload["gaps"], [])
+        self.assertEqual(payload["report"]["sourceFingerprint"], "a" * 64)
+        self.assertEqual(payload["report"]["proofId"], report["proofId"])
+        self.assertEqual(payload["report"]["parityRunId"], "parity-run-1")
+        self.assertEqual(payload["report"]["artifactSha256"]["windows"], "2" * 64)
+        self.assertEqual(payload["connectors"][0]["proofStatus"], "cross_os_verified")
+        self.assertEqual(payload["connectors"][1]["proofStatus"], "cross_os_verified")
+        self.assertIn("data/host-bridge-parity-report.json", payload["commands"]["verify"])
 
     def test_windows_background_shell_disables_screen_and_pty_without_posix_session_kwargs(self) -> None:
         class FakeProc:
@@ -1988,6 +3148,19 @@ class WindowsHostBridgeTest(unittest.TestCase):
             captured.update(args)
             return {"returnCode": 0, "stdout": "", "stderr": "", "profile": args.get("profile"), "processId": 42}
 
+        def fake_browser_snapshot(args: dict[str, object], _run_process: object) -> dict[str, object]:
+            return {
+                "returnCode": 0,
+                "refCount": 1,
+                "snapshot": {"elements": [{"ref": "b1", "role": "button", "name": "ATRIUM browser probe"}]},
+            }
+
+        def fake_browser_act(args: dict[str, object], _run_process: object) -> dict[str, object]:
+            return {
+                "returnCode": 0,
+                "snapshot": {"elements": [{"ref": "b1", "role": "button", "name": "ATRIUM clicked"}]},
+            }
+
         def fake_list_apps(_args: dict[str, object], _run_process: object) -> dict[str, object]:
             return {"returnCode": 0, "running": [], "installed": []}
 
@@ -2001,11 +3174,13 @@ class WindowsHostBridgeTest(unittest.TestCase):
                 mock.patch.object(probe, "_runtime_block_for", lambda _tool, _args: {"api": None, "chat": None}),
                 mock.patch.object(probe, "_shell_probe", lambda _status: {"returnCode": 0, "containsExpected": True}),
                 mock.patch.object(probe.HostBridge, "status", lambda _self: FakeStatus()),
-                mock.patch.object(visual_bridge, "execute_windows_visual_selftest", lambda _run_process: {"returnCode": 0, "ok": True}),
+                mock.patch.object(visual_bridge, "execute_windows_visual_selftest", _windows_helper_selftest_ok),
                 mock.patch.object(visual_bridge, "execute_windows_powershell_visual_preflight", _windows_preflight_ok),
                 mock.patch.object(visual_bridge, "list_browser_profiles", lambda: {"profiles": []}),
                 mock.patch.object(visual_bridge, "execute_list_apps", fake_list_apps),
                 mock.patch.object(visual_bridge, "execute_browser_open", fake_open),
+                mock.patch.object(visual_bridge, "execute_browser_snapshot", fake_browser_snapshot),
+                mock.patch.object(visual_bridge, "execute_browser_act", fake_browser_act),
             ):
                 result = probe._live(
                     screenshot=False,
@@ -2021,6 +3196,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertEqual(captured["profile"], "atrium")
         self.assertIsNone(result["checks"]["browserOpenRoute"]["blockReason"])
         self.assertEqual(result["checks"]["browserOpenProcessId"], 42)
+        self.assertTrue(result["checks"]["browserRef"]["containsExpected"])
 
     def test_windows_probe_reports_args_specific_isolated_profile_runtime_block(self) -> None:
         probe = _load_windows_probe_module()
@@ -2043,7 +3219,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
                 mock.patch.object(probe, "_routes", lambda: {tool: {"blockReason": None} for tool in probe.VISUAL_TOOLS}),
                 mock.patch.object(probe, "_runtime_blocks", lambda: {tool: {"api": None, "chat": None} for tool in probe.VISUAL_TOOLS}),
                 mock.patch.object(probe, "_shell_probe", lambda _status: {"returnCode": 0, "containsExpected": True}),
-                mock.patch.object(visual_bridge, "execute_windows_visual_selftest", lambda _run_process: {"returnCode": 0, "ok": True}),
+                mock.patch.object(visual_bridge, "execute_windows_visual_selftest", _windows_helper_selftest_ok),
                 mock.patch.object(visual_bridge, "execute_windows_powershell_visual_preflight", _windows_preflight_ok),
                 mock.patch.object(visual_bridge, "execute_list_apps", fake_list_apps),
                 mock.patch.object(visual_bridge, "execute_browser_open", side_effect=AssertionError("blocked browser.open should not execute")),
@@ -2133,7 +3309,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
                     mock.patch.object(probe, "_shell_probe", lambda _status: {"returnCode": 0, "containsExpected": True}),
                     mock.patch.object(probe.HostBridge, "status", lambda _self: FakeStatus()),
                     mock.patch.object(probe, "get_settings", lambda: FakeSettings(Path(tmp))),
-                    mock.patch.object(visual_bridge, "execute_windows_visual_selftest", lambda _run_process: {"returnCode": 0, "ok": True}),
+                    mock.patch.object(visual_bridge, "execute_windows_visual_selftest", _windows_helper_selftest_ok),
                     mock.patch.object(visual_bridge, "execute_windows_powershell_visual_preflight", _windows_preflight_ok),
                     mock.patch.object(visual_bridge, "list_browser_profiles", lambda: {"profiles": []}),
                     mock.patch.object(visual_bridge, "execute_list_apps", fake_list_apps),
@@ -2176,19 +3352,29 @@ class WindowsHostBridgeTest(unittest.TestCase):
                 mock.patch.object(probe, "_runtime_blocks", lambda: {tool: {"api": None, "chat": None} for tool in probe.VISUAL_TOOLS}),
                 mock.patch.object(probe, "_shell_probe", lambda _status: {"returnCode": 0, "containsExpected": True}),
                 mock.patch.object(probe.HostBridge, "status", lambda _self: FakeStatus()),
-                mock.patch.object(visual_bridge, "execute_windows_visual_selftest", lambda _run_process: {"returnCode": 0, "ok": True}),
+                mock.patch.object(visual_bridge, "execute_windows_visual_selftest", _windows_helper_selftest_ok),
                 mock.patch.object(visual_bridge, "execute_windows_powershell_visual_preflight", _windows_preflight_ok),
                 mock.patch.object(visual_bridge, "list_browser_profiles", lambda: {"profiles": []}),
                 mock.patch.object(visual_bridge, "execute_list_apps", fake_list_apps),
                 mock.patch.object(visual_bridge, "execute_open_app", fake_open_app),
-                mock.patch.object(visual_bridge, "execute_activate_app", ok_result),
-                mock.patch.object(visual_bridge, "execute_type_text", ok_result),
-                mock.patch.object(visual_bridge, "execute_keypress", ok_result),
+                mock.patch.object(visual_bridge, "execute_activate_app", lambda _args, _run_process: _windows_foreground_activation_ok()),
+                mock.patch.object(visual_bridge, "execute_type_text", lambda args, _run_process: _windows_type_text_ok(str(args.get("text") or ""))),
+                mock.patch.object(visual_bridge, "execute_keypress", lambda args, _run_process: _windows_keypress_ok(args)),
                 mock.patch.object(visual_bridge, "execute_paste_text", ok_result),
+                mock.patch.object(
+                    visual_bridge,
+                    "execute_desktop_snapshot",
+                    lambda _args, _run_process: {
+                        "returnCode": 0,
+                        "refCount": 1,
+                        "snapshot": {"elements": [{"ref": "d1", "role": "Edit", "className": "Edit"}]},
+                    },
+                ),
+                mock.patch.object(visual_bridge, "execute_desktop_act", lambda _args, _run_process: _windows_native_value_pattern_ok()),
                 mock.patch.object(visual_bridge, "execute_scroll", ok_result),
                 mock.patch.object(visual_bridge, "execute_quit_app", ok_result),
                 mock.patch.object(probe, "_set_clipboard_text", lambda _value, _run_process=None: {"returnCode": 0, "verified": True}),
-                mock.patch.object(probe, "_clipboard_round_trip", lambda _expected, _run_process=None: {"returnCode": 0, "containsExpected": False}),
+                mock.patch.object(probe, "_clipboard_round_trip", lambda _expected, _run_process=None: {"returnCode": 0, "containsExpected": False, "verified": False}),
             ):
                 result = probe._live(
                     screenshot=False,
@@ -2225,6 +3411,78 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertEqual(result["error"], "desktop.activate_app failed; refusing to type into an unverified foreground app")
         self.assertIn("quitApp", result)
 
+    def test_windows_interactive_probe_rejects_activation_without_foreground_metadata(self) -> None:
+        probe = _load_windows_probe_module()
+
+        def fake_open_app(_args: dict[str, object], _run_process: object) -> dict[str, object]:
+            return {"returnCode": 0, "processId": 42, "stdout": "", "stderr": ""}
+
+        def wrong_foreground(_args: dict[str, object], _run_process: object) -> dict[str, object]:
+            return {
+                "returnCode": 0,
+                "processId": 42,
+                "activeProcessId": 7,
+                "foreground": False,
+                "stdout": "",
+                "stderr": "",
+            }
+
+        with (
+            mock.patch.object(visual_bridge, "execute_open_app", fake_open_app),
+            mock.patch.object(visual_bridge, "execute_activate_app", wrong_foreground),
+            mock.patch.object(visual_bridge, "execute_type_text", side_effect=AssertionError("should not type into the wrong foreground app")),
+            mock.patch.object(visual_bridge, "execute_quit_app", lambda _args, _run_process: {"returnCode": 0, "quitVerified": True}),
+            mock.patch.object(probe.time, "sleep", lambda _seconds: None),
+        ):
+            result = probe._interactive_desktop_probe()
+
+        self.assertEqual(result["activateAttempts"], 10)
+        self.assertFalse(result["foregroundActivationVerified"])
+        self.assertEqual(result["error"], "desktop.activate_app failed; refusing to type into an unverified foreground app")
+        self.assertIn("quitApp", result)
+
+    def test_windows_interactive_probe_requires_unicode_type_metrics(self) -> None:
+        probe = _load_windows_probe_module()
+
+        def fake_open_app(_args: dict[str, object], _run_process: object) -> dict[str, object]:
+            return {"returnCode": 0, "processId": 42, "stdout": "", "stderr": ""}
+
+        with (
+            mock.patch.object(visual_bridge, "execute_open_app", fake_open_app),
+            mock.patch.object(visual_bridge, "execute_activate_app", lambda _args, _run_process: _windows_foreground_activation_ok()),
+            mock.patch.object(visual_bridge, "execute_type_text", lambda _args, _run_process: {"returnCode": 0, "textBytes": 1, "textCharacters": 1, "textUnits": 1}),
+            mock.patch.object(visual_bridge, "execute_keypress", side_effect=AssertionError("should not continue after Unicode typing proof fails")),
+            mock.patch.object(visual_bridge, "execute_quit_app", lambda _args, _run_process: {"returnCode": 0, "quitVerified": True}),
+            mock.patch.object(probe.time, "sleep", lambda _seconds: None),
+        ):
+            result = probe._interactive_desktop_probe()
+
+        self.assertFalse(result["unicodeTypeVerified"])
+        self.assertEqual(result["error"], "desktop.type did not prove Windows Unicode SendInput text metrics")
+        self.assertIn("quitApp", result)
+
+    def test_windows_interactive_probe_requires_control_a_key_mapping(self) -> None:
+        probe = _load_windows_probe_module()
+
+        def fake_open_app(_args: dict[str, object], _run_process: object) -> dict[str, object]:
+            return {"returnCode": 0, "processId": 42, "stdout": "", "stderr": ""}
+
+        with (
+            mock.patch.object(visual_bridge, "execute_open_app", fake_open_app),
+            mock.patch.object(visual_bridge, "execute_activate_app", lambda _args, _run_process: _windows_foreground_activation_ok()),
+            mock.patch.object(visual_bridge, "execute_type_text", lambda args, _run_process: _windows_type_text_ok(str(args.get("text") or ""))),
+            mock.patch.object(visual_bridge, "execute_keypress", lambda _args, _run_process: {"returnCode": 0, "key": "a", "modifiers": []}),
+            mock.patch.object(visual_bridge, "execute_paste_text", side_effect=AssertionError("should not paste after key mapping proof fails")),
+            mock.patch.object(visual_bridge, "execute_quit_app", lambda _args, _run_process: {"returnCode": 0, "quitVerified": True}),
+            mock.patch.object(probe.time, "sleep", lambda _seconds: None),
+        ):
+            result = probe._interactive_desktop_probe()
+
+        self.assertTrue(result["unicodeTypeVerified"])
+        self.assertFalse(result["selectAllKeypressVerified"])
+        self.assertEqual(result["error"], "desktop.keypress did not prove Windows control+a mapping")
+        self.assertIn("quitApp", result)
+
     def test_windows_interactive_probe_clears_clipboard_before_copyback(self) -> None:
         probe = _load_windows_probe_module()
         events: list[tuple[str, object]] = []
@@ -2237,7 +3495,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
 
         def fake_keypress(args: dict[str, object], _run_process: object) -> dict[str, object]:
             events.append(("key", tuple(args.get("keys") or [])))
-            return {"returnCode": 0, "stdout": "", "stderr": ""}
+            return _windows_keypress_ok(args)
 
         def fake_clear(value: str, _run_process: object = None) -> dict[str, object]:
             events.append(("clear", value))
@@ -2245,14 +3503,38 @@ class WindowsHostBridgeTest(unittest.TestCase):
 
         def fake_round_trip(expected: str, _run_process: object = None) -> dict[str, object]:
             events.append(("roundTrip", expected))
-            return {"returnCode": 0, "containsExpected": True}
+            return {
+                "returnCode": 0,
+                "expected": expected,
+                "containsExpected": True,
+                "verified": True,
+                "textLength": len(expected),
+                "textBytes": len(expected.encode("utf-8")),
+                "expectedLength": len(expected),
+                "expectedBytes": len(expected.encode("utf-8")),
+            }
+
+        def fake_desktop_act(args: dict[str, object], _run_process: object) -> dict[str, object]:
+            events.append(("desktopActRequireNative", args.get("requireNative")))
+            events.append(("desktopActText", args.get("text")))
+            return _windows_native_value_pattern_ok(str(args.get("text") or ""))
 
         with (
             mock.patch.object(visual_bridge, "execute_open_app", fake_open_app),
-            mock.patch.object(visual_bridge, "execute_activate_app", ok_result),
-            mock.patch.object(visual_bridge, "execute_type_text", ok_result),
+            mock.patch.object(visual_bridge, "execute_activate_app", lambda _args, _run_process: _windows_foreground_activation_ok()),
+            mock.patch.object(visual_bridge, "execute_type_text", lambda args, _run_process: _windows_type_text_ok(str(args.get("text") or ""))),
             mock.patch.object(visual_bridge, "execute_keypress", fake_keypress),
             mock.patch.object(visual_bridge, "execute_paste_text", ok_result),
+            mock.patch.object(
+                visual_bridge,
+                "execute_desktop_snapshot",
+                lambda _args, _run_process: {
+                    "returnCode": 0,
+                    "refCount": 1,
+                    "snapshot": {"elements": [{"ref": "d1", "role": "Edit", "className": "Edit"}]},
+                },
+            ),
+            mock.patch.object(visual_bridge, "execute_desktop_act", fake_desktop_act),
             mock.patch.object(visual_bridge, "execute_scroll", ok_result),
             mock.patch.object(visual_bridge, "execute_quit_app", lambda _args, _run_process: {"returnCode": 0, "quitVerified": True}),
             mock.patch.object(probe, "_set_clipboard_text", fake_clear),
@@ -2267,12 +3549,139 @@ class WindowsHostBridgeTest(unittest.TestCase):
             events,
             [
                 ("key", ("control", "a")),
+                ("desktopActRequireNative", True),
+                ("desktopActText", WINDOWS_INTERACTIVE_NATIVE_TEXT),
                 ("key", ("control", "a")),
                 ("clear", "ATRIUM clipboard cleared before copy-back verification"),
                 ("key", ("control", "c")),
-                ("roundTrip", "ATRIUM paste probe ไทย"),
+                ("roundTrip", WINDOWS_INTERACTIVE_NATIVE_TEXT),
             ],
         )
+
+    def test_windows_interactive_probe_requires_desktop_act_ref_path(self) -> None:
+        probe = _load_windows_probe_module()
+
+        def fake_open_app(_args: dict[str, object], _run_process: object) -> dict[str, object]:
+            return {"returnCode": 0, "processId": 42, "stdout": "", "stderr": ""}
+
+        def ok_result(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return {"returnCode": 0, "stdout": "", "stderr": ""}
+
+        with (
+            mock.patch.object(visual_bridge, "execute_open_app", fake_open_app),
+            mock.patch.object(visual_bridge, "execute_activate_app", lambda _args, _run_process: _windows_foreground_activation_ok()),
+            mock.patch.object(visual_bridge, "execute_type_text", lambda args, _run_process: _windows_type_text_ok(str(args.get("text") or ""))),
+            mock.patch.object(visual_bridge, "execute_keypress", lambda args, _run_process: _windows_keypress_ok(args)),
+            mock.patch.object(visual_bridge, "execute_paste_text", ok_result),
+            mock.patch.object(
+                visual_bridge,
+                "execute_desktop_snapshot",
+                lambda _args, _run_process: {
+                    "returnCode": 0,
+                    "refCount": 1,
+                    "snapshot": {"elements": [{"ref": "d1", "role": "Edit", "className": "Edit"}]},
+                },
+            ),
+            mock.patch.object(visual_bridge, "execute_desktop_act", lambda _args, _run_process: {"returnCode": 1, "stderr": "uia failed"}),
+            mock.patch.object(visual_bridge, "execute_scroll", side_effect=AssertionError("should not continue after desktop.act failure")),
+            mock.patch.object(visual_bridge, "execute_quit_app", lambda _args, _run_process: {"returnCode": 0, "quitVerified": True}),
+            mock.patch.object(probe.time, "sleep", lambda _seconds: None),
+        ):
+            result = probe._interactive_desktop_probe()
+
+        self.assertEqual(result["error"], "desktop.act failed to set Notepad text through a snapshot ref")
+        self.assertEqual(result["desktopActSetText"]["returnCode"], 1)
+        self.assertIn("quitApp", result)
+
+    def test_windows_interactive_probe_requires_valuepattern_native_desktop_act(self) -> None:
+        probe = _load_windows_probe_module()
+
+        def fake_open_app(_args: dict[str, object], _run_process: object) -> dict[str, object]:
+            return {"returnCode": 0, "processId": 42, "stdout": "", "stderr": ""}
+
+        def ok_result(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return {"returnCode": 0, "stdout": "", "stderr": ""}
+
+        with (
+            mock.patch.object(visual_bridge, "execute_open_app", fake_open_app),
+            mock.patch.object(visual_bridge, "execute_activate_app", lambda _args, _run_process: _windows_foreground_activation_ok()),
+            mock.patch.object(visual_bridge, "execute_type_text", lambda args, _run_process: _windows_type_text_ok(str(args.get("text") or ""))),
+            mock.patch.object(visual_bridge, "execute_keypress", lambda args, _run_process: _windows_keypress_ok(args)),
+            mock.patch.object(visual_bridge, "execute_paste_text", ok_result),
+            mock.patch.object(
+                visual_bridge,
+                "execute_desktop_snapshot",
+                lambda _args, _run_process: {
+                    "returnCode": 0,
+                    "refCount": 1,
+                    "snapshot": {"elements": [{"ref": "d1", "role": "Edit", "className": "Edit"}]},
+                },
+            ),
+            mock.patch.object(
+                visual_bridge,
+                "execute_desktop_act",
+                lambda _args, _run_process: {
+                    "returnCode": 0,
+                    "usedNativeAction": True,
+                    "nativeAttempt": {
+                        "returnCode": 0,
+                        "method": "uia",
+                        "inputMethod": "uia",
+                        "nativeAction": "SendInput",
+                        "ok": True,
+                    },
+                },
+            ),
+            mock.patch.object(visual_bridge, "execute_scroll", side_effect=AssertionError("should not continue after non-ValuePattern native proof")),
+            mock.patch.object(visual_bridge, "execute_quit_app", lambda _args, _run_process: {"returnCode": 0, "quitVerified": True}),
+            mock.patch.object(probe.time, "sleep", lambda _seconds: None),
+        ):
+            result = probe._interactive_desktop_probe()
+
+        self.assertEqual(result["error"], "desktop.act did not prove Notepad ValuePattern native UIAutomation action")
+        self.assertFalse(result["nativeActionVerified"])
+        self.assertIn("quitApp", result)
+
+    def test_windows_interactive_probe_requires_valuepattern_text_snapshot(self) -> None:
+        probe = _load_windows_probe_module()
+
+        def fake_open_app(_args: dict[str, object], _run_process: object) -> dict[str, object]:
+            return {"returnCode": 0, "processId": 42, "stdout": "", "stderr": ""}
+
+        def ok_result(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return {"returnCode": 0, "stdout": "", "stderr": ""}
+
+        def fake_desktop_act(_args: dict[str, object], _run_process: object) -> dict[str, object]:
+            result = _windows_native_value_pattern_ok("ATRIUM paste probe ไทย")
+            result["after"]["snapshot"]["elements"][0]["value"] = "ATRIUM paste probe ไทย"
+            return result
+
+        with (
+            mock.patch.object(visual_bridge, "execute_open_app", fake_open_app),
+            mock.patch.object(visual_bridge, "execute_activate_app", lambda _args, _run_process: _windows_foreground_activation_ok()),
+            mock.patch.object(visual_bridge, "execute_type_text", lambda args, _run_process: _windows_type_text_ok(str(args.get("text") or ""))),
+            mock.patch.object(visual_bridge, "execute_keypress", lambda args, _run_process: _windows_keypress_ok(args)),
+            mock.patch.object(visual_bridge, "execute_paste_text", ok_result),
+            mock.patch.object(
+                visual_bridge,
+                "execute_desktop_snapshot",
+                lambda _args, _run_process: {
+                    "returnCode": 0,
+                    "refCount": 1,
+                    "snapshot": {"elements": [{"ref": "d1", "role": "Edit", "className": "Edit"}]},
+                },
+            ),
+            mock.patch.object(visual_bridge, "execute_desktop_act", fake_desktop_act),
+            mock.patch.object(visual_bridge, "execute_scroll", side_effect=AssertionError("should not continue after missing native text proof")),
+            mock.patch.object(visual_bridge, "execute_quit_app", lambda _args, _run_process: {"returnCode": 0, "quitVerified": True}),
+            mock.patch.object(probe.time, "sleep", lambda _seconds: None),
+        ):
+            result = probe._interactive_desktop_probe()
+
+        self.assertEqual(result["error"], "desktop.snapshot did not confirm Notepad text after ValuePattern native UIAutomation action")
+        self.assertTrue(result["nativeActionVerified"])
+        self.assertFalse(result["nativeValueVerified"])
+        self.assertIn("quitApp", result)
 
     def test_windows_probe_full_option_expands_live_parity_checks(self) -> None:
         probe = _load_windows_probe_module()
@@ -2319,6 +3728,64 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertEqual(exit_code, 0)
         self.assertEqual(captured["browser_url"], "https://local.test")
 
+    def test_windows_probe_output_writes_stamped_json_artifact(self) -> None:
+        probe = _load_windows_probe_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "nested" / "windows.json"
+            with (
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    ["windows_host_bridge_probe.py", "--simulate", "--parity-run-id", "test-run-1", "--output", str(output_path)],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                exit_code = probe.main()
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(payload["schemaVersion"], 1)
+        self.assertEqual(payload["mode"], "simulate")
+        self.assertEqual(payload["parityRunId"], "test-run-1")
+        self.assertRegex(payload["source"]["sourceFingerprint"], r"^[0-9a-f]{64}$")
+        self.assertTrue(payload["source"]["files"]["system/app/host_bridge_proof.py"]["present"])
+
+    def test_windows_probe_refuses_source_fingerprint_mismatch_before_probe(self) -> None:
+        probe = _load_windows_probe_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            output_path = Path(tmp) / "windows.json"
+            source = {
+                "sourceFingerprint": "a" * 64,
+                "gitHead": "b" * 40,
+                "gitDirty": False,
+                "files": {"system/app/host_bridge_proof.py": {"present": True}},
+            }
+            with (
+                mock.patch.object(probe, "host_bridge_source_provenance", lambda _root: source),
+                mock.patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "windows_host_bridge_probe.py",
+                        "--simulate",
+                        "--expect-source-fingerprint",
+                        "f" * 64,
+                        "--parity-run-id",
+                        "test-run-1",
+                        "--output",
+                        str(output_path),
+                    ],
+                ),
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                exit_code = probe.main()
+            payload = json.loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(payload["mode"], "source_preflight_failed")
+        self.assertEqual(payload["parityRunId"], "test-run-1")
+        self.assertIn("source fingerprint mismatch", " ".join(payload["sourcePreflight"]["findings"]))
+
     def test_windows_probe_fails_when_visual_helper_selftest_fails(self) -> None:
         probe = _load_windows_probe_module()
 
@@ -2355,7 +3822,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["checks"]["helperSelftest"]["stderr"], "helper failed")
 
-    def test_windows_probe_fails_notification_without_show_metadata(self) -> None:
+    def test_windows_probe_requires_dpi_and_virtual_screen_metadata(self) -> None:
         probe = _load_windows_probe_module()
 
         class FakeStatus:
@@ -2374,6 +3841,94 @@ class WindowsHostBridgeTest(unittest.TestCase):
                 mock.patch.object(probe, "_shell_probe", lambda _status: {"returnCode": 0, "containsExpected": True}),
                 mock.patch.object(probe.HostBridge, "status", lambda _self: FakeStatus()),
                 mock.patch.object(visual_bridge, "execute_windows_visual_selftest", lambda _run_process: {"returnCode": 0, "ok": True}),
+                mock.patch.object(visual_bridge, "execute_windows_powershell_visual_preflight", lambda _run_process: {"returnCode": 0, "ok": True, "checks": {}}),
+                mock.patch.object(visual_bridge, "list_browser_profiles", lambda: {"profiles": []}),
+                mock.patch.object(visual_bridge, "execute_list_apps", fake_list_apps),
+            ):
+                result = probe._live(
+                    screenshot=False,
+                    notification=False,
+                    browser_url=None,
+                    browser_profile="atrium",
+                    interactive=False,
+                )
+        finally:
+            sys.platform = original_platform
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["checks"]["windowsVisualProof"]["dpiAwareness"])
+        self.assertFalse(result["checks"]["windowsVisualProof"]["virtualScreen"])
+
+    def test_windows_live_probe_skips_interactive_when_runtime_blocks_desktop_writes(self) -> None:
+        probe = _load_windows_probe_module()
+
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {"browserBridge": True, "desktopBridge": True}
+
+        def fake_list_apps(_args: dict[str, object], _run_process: object) -> dict[str, object]:
+            return {"returnCode": 0, "running": [], "installed": []}
+
+        def fail_interactive(*_args: object, **_kwargs: object) -> dict[str, object]:
+            raise AssertionError("interactive probe should be skipped when runtime readiness blocks desktop writes")
+
+        original_platform = sys.platform
+        try:
+            sys.platform = "win32"
+            with (
+                mock.patch.object(probe, "_routes", lambda: {tool: {"blockReason": None} for tool in probe.VISUAL_TOOLS}),
+                mock.patch.object(
+                    probe,
+                    "_runtime_blocks",
+                    lambda: {
+                        **{tool: {"api": None, "chat": None} for tool in probe.VISUAL_TOOLS},
+                        "desktop.act": {"api": "interactive desktop session unavailable", "chat": None},
+                        "desktop.activate_app": {"api": "interactive desktop session unavailable", "chat": None},
+                    },
+                ),
+                mock.patch.object(probe, "_shell_probe", lambda _status: {"returnCode": 0, "containsExpected": True}),
+                mock.patch.object(probe.HostBridge, "status", lambda _self: FakeStatus()),
+                mock.patch.object(visual_bridge, "execute_windows_visual_selftest", _windows_helper_selftest_ok),
+                mock.patch.object(visual_bridge, "execute_windows_powershell_visual_preflight", _windows_preflight_ok),
+                mock.patch.object(visual_bridge, "list_browser_profiles", lambda: {"profiles": []}),
+                mock.patch.object(visual_bridge, "execute_list_apps", fake_list_apps),
+                mock.patch.object(visual_bridge, "execute_desktop_snapshot", lambda _args, _run_process: {"returnCode": 0, "refCount": 1}),
+                mock.patch.object(probe, "_interactive_desktop_probe", fail_interactive),
+            ):
+                result = probe._live(
+                    screenshot=False,
+                    notification=False,
+                    browser_url=None,
+                    browser_profile="atrium",
+                    interactive=True,
+                )
+        finally:
+            sys.platform = original_platform
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["checks"]["interactiveSkipped"]["skipped"])
+        self.assertIn("desktop.act", result["checks"]["interactiveSkipped"]["blockedTools"])
+        self.assertTrue(result["checks"]["interactiveDesktop"]["skipped"])
+
+    def test_windows_probe_fails_notification_without_show_metadata(self) -> None:
+        probe = _load_windows_probe_module()
+
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {"browserBridge": True, "desktopBridge": True}
+
+        def fake_list_apps(_args: dict[str, object], _run_process: object) -> dict[str, object]:
+            return {"returnCode": 0, "running": [], "installed": []}
+
+        original_platform = sys.platform
+        try:
+            sys.platform = "win32"
+            with (
+                mock.patch.object(probe, "_routes", lambda: {tool: {"blockReason": None} for tool in probe.VISUAL_TOOLS}),
+                mock.patch.object(probe, "_runtime_blocks", lambda: {tool: {"api": None, "chat": None} for tool in probe.VISUAL_TOOLS}),
+                mock.patch.object(probe, "_shell_probe", lambda _status: {"returnCode": 0, "containsExpected": True}),
+                mock.patch.object(probe.HostBridge, "status", lambda _self: FakeStatus()),
+                mock.patch.object(visual_bridge, "execute_windows_visual_selftest", _windows_helper_selftest_ok),
                 mock.patch.object(visual_bridge, "execute_windows_powershell_visual_preflight", _windows_preflight_ok),
                 mock.patch.object(visual_bridge, "list_browser_profiles", lambda: {"profiles": []}),
                 mock.patch.object(visual_bridge, "execute_list_apps", fake_list_apps),
@@ -2410,7 +3965,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
                 mock.patch.object(probe, "_runtime_blocks", lambda: {tool: {"api": None, "chat": None} for tool in probe.VISUAL_TOOLS}),
                 mock.patch.object(probe, "_shell_probe", lambda _status: {"returnCode": 0, "containsExpected": True}),
                 mock.patch.object(probe.HostBridge, "status", lambda _self: FakeStatus()),
-                mock.patch.object(visual_bridge, "execute_windows_visual_selftest", lambda _run_process: {"returnCode": 0, "ok": True}),
+                mock.patch.object(visual_bridge, "execute_windows_visual_selftest", _windows_helper_selftest_ok),
                 mock.patch.object(visual_bridge, "execute_windows_powershell_visual_preflight", lambda _run_process: {"returnCode": 0, "ok": False, "checks": {"drawing": False}}),
                 mock.patch.object(visual_bridge, "list_browser_profiles", lambda: {"profiles": []}),
                 mock.patch.object(visual_bridge, "execute_list_apps", fake_list_apps),
@@ -2444,7 +3999,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
                 mock.patch.object(probe, "_runtime_blocks", lambda: {tool: {"api": None, "chat": None} for tool in probe.VISUAL_TOOLS}),
                 mock.patch.object(probe, "_shell_probe", lambda _status: {"returnCode": 0, "containsExpected": True}),
                 mock.patch.object(probe.HostBridge, "status", lambda _self: FakeStatus()),
-                mock.patch.object(visual_bridge, "execute_windows_visual_selftest", lambda _run_process: {"returnCode": 0, "ok": True}),
+                mock.patch.object(visual_bridge, "execute_windows_visual_selftest", _windows_helper_selftest_ok),
                 mock.patch.object(visual_bridge, "execute_windows_powershell_visual_preflight", _windows_preflight_ok),
                 mock.patch.object(visual_bridge, "list_browser_profiles", lambda: {"profiles": []}),
                 mock.patch.object(visual_bridge, "execute_list_apps", lambda _args, _run_process: {"returnCode": None, "timeout": True}),

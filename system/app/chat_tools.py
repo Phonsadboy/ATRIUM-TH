@@ -13,6 +13,7 @@ import json
 import locale
 import os
 import re
+import secrets
 import signal
 import shutil
 import subprocess
@@ -59,8 +60,12 @@ from .tools.host_bridge import HostBridge
 from .tools.visual_bridge import (
     browser_profile_from_args,
     execute_activate_app,
+    execute_browser_act,
     execute_browser_open,
+    execute_browser_snapshot,
     execute_click,
+    execute_desktop_act,
+    execute_desktop_snapshot,
     execute_keypress as execute_visual_keypress,
     execute_list_apps,
     execute_notification,
@@ -318,6 +323,22 @@ def _redact_telegram_gateway_args(args: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _redact_telegram_gateway_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in {"botToken", "bot_token", "telegramBotToken", "telegram_bot_token"} and item:
+                out[key] = "[redacted-telegram-bot-token]"
+            else:
+                out[key] = _redact_telegram_gateway_payload(item)
+        return out
+    if isinstance(value, list):
+        return [_redact_telegram_gateway_payload(item) for item in value]
+    if isinstance(value, str):
+        return _redact_telegram_token_text(value)
+    return value
+
+
 def _is_provider_env_api_call(tool: str, args: dict[str, Any]) -> bool:
     if tool != "call_atrium_api":
         return False
@@ -420,9 +441,13 @@ def chat_tool_system_instructions(departments: list[dict[str, Any]], active_dept
         "Before calling update_provider_env_settings, get explicit approval in normal chat for the exact provider/env key changes; "
         "a current user message that directly asks you to set or unset those keys counts as approval. Do not use the approval drawer for this. "
         "Never paste or log credential values in visible chat; after the tool runs, summarize only the keys changed/unset and runtime effect. "
-        "When the user sends a Telegram bot token or asks to connect Telegram, call connect_telegram_gateway as the executive. "
+        "When the user sends a Telegram bot token or asks to connect Telegram, use connect_telegram_gateway as the executive after setup choices are clear. "
         "Treat Telegram bot tokens as credentials: pass the token only as a tool argument, never repeat it in visible chat, logs, artifacts, or summaries. "
-        "If a Telegram gateway URL is configured or provided, connect it; otherwise verify and store the token as local gateway auth and explain the missing gateway URL as the next operational step. "
+        "Use the owner-approved Telegram defaults unless the owner asks otherwise: deliveryMode='polling', pollingIntervalS=5, pollingBurstIntervalS=2, pollingBurstWindowS=120, dmPolicy='pairing', groupPolicy='configured', groupRequireMention=true. "
+        "When Telegram DM pairing is pending, approve the code through connect_telegram_gateway action='approve_pairing' after the owner confirms it. "
+        "If the owner asks to change Telegram defaults, ask concise setup choices before calling the tool. "
+        "Prefer storing Telegram channel policy through connect_telegram_gateway instead of asking the user to edit .env. "
+        "If a Telegram gateway URL is configured or provided, connect it; otherwise verify and store the token as local gateway auth. "
         "Executive and departments each have separate user-visible chat rooms. Do not assume another room's transcript is in your prompt. "
         "Before deciding whether another agent is idle, busy, processing, or blocked, call list_agent_statuses. "
         "To wake, ping, or casually talk to another department/executive agent, call nudge_agent; it writes a visible message into that agent's room and can queue the target to answer when the engine is enabled. "
@@ -452,6 +477,8 @@ def chat_tool_system_instructions(departments: list[dict[str, Any]], active_dept
         "For local files or chat attachment artifacts that you need to inspect more deeply, use open_local_file with a path or artifactId; "
         "it imports host files as durable artifacts and returns image pixels to the next model turn when possible. "
         "For visual browser or desktop work, call browser.profiles when profile context matters; use profile='atrium' (aliases own/agent/system) for ATRIUM's isolated browser profile and profile='user' only when an existing user login/session is needed. "
+        "For JS-heavy web UI flows in an isolated profile, prefer browser.snapshot to get DOM refs and browser.act to click/fill/type/press by ref or selector before falling back to coordinate clicks. "
+        "For native desktop apps, prefer desktop.snapshot to get fresh accessibility/UIA refs and desktop.act to act by ref when available; choose refs whose supportedActions include the needed action, prefer nativeActionable refs when available, set requireNative=true when the task must prove semantic Accessibility/UIAutomation control instead of coordinate fallback, and use screenshot coordinates when accessibility refs are missing or visual pixels matter. "
         "For shell.exec through run_owner_tool, args.command must always be a JSON string array such as "
         "{\"command\":[\"/bin/bash\",\"-lc\",\"cd /tmp && find . -name '*.mp4' | head\"]}; never pass command as one string. "
         "Prefer args.cwd instead of a shell cd; use /bin/bash -lc on Unix/macOS or PowerShell on Windows only when you need shell syntax like pipes, &&, globs, or redirection. "
@@ -464,8 +491,8 @@ def chat_tool_system_instructions(departments: list[dict[str, Any]], active_dept
         "Do not fake backgrounding with nohup, setsid, disown, or shell ampersands. "
         "Background shell runs return a toolRun id and log paths immediately, and you should report those handles instead of waiting for completion. "
         "For native desktop app work, use desktop.apps to find the target, desktop.open_app to launch it, desktop.activate_app before controlling it, and desktop.quit_app only when the user asked to close it or the workflow is complete. "
-        "On Windows, prefer processId from desktop.apps or desktop.open_app for desktop.activate_app and desktop.quit_app when it is available, so you do not target unrelated same-name apps. "
-        "Take a browser.screenshot or desktop.screenshot first, then click coordinates, paste/type text, scroll when needed, and take another screenshot after UI-changing actions. "
+        "Prefer processId from desktop.apps, desktop.snapshot, or desktop.open_app for desktop.activate_app and desktop.quit_app when it is available, so you do not target unrelated same-name apps or stale app instances. "
+        "Use browser.screenshot or desktop.screenshot when pixels, images, layout, login/user-profile state, or native desktop UI matters; then click coordinates, paste/type text, scroll when needed, and take another screenshot after UI-changing actions. "
         "Screenshot tools return durable image artifacts so the next model turn can inspect the pixels when the provider supports image inputs. "
         "For internet research, prefer web.search for fast ranked results and web.fetch for readable page text plus image/link URLs. "
         "Use browser.open plus browser.screenshot for JS-heavy pages, login/session pages, Google-style interactive search pages, or when the user needs visual inspection of images. "
@@ -661,16 +688,17 @@ def chat_tool_definitions(departments: list[dict[str, Any]], active_dept: dict[s
             "name": "connect_telegram_gateway",
             "description": (
                 "Executive-only Telegram gateway setup. Use immediately when the owner sends a Telegram bot token "
-                "or asks to connect Telegram. Verifies the bot token with Telegram, optionally forwards it to a "
-                "configured gateway, and stores only redacted public status plus a local secret auth file."
+                "or asks to connect Telegram. Verifies the bot token with Telegram, configures the local channel "
+                "gateway policy/routing, optionally forwards it to an external gateway, and stores only redacted "
+                "public status plus a local secret auth file."
             ),
             "input_schema": {
                 "type": "object",
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["connect", "status", "disconnect"],
-                        "description": "Default connect. Use status to inspect redacted gateway state; disconnect removes local auth.",
+                        "enum": ["connect", "status", "disconnect", "approve_pairing"],
+                        "description": "Default connect. Use status to inspect redacted gateway state; approve_pairing authorizes a pending DM pairing code; disconnect removes local auth.",
                     },
                     "botToken": {
                         "type": "string",
@@ -692,6 +720,63 @@ def chat_tool_definitions(departments: list[dict[str, Any]], active_dept: dict[s
                     "defaultThreadId": {
                         "type": "string",
                         "description": "Default ATRIUM thread for Telegram messages. Defaults to executive.",
+                    },
+                    "dmPolicy": {
+                        "type": "string",
+                        "enum": ["pairing", "allowlist", "open", "disabled"],
+                        "description": "DM access policy. pairing/allowlist require numeric Telegram user IDs in allowFrom; open allows any DM.",
+                    },
+                    "allowFrom": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Numeric Telegram user IDs allowed to DM the executive/main thread. Do not use @usernames.",
+                    },
+                    "pairingCode": {
+                        "type": "string",
+                        "description": "Pending Telegram pairing code from a DM user, e.g. TG-ABC123. Required for action=approve_pairing.",
+                    },
+                    "userId": {
+                        "type": "string",
+                        "description": "Optional numeric Telegram user ID for action=approve_pairing. Defaults to the user recorded with pairingCode.",
+                    },
+                    "groupPolicy": {
+                        "type": "string",
+                        "enum": ["configured", "open", "disabled"],
+                        "description": "Group access policy. configured requires groups JSON/bindings; open can use default group routing.",
+                    },
+                    "groupAllowFrom": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional numeric Telegram user IDs allowed to speak in configured groups.",
+                    },
+                    "groupRequireMention": {
+                        "type": "boolean",
+                        "description": "Default true. In groups, only route messages that mention the bot unless a group binding overrides it.",
+                    },
+                    "groups": {
+                        "type": "object",
+                        "description": "Optional group bindings by numeric chat id, e.g. {'-100123': {'threadId':'executive','requireMention':true}}.",
+                    },
+                    "deliveryMode": {
+                        "type": "string",
+                        "enum": ["polling", "webhook"],
+                        "description": "How ATRIUM receives Telegram updates. Ask the owner first when not specified. polling is easiest for local use; webhook is for public HTTPS deployments.",
+                    },
+                    "pollingIntervalS": {
+                        "type": "number",
+                        "description": "Normal polling cadence in seconds. Owner default: 5.",
+                    },
+                    "pollingBurstIntervalS": {
+                        "type": "number",
+                        "description": "Polling cadence after recent Telegram activity. Owner default: 2.",
+                    },
+                    "pollingBurstWindowS": {
+                        "type": "number",
+                        "description": "How long to keep burst polling after recent activity. Owner default: 120.",
+                    },
+                    "webhookSecret": {
+                        "type": "string",
+                        "description": "Optional Telegram webhook secret token. Stored only in local auth; never exposed in public status.",
                     },
                     "agentSwitchingEnabled": {
                         "type": "boolean",
@@ -2027,6 +2112,17 @@ def _telegram_write_auth_file(payload: dict[str, Any]) -> str:
     return str(path)
 
 
+def _telegram_read_auth_file() -> dict[str, Any]:
+    path = _telegram_auth_path()
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8") or "{}")
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _telegram_remove_auth_file() -> bool:
     path = _telegram_auth_path()
     if not path.exists():
@@ -2128,6 +2224,18 @@ def _telegram_public_gateway_record(
     public_base_url: str = "",
     default_thread_id: str = "executive",
     agent_switching_enabled: bool = True,
+    dm_policy: str = "pairing",
+    allow_from: list[str] | None = None,
+    group_policy: str = "configured",
+    group_allow_from: list[str] | None = None,
+    group_require_mention: bool = True,
+    groups: dict[str, Any] | None = None,
+    delivery_mode: str = "polling",
+    polling_enabled: bool = True,
+    polling_interval_s: float = 5.0,
+    polling_burst_interval_s: float = 2.0,
+    polling_burst_window_s: float = 120.0,
+    webhook_configured: bool = False,
     requested_by: str = "executive",
     extra: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -2144,6 +2252,18 @@ def _telegram_public_gateway_record(
         "defaultThreadId": default_thread_id or "executive",
         "defaultDepartmentId": EXEC_ID,
         "agentSwitchingEnabled": agent_switching_enabled,
+        "dmPolicy": dm_policy,
+        "allowFrom": list(allow_from or []),
+        "groupPolicy": group_policy,
+        "groupAllowFrom": list(group_allow_from or []),
+        "groupRequireMention": group_require_mention,
+        "groups": groups or {},
+        "deliveryMode": delivery_mode,
+        "pollingEnabled": polling_enabled,
+        "pollingIntervalS": polling_interval_s,
+        "pollingBurstIntervalS": polling_burst_interval_s,
+        "pollingBurstWindowS": polling_burst_window_s,
+        "webhookConfigured": webhook_configured,
         "commands": ["/agents", "/use <agent>", "/executive", "/status"],
         "bot": {
             "id": bot.get("id"),
@@ -2161,6 +2281,39 @@ def _telegram_public_gateway_record(
     return record
 
 
+def _telegram_config_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple, set)):
+        raw = value
+    else:
+        raw = re.split(r"[,;\s]+", str(value or ""))
+    out: list[str] = []
+    for item in raw:
+        text = str(item or "").strip().removeprefix("telegram:").removeprefix("tg:")
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def _telegram_config_object(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return {}
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _telegram_policy(value: Any, *, allowed: set[str], default: str) -> str:
+    text = str(value or default).strip().lower()
+    return text if text in allowed else default
+
+
 async def _connect_telegram_gateway_tool(
     repo: Repo,
     args: dict[str, Any],
@@ -2176,19 +2329,20 @@ async def _connect_telegram_gateway_tool(
             "summary": "Telegram gateway connection is executive-only; ask the executive to run it.",
         }
 
-    action = str(args.get("action") or "connect").strip().lower()
+    action = str(args.get("action") or "connect").strip().lower().replace("-", "_")
     settings = get_settings()
     existing = await repo.get_entity("telegram_gateway", "default")
     if action == "status":
+        gateway = _redact_telegram_gateway_payload(existing) if existing else _telegram_public_gateway_record(
+            status="not_configured",
+            connected=False,
+            requested_by=requested_by,
+        )
         return {
             "ok": True,
             "tool": "connect_telegram_gateway",
             "summary": (existing or {}).get("status") or "telegram gateway is not configured",
-            "gateway": existing or _telegram_public_gateway_record(
-                status="not_configured",
-                connected=False,
-                requested_by=requested_by,
-            ),
+            "gateway": gateway,
         }
     if action == "disconnect":
         removed = _telegram_remove_auth_file()
@@ -2211,8 +2365,102 @@ async def _connect_telegram_gateway_tool(
             "summary": "telegram gateway disconnected",
             "gateway": record,
         }
+    if action == "approve_pairing":
+        pairing_code = str(
+            args.get("pairingCode")
+            or args.get("pairing_code")
+            or args.get("code")
+            or ""
+        ).strip().upper()
+        if not pairing_code:
+            raise ValueError("pairingCode is required for Telegram pairing approval")
+        pairing = await repo.get_entity("telegram_pairing", pairing_code)
+        if not isinstance(pairing, dict):
+            raise ValueError(f"Telegram pairing code not found: {pairing_code}")
+        user_id = str(
+            args.get("userId")
+            or args.get("user_id")
+            or pairing.get("userId")
+            or ""
+        ).strip().removeprefix("telegram:").removeprefix("tg:")
+        if not user_id:
+            raise ValueError("Telegram pairing approval is missing userId")
+        auth = _telegram_read_auth_file()
+        if not auth.get("botToken"):
+            raise ValueError("Telegram gateway auth is not configured; connect the bot token first")
+        allow_from = _telegram_config_list(auth.get("allowFrom"))
+        if user_id not in allow_from:
+            allow_from.append(user_id)
+        auth["allowFrom"] = allow_from
+        auth["dmPolicy"] = _telegram_policy(
+            auth.get("dmPolicy") or (existing or {}).get("dmPolicy"),
+            allowed={"pairing", "allowlist", "open", "disabled"},
+            default="pairing",
+        )
+        auth["pairingApprovedAt"] = now_ms()
+        auth["pairingApprovedBy"] = requested_by
+        _telegram_write_auth_file(auth)
+        now = now_ms()
+        record = _redact_telegram_gateway_payload(existing) if isinstance(existing, dict) and existing else _telegram_public_gateway_record(
+            status="token_verified_local_auth",
+            connected=bool(auth.get("gatewayUrl")),
+            bot=auth.get("bot") if isinstance(auth.get("bot"), dict) else {},
+            token_fingerprint=auth.get("token") if isinstance(auth.get("token"), dict) else {},
+            mode="gateway" if auth.get("gatewayUrl") else "local",
+            gateway_url=str(auth.get("gatewayUrl") or ""),
+            public_base_url=str(auth.get("publicBaseUrl") or ""),
+            default_thread_id=str(auth.get("defaultThreadId") or "executive"),
+            agent_switching_enabled=_tool_bool(auth.get("agentSwitchingEnabled"), default=True),
+            dm_policy=str(auth.get("dmPolicy") or "pairing"),
+            allow_from=allow_from,
+            group_policy=str(auth.get("groupPolicy") or "configured"),
+            group_allow_from=_telegram_config_list(auth.get("groupAllowFrom")),
+            group_require_mention=_tool_bool(auth.get("groupRequireMention"), default=True),
+            groups=_telegram_config_object(auth.get("groups")),
+            delivery_mode=str(auth.get("deliveryMode") or "polling"),
+            polling_enabled=_tool_bool(auth.get("pollingEnabled"), default=True),
+            polling_interval_s=float(auth.get("pollingIntervalS") or 5.0),
+            polling_burst_interval_s=float(auth.get("pollingBurstIntervalS") or 2.0),
+            polling_burst_window_s=float(auth.get("pollingBurstWindowS") or 120.0),
+            webhook_configured=bool(auth.get("webhookSecret")),
+            requested_by=requested_by,
+        )
+        record = {
+            **record,
+            "dmPolicy": auth["dmPolicy"],
+            "allowFrom": allow_from,
+            "updatedAt": now,
+            "updatedBy": requested_by,
+            "secretStored": _telegram_auth_path().exists(),
+        }
+        await repo.put_entity("telegram_gateway", record, dept=EXEC_ID, status=str(record.get("status") or "token_verified_local_auth"), ts=now)
+        pairing_record = {
+            **pairing,
+            "status": "approved",
+            "approvedAt": now,
+            "approvedBy": requested_by,
+            "approvedUserId": user_id,
+        }
+        await repo.put_entity("telegram_pairing", pairing_record, dept=EXEC_ID, status="approved", ts=now)
+        await repo.add_activity(_activity(
+            f"Telegram DM pairing approved for user {user_id}",
+            type_="system",
+            department_id=EXEC_ID,
+            severity="good",
+        ))
+        return {
+            "ok": True,
+            "tool": "connect_telegram_gateway",
+            "summary": f"telegram pairing {pairing_code} approved",
+            "gateway": record,
+            "pairing": {
+                "id": pairing_code,
+                "status": "approved",
+                "userId": user_id,
+            },
+        }
     if action != "connect":
-        raise ValueError("action must be connect, status, or disconnect")
+        raise ValueError("action must be connect, status, approve_pairing, or disconnect")
 
     bot_token = str(_first_arg(args, "botToken", "bot_token", "token", "telegramBotToken", "telegram_bot_token") or "").strip()
     if not bot_token:
@@ -2240,6 +2488,35 @@ async def _connect_telegram_gateway_tool(
         args.get("agentSwitchingEnabled") if "agentSwitchingEnabled" in args else args.get("agent_switching_enabled"),
         default=True,
     )
+    dm_policy = _telegram_policy(
+        args.get("dmPolicy") or args.get("dm_policy"),
+        allowed={"pairing", "allowlist", "open", "disabled"},
+        default="pairing",
+    )
+    allow_from = _telegram_config_list(args.get("allowFrom") if "allowFrom" in args else args.get("allow_from"))
+    group_policy = _telegram_policy(
+        args.get("groupPolicy") or args.get("group_policy"),
+        allowed={"configured", "open", "disabled"},
+        default="configured",
+    )
+    group_allow_from = _telegram_config_list(
+        args.get("groupAllowFrom") if "groupAllowFrom" in args else args.get("group_allow_from")
+    )
+    group_require_mention = _tool_bool(
+        args.get("groupRequireMention") if "groupRequireMention" in args else args.get("group_require_mention"),
+        default=True,
+    )
+    groups = _telegram_config_object(args.get("groups") if "groups" in args else args.get("telegramGroups") or args.get("telegram_groups"))
+    delivery_mode = str(args.get("deliveryMode") or args.get("delivery_mode") or "").strip().lower()
+    if delivery_mode not in {"polling", "webhook"}:
+        delivery_mode = "polling"
+    webhook_secret = str(args.get("webhookSecret") or args.get("webhook_secret") or "").strip()
+    if delivery_mode == "webhook" and not webhook_secret:
+        webhook_secret = secrets.token_urlsafe(32)
+    polling_enabled = delivery_mode == "polling"
+    polling_interval_s = float(args.get("pollingIntervalS") or args.get("polling_interval_s") or 5.0)
+    polling_burst_interval_s = float(args.get("pollingBurstIntervalS") or args.get("polling_burst_interval_s") or 2.0)
+    polling_burst_window_s = float(args.get("pollingBurstWindowS") or args.get("polling_burst_window_s") or 120.0)
     token_fingerprint = _telegram_token_fingerprint(bot_token)
 
     gateway_result: dict[str, Any] | None = None
@@ -2252,6 +2529,18 @@ async def _connect_telegram_gateway_tool(
             "defaultThreadId": default_thread_id,
             "defaultDepartmentId": EXEC_ID,
             "agentSwitchingEnabled": agent_switching,
+            "dmPolicy": dm_policy,
+            "allowFrom": allow_from,
+            "groupPolicy": group_policy,
+            "groupAllowFrom": group_allow_from,
+            "groupRequireMention": group_require_mention,
+            "groups": groups,
+            "deliveryMode": delivery_mode,
+            "pollingEnabled": polling_enabled,
+            "pollingIntervalS": polling_interval_s,
+            "pollingBurstIntervalS": polling_burst_interval_s,
+            "pollingBurstWindowS": polling_burst_window_s,
+            "webhookConfigured": bool(delivery_mode == "webhook"),
             "commands": ["/agents", "/use <agent>", "/executive", "/status"],
             "atriumPublicBaseUrl": public_base_url,
             "bot": {
@@ -2270,6 +2559,7 @@ async def _connect_telegram_gateway_tool(
             bot_token=bot_token,
             payload=gateway_payload,
         )
+        gateway_result = _redact_telegram_gateway_payload(gateway_result)
         connected = True
         status = "gateway_connected"
     elif mode == "gateway":
@@ -2284,6 +2574,18 @@ async def _connect_telegram_gateway_tool(
         "defaultThreadId": default_thread_id,
         "defaultDepartmentId": EXEC_ID,
         "agentSwitchingEnabled": agent_switching,
+        "dmPolicy": dm_policy,
+        "allowFrom": allow_from,
+        "groupPolicy": group_policy,
+        "groupAllowFrom": group_allow_from,
+        "groupRequireMention": group_require_mention,
+        "groups": groups,
+        "deliveryMode": delivery_mode,
+        "pollingEnabled": polling_enabled,
+        "pollingIntervalS": polling_interval_s,
+        "pollingBurstIntervalS": polling_burst_interval_s,
+        "pollingBurstWindowS": polling_burst_window_s,
+        "webhookSecret": webhook_secret,
         "connectedAt": now_ms(),
         "connectedBy": requested_by,
     })
@@ -2297,6 +2599,18 @@ async def _connect_telegram_gateway_tool(
         public_base_url=public_base_url,
         default_thread_id=default_thread_id,
         agent_switching_enabled=agent_switching,
+        dm_policy=dm_policy,
+        allow_from=allow_from,
+        group_policy=group_policy,
+        group_allow_from=group_allow_from,
+        group_require_mention=group_require_mention,
+        groups=groups,
+        delivery_mode=delivery_mode,
+        polling_enabled=polling_enabled,
+        polling_interval_s=polling_interval_s,
+        polling_burst_interval_s=polling_burst_interval_s,
+        polling_burst_window_s=polling_burst_window_s,
+        webhook_configured=bool(delivery_mode == "webhook"),
         requested_by=requested_by,
         extra={
             "authPath": auth_path,
@@ -2315,15 +2629,16 @@ async def _connect_telegram_gateway_tool(
         department_id=EXEC_ID,
         severity="good" if connected else "info",
     ))
-    summary = (
-        f"telegram gateway connected for @{bot_info.get('username')}"
-        if connected and bot_info.get("username")
-        else (
-            "telegram bot token verified and stored locally; configure ATRIUM_TELEGRAM_GATEWAY_URL to forward it to a gateway"
-            if not connected
-            else "telegram gateway connected"
+    if not connected:
+        summary = (
+            "telegram bot token verified and stored for the local polling channel gateway"
+            if delivery_mode == "polling"
+            else "telegram bot token verified and stored for /api/telegram/webhook"
         )
-    )
+    elif bot_info.get("username"):
+        summary = f"telegram gateway connected for @{bot_info.get('username')}"
+    else:
+        summary = "telegram gateway connected"
     return {
         "ok": True,
         "tool": "connect_telegram_gateway",
@@ -2569,12 +2884,14 @@ OWNER_TOOL_MUTATING_TOOLS = {
     "sandbox.exec",
     "import.url",
     "http.post",
+    "browser.act",
     "browser.open",
     "browser.click",
     "browser.type",
     "browser.keypress",
     "browser.paste_text",
     "browser.scroll",
+    "desktop.act",
     "desktop.open_app",
     "desktop.activate_app",
     "desktop.quit_app",
@@ -2800,7 +3117,7 @@ def _owner_tool_risk(run: dict[str, Any]) -> str:
         return str(item.get("riskClass") or "local_write")
     if tool == "sandbox.exec":
         return "network" if args.get("network") else "command"
-    if tool in {"git.status", "git.diff", "logs.query", "browser.screenshot", "desktop.screenshot", "desktop.apps"}:
+    if tool in {"git.status", "git.diff", "logs.query", "browser.snapshot", "browser.screenshot", "desktop.snapshot", "desktop.screenshot", "desktop.apps"}:
         return "safe_read"
     if tool == "git.commit":
         return "local_write"
@@ -2820,7 +3137,7 @@ def _owner_tool_risk(run: dict[str, Any]) -> str:
         return "desktop"
     if tool == "desktop.quit_app" and args.get("force"):
         return "destructive"
-    if tool in {"browser.open", "browser.click", "browser.type", "browser.keypress", "browser.paste_text", "browser.scroll", "desktop.open_app", "desktop.activate_app", "desktop.quit_app", "desktop.click", "desktop.type", "desktop.keypress", "desktop.paste_text", "desktop.scroll"}:
+    if tool in {"browser.open", "browser.act", "browser.click", "browser.type", "browser.keypress", "browser.paste_text", "browser.scroll", "desktop.open_app", "desktop.activate_app", "desktop.quit_app", "desktop.act", "desktop.click", "desktop.type", "desktop.keypress", "desktop.paste_text", "desktop.scroll"}:
         return "desktop"
     if tool == "scheduler.create":
         return "privileged"
@@ -5556,8 +5873,16 @@ def _owner_execute_tool(run: dict[str, Any]) -> dict[str, Any]:
         return _owner_execute_import_url(args, dept_id=dept_id)
     if tool == "browser.open":
         return execute_browser_open(args, _owner_run_process)
+    if tool == "browser.snapshot":
+        return execute_browser_snapshot(args, _owner_run_process)
+    if tool == "browser.act":
+        return execute_browser_act(args, _owner_run_process)
     if tool == "desktop.apps":
         return execute_list_apps(args, _owner_run_process)
+    if tool == "desktop.snapshot":
+        return execute_desktop_snapshot(args, _owner_run_process)
+    if tool == "desktop.act":
+        return execute_desktop_act(args, _owner_run_process)
     if tool == "desktop.open_app":
         return execute_open_app(args, _owner_run_process)
     if tool == "desktop.activate_app":
@@ -5598,6 +5923,14 @@ async def _owner_execute_tool_async(repo: Repo, run: dict[str, Any]) -> dict[str
         return await _owner_process_tool(repo, args, run["departmentId"])
     if tool == "browser.profiles":
         return list_browser_profiles()
+    if tool == "browser.snapshot":
+        return await asyncio.to_thread(execute_browser_snapshot, args, _owner_run_process)
+    if tool == "browser.act":
+        return await asyncio.to_thread(execute_browser_act, args, _owner_run_process)
+    if tool == "desktop.snapshot":
+        return await asyncio.to_thread(execute_desktop_snapshot, args, _owner_run_process)
+    if tool == "desktop.act":
+        return await asyncio.to_thread(execute_desktop_act, args, _owner_run_process)
     if tool in {"browser.screenshot", "desktop.screenshot"}:
         path, _, _ = _owner_tool_path(run["departmentId"], args.get("path"), default=f"screenshots/{uid('shot')}.png")
         result = await asyncio.to_thread(execute_screenshot_capture, path, _owner_run_process)
@@ -5686,7 +6019,7 @@ async def _owner_execute_tool_async(repo: Repo, run: dict[str, Any]) -> dict[str
     custom_result = await execute_custom_tool(repo, run)
     if custom_result is not None:
         return custom_result
-    return _owner_execute_tool(run)
+    return await asyncio.to_thread(_owner_execute_tool, run)
 
 
 async def _save_owner_tool_run(repo: Repo, run: dict[str, Any]) -> None:

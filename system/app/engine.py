@@ -1816,6 +1816,17 @@ async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int)
         ts=now,
     ))
     await _tool_activity_lines(repo, thread_id, dept, result.meta.get("toolRuns", []), war_room_id=war_room_id or None)
+    from .telegram_gateway import maybe_deliver_telegram_reply_for_message
+
+    telegram_delivery = await maybe_deliver_telegram_reply_for_message(repo, reply)
+    if telegram_delivery.get("status") in {"sent", "retry_queued", "failed"}:
+        await repo.add_activity(_activity(
+            f"Telegram outbound {telegram_delivery.get('status')} for chat reply",
+            type_="system",
+            department_id=dept["id"],
+            severity="good" if telegram_delivery.get("status") == "sent" else "warn",
+            ts=now_ms(),
+        ))
 
 
 def _target_department_id(target: str | None) -> str | None:
@@ -2300,6 +2311,14 @@ async def _process_due_job(repo: Repo, job, now: int) -> None:
             await enqueue_org_lifecycle(repo, run_after=now + delay_ms)
     elif job.kind == "chat_reply":
         await _process_chat_reply_job(repo, job.payload or {}, now)
+    elif job.kind == "telegram_outbound":
+        from .telegram_gateway import process_telegram_outbound_job
+
+        await process_telegram_outbound_job(repo, job.payload or {}, now)
+    elif job.kind == "telegram_progress":
+        from .telegram_gateway import process_telegram_progress_job
+
+        await process_telegram_progress_job(repo, job.payload or {}, now)
     elif job.kind == "image_generation":
         await process_image_generation_job(repo, job.payload or {}, now)
     elif job.kind == "video_tool":
@@ -2367,6 +2386,20 @@ async def run_chat_reply_loop(settings: Settings | None = None) -> None:
                     settings,
                     kind="chat_reply",
                     limit=3,
+                )
+                processed += await _process_due_jobs(
+                    repo,
+                    now_ms(),
+                    settings,
+                    kind="telegram_outbound",
+                    limit=6,
+                )
+                processed += await _process_due_jobs(
+                    repo,
+                    now_ms(),
+                    settings,
+                    kind="telegram_progress",
+                    limit=6,
                 )
                 if processed:
                     hub.mark_dirty()

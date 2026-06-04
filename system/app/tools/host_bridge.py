@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +43,12 @@ _KNOWN_EXECUTABLES = {
 }
 _WINDOWS_PREFLIGHT_CACHE_TTL_SECONDS = 10.0
 _WINDOWS_PREFLIGHT_CACHE: tuple[float, dict[str, Any]] | None = None
+_MACOS_PREFLIGHT_CACHE_TTL_SECONDS = 10.0
+_MACOS_PREFLIGHT_CACHE: tuple[float, dict[str, Any]] | None = None
+_MACOS_ACCESSIBILITY_CACHE_TTL_SECONDS = 10.0
+_MACOS_ACCESSIBILITY_CACHE: tuple[float, bool | None] | None = None
+_BROWSER_PLAYWRIGHT_PACKAGE_CACHE_TTL_SECONDS = 10.0
+_BROWSER_PLAYWRIGHT_PACKAGE_CACHE: tuple[float, str, dict[str, Any]] | None = None
 _WINDOWS_VISUAL_PREFLIGHT_TOOLS = {
     "browser.screenshot",
     "browser.click",
@@ -51,6 +57,8 @@ _WINDOWS_VISUAL_PREFLIGHT_TOOLS = {
     "browser.paste_text",
     "browser.scroll",
     "desktop.screenshot",
+    "desktop.snapshot",
+    "desktop.act",
     "desktop.click",
     "desktop.type",
     "desktop.keypress",
@@ -58,6 +66,38 @@ _WINDOWS_VISUAL_PREFLIGHT_TOOLS = {
     "desktop.scroll",
     "notify.send",
 }
+_MACOS_VISUAL_PREFLIGHT_TOOLS = {
+    "browser.screenshot",
+    "browser.click",
+    "browser.type",
+    "browser.keypress",
+    "browser.paste_text",
+    "browser.scroll",
+    "desktop.screenshot",
+    "desktop.snapshot",
+    "desktop.act",
+    "desktop.click",
+    "desktop.type",
+    "desktop.keypress",
+    "desktop.paste_text",
+    "desktop.scroll",
+    "notify.send",
+}
+_MACOS_FOREGROUND_SESSION_TOOLS = {
+    "browser.click",
+    "browser.type",
+    "browser.keypress",
+    "browser.paste_text",
+    "browser.scroll",
+    "desktop.activate_app",
+    "desktop.act",
+    "desktop.click",
+    "desktop.type",
+    "desktop.keypress",
+    "desktop.paste_text",
+    "desktop.scroll",
+}
+_BROWSER_PLAYWRIGHT_CONTROL_TOOLS = {"browser.snapshot", "browser.act"}
 
 
 def _has_executable(name: str) -> bool:
@@ -83,6 +123,9 @@ class HostBridgeStatus:
     isolated_browser_profile_ready: bool
     isolated_browser_profile_app: str | None
     isolated_browser_profile_executable: str | None
+    browser_playwright_ready: bool
+    browser_playwright_package: str | None
+    browser_playwright_error: str | None
     desktop_bridge_executable: str | None
     desktop_bridge: bool
     desktop_automation_ready: bool
@@ -94,7 +137,11 @@ class HostBridgeStatus:
     windows_visual_preflight_ok: bool | None
     windows_visual_preflight_error: str | None
     windows_visual_preflight_checks: dict[str, Any]
-    notes: list[str]
+    macos_visual_preflight_checked: bool = False
+    macos_visual_preflight_ok: bool | None = None
+    macos_visual_preflight_error: str | None = None
+    macos_visual_preflight_checks: dict[str, Any] = field(default_factory=dict)
+    notes: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -111,6 +158,9 @@ class HostBridgeStatus:
             "isolatedBrowserProfileReady": self.isolated_browser_profile_ready,
             "isolatedBrowserProfileApp": self.isolated_browser_profile_app,
             "isolatedBrowserProfileExecutable": self.isolated_browser_profile_executable,
+            "browserPlaywrightReady": self.browser_playwright_ready,
+            "browserPlaywrightPackage": self.browser_playwright_package,
+            "browserPlaywrightError": self.browser_playwright_error,
             "desktopBridgeExecutable": self.desktop_bridge_executable,
             "desktopBridge": self.desktop_bridge,
             "desktopAutomationReady": self.desktop_automation_ready,
@@ -122,6 +172,10 @@ class HostBridgeStatus:
             "windowsVisualPreflightOk": self.windows_visual_preflight_ok,
             "windowsVisualPreflightError": self.windows_visual_preflight_error,
             "windowsVisualPreflightChecks": self.windows_visual_preflight_checks,
+            "macosVisualPreflightChecked": self.macos_visual_preflight_checked,
+            "macosVisualPreflightOk": self.macos_visual_preflight_ok,
+            "macosVisualPreflightError": self.macos_visual_preflight_error,
+            "macosVisualPreflightChecks": self.macos_visual_preflight_checks,
             "notes": self.notes,
         }
 
@@ -158,13 +212,26 @@ class HostBridge:
             "error": None,
             "checks": {},
         }
+        macos_visual_preflight = {
+            "checked": False,
+            "ok": None,
+            "error": None,
+            "checks": {},
+        }
         if platform == "darwin":
             browser_executable = _first_executable(("open",))
             desktop_executable = _first_executable(("osascript",))
+            macos_visual_preflight = _macos_visual_preflight()
+            macos_checks = macos_visual_preflight.get("checks") if isinstance(macos_visual_preflight.get("checks"), dict) else {}
             browser = bool(browser_executable and shutil.which("osascript"))
-            browser_ready = browser and bool(shutil.which("screencapture") and shutil.which("pbcopy"))
+            browser_ready = browser and macos_checks.get("open") is True and macos_checks.get("osascript") is True and macos_checks.get("screencapture") is True
             desktop = bool(desktop_executable and shutil.which("screencapture"))
-            desktop_ready = desktop and bool(shutil.which("pbcopy"))
+            desktop_ready = desktop and macos_visual_preflight.get("ok") is True
+            if macos_visual_preflight.get("checked") is True and macos_visual_preflight.get("ok") is False:
+                detail = str(macos_visual_preflight.get("error") or "visual preflight failed")
+                notes.append(f"macOS visual automation preflight failed: {detail}")
+            if desktop_ready:
+                notes.append("macOS foreground switching is not proven by non-invasive status; run ops/macos_host_bridge_probe.py --full for live desktop proof.")
         elif platform == "win32":
             powershell = _first_executable(("powershell.exe", "powershell", "pwsh.exe", "pwsh"))
             interactive_session, interactive_session_name, interactive_session_id = _windows_interactive_session()
@@ -196,8 +263,17 @@ class HostBridge:
             isolated_browser_profile_app = browser_profile_app.get("name")
             isolated_browser_profile_executable = browser_profile_app.get("path")
             isolated_browser_profile_ready = bool(isolated_browser_profile_executable)
+        node_executable = _node_executable()
+        playwright_package_status = _browser_playwright_package_status(node_executable) if node_executable else {
+            "ok": False,
+            "package": None,
+            "error": "Node.js is required for browser.snapshot/browser.act",
+        }
+        browser_playwright_ready = bool(node_executable and isolated_browser_profile_ready and playwright_package_status.get("ok"))
         if browser_ready and not isolated_browser_profile_ready:
             notes.append("Isolated browser profiles require Chrome, Edge, Brave, or Chromium.")
+        if browser_ready and isolated_browser_profile_ready and node_executable and not playwright_package_status.get("ok"):
+            notes.append("browser.snapshot/browser.act require the Playwright package (`playwright` or `@playwright/test`).")
         git = _has_executable("git")
         docker = _has_executable("docker")
         return HostBridgeStatus(
@@ -214,6 +290,9 @@ class HostBridge:
             isolated_browser_profile_ready=isolated_browser_profile_ready,
             isolated_browser_profile_app=isolated_browser_profile_app,
             isolated_browser_profile_executable=isolated_browser_profile_executable,
+            browser_playwright_ready=browser_playwright_ready,
+            browser_playwright_package=playwright_package_status.get("package"),
+            browser_playwright_error=playwright_package_status.get("error"),
             desktop_bridge_executable=desktop_executable,
             desktop_bridge=desktop,
             desktop_automation_ready=desktop_ready,
@@ -225,6 +304,10 @@ class HostBridge:
             windows_visual_preflight_ok=windows_visual_preflight.get("ok"),
             windows_visual_preflight_error=windows_visual_preflight.get("error"),
             windows_visual_preflight_checks=windows_visual_preflight.get("checks") if isinstance(windows_visual_preflight.get("checks"), dict) else {},
+            macos_visual_preflight_checked=bool(macos_visual_preflight.get("checked")),
+            macos_visual_preflight_ok=macos_visual_preflight.get("ok"),
+            macos_visual_preflight_error=macos_visual_preflight.get("error"),
+            macos_visual_preflight_checks=macos_visual_preflight.get("checks") if isinstance(macos_visual_preflight.get("checks"), dict) else {},
             notes=notes,
         )
 
@@ -242,11 +325,29 @@ class HostBridge:
                 return False, "win32 interactive desktop session unavailable"
             if status.platform == "win32" and status.interactive_session is None:
                 return False, "win32 interactive desktop session could not be verified"
+            if tool_name in _BROWSER_PLAYWRIGHT_CONTROL_TOOLS:
+                if _requests_user_browser_profile(args):
+                    return False, "browser.snapshot/browser.act require an isolated browser profile"
+                if not _node_executable():
+                    return False, "Node.js is required for browser.snapshot/browser.act"
+                if not status.isolated_browser_profile_ready:
+                    return False, "deterministic browser control requires Chrome, Edge, Brave, or Chromium"
+                if not status.browser_playwright_ready:
+                    detail = str(status.browser_playwright_error or "").strip()
+                    return False, detail or "Playwright package is required for browser.snapshot/browser.act"
             if tool_name in _WINDOWS_VISUAL_PREFLIGHT_TOOLS and status.windows_visual_preflight_checked and status.windows_visual_preflight_ok is False:
                 return False, _windows_visual_preflight_reason(status)
             if tool_name == "browser.open" and _requests_isolated_browser_profile(args) and not status.isolated_browser_profile_ready:
                 return False, "isolated browser profile requires Chrome, Edge, Brave, or Chromium"
             if status.platform == "darwin":
+                if tool_name == "browser.open" and _macos_preflight_failed_for(status, {"open"}):
+                    return False, _macos_visual_preflight_reason(status, {"open"})
+                if tool_name == "browser.screenshot" and _macos_preflight_failed_for(status, {"screencapture"}):
+                    return False, _macos_visual_preflight_reason(status, {"screencapture"})
+                if tool_name == "browser.paste_text" and _macos_preflight_failed_for(status, {"osascript"}):
+                    return False, _macos_visual_preflight_reason(status, {"osascript"})
+                if tool_name in _MACOS_FOREGROUND_SESSION_TOOLS and _macos_preflight_failed_for(status, {"foregroundSession"}):
+                    return False, _macos_visual_preflight_reason(status, {"foregroundSession"})
                 if tool_name == "browser.screenshot" and not shutil.which("screencapture"):
                     return False, "macOS screencapture is unavailable"
         if tool_name.startswith("desktop."):
@@ -263,13 +364,27 @@ class HostBridge:
             if tool_name in _WINDOWS_VISUAL_PREFLIGHT_TOOLS and status.windows_visual_preflight_checked and status.windows_visual_preflight_ok is False:
                 return False, _windows_visual_preflight_reason(status)
             if status.platform == "darwin":
+                if tool_name == "desktop.open_app" and _macos_preflight_failed_for(status, {"open"}):
+                    return False, _macos_visual_preflight_reason(status, {"open"})
+                if tool_name in {"desktop.apps", "desktop.activate_app", "desktop.quit_app", "desktop.paste_text"} and _macos_preflight_failed_for(status, {"osascript"}):
+                    return False, _macos_visual_preflight_reason(status, {"osascript"})
+                if tool_name in {"desktop.snapshot", "desktop.act"} and _macos_preflight_failed_for(status, {"osascript", "accessibility"}):
+                    return False, _macos_visual_preflight_reason(status, {"osascript", "accessibility"})
+                if tool_name == "desktop.screenshot" and _macos_preflight_failed_for(status, {"screencapture"}):
+                    return False, _macos_visual_preflight_reason(status, {"screencapture"})
+                if tool_name in _MACOS_FOREGROUND_SESSION_TOOLS and _macos_preflight_failed_for(status, {"foregroundSession"}):
+                    if tool_name == "desktop.act" and _requests_native_desktop_ref_action(args):
+                        return True, None
+                    return False, _macos_visual_preflight_reason(status, {"foregroundSession"})
                 if tool_name == "desktop.open_app" and not shutil.which("open"):
                     return False, "macOS open command is unavailable"
-                if tool_name in {"desktop.apps", "desktop.activate_app", "desktop.quit_app"} and not shutil.which("osascript"):
+                if tool_name in {"desktop.apps", "desktop.snapshot", "desktop.activate_app", "desktop.quit_app"} and not shutil.which("osascript"):
                     return False, "macOS osascript bridge is unavailable"
+                if tool_name in {"desktop.snapshot", "desktop.act"} and _macos_accessibility_enabled() is False:
+                    return False, "macOS Accessibility permission is disabled for System Events"
                 if tool_name == "desktop.screenshot" and not shutil.which("screencapture"):
                     return False, "macOS screencapture is unavailable"
-            if tool_name not in {"desktop.apps", "desktop.open_app", "desktop.activate_app", "desktop.quit_app", "desktop.screenshot"} and not status.desktop_bridge:
+            if tool_name not in {"desktop.apps", "desktop.snapshot", "desktop.open_app", "desktop.activate_app", "desktop.quit_app", "desktop.screenshot"} and not status.desktop_bridge:
                 return False, f"{status.platform} desktop bridge unavailable"
         if tool_name == "notify.send":
             if status.platform == "win32" and status.interactive_session is False:
@@ -278,6 +393,8 @@ class HostBridge:
                 return False, "win32 interactive desktop session could not be verified"
             if status.platform == "win32" and status.windows_visual_preflight_checked and status.windows_visual_preflight_ok is False:
                 return False, _windows_visual_preflight_reason(status)
+            if status.platform == "darwin" and _macos_preflight_failed_for(status, {"osascript"}):
+                return False, _macos_visual_preflight_reason(status, {"osascript"})
             if not status.desktop_bridge:
                 return False, f"{status.platform} notification bridge unavailable"
         if tool_name.startswith("git."):
@@ -295,6 +412,78 @@ def _first_executable(names: tuple[str, ...]) -> str | None:
             if Path(candidate).exists():
                 return candidate
     return None
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def _node_executable() -> str | None:
+    return shutil.which("node") or shutil.which("node.exe")
+
+
+def _browser_playwright_package_status(node_executable: str | None = None) -> dict[str, Any]:
+    global _BROWSER_PLAYWRIGHT_PACKAGE_CACHE
+    node = node_executable or _node_executable()
+    if not node:
+        return {
+            "ok": False,
+            "package": None,
+            "path": None,
+            "error": "Node.js is required for browser.snapshot/browser.act",
+        }
+    now = time.monotonic()
+    if (
+        _BROWSER_PLAYWRIGHT_PACKAGE_CACHE
+        and _BROWSER_PLAYWRIGHT_PACKAGE_CACHE[1] == node
+        and now - _BROWSER_PLAYWRIGHT_PACKAGE_CACHE[0] < _BROWSER_PLAYWRIGHT_PACKAGE_CACHE_TTL_SECONDS
+    ):
+        return dict(_BROWSER_PLAYWRIGHT_PACKAGE_CACHE[2])
+    ui_root = _repo_root() / "ui"
+    cwd = ui_root if ui_root.exists() else _repo_root()
+    script = (
+        "const packages = ['playwright', '@playwright/test'];"
+        "const errors = [];"
+        "for (const name of packages) {"
+        "  try {"
+        "    const resolved = require.resolve(name);"
+        "    require(name);"
+        "    console.log(JSON.stringify({ok:true, package:name, path:resolved}));"
+        "    process.exit(0);"
+        "  } catch (error) {"
+        "    errors.push(`${name}: ${error && error.message ? error.message : String(error)}`);"
+        "  }"
+        "}"
+        "console.log(JSON.stringify({ok:false, package:null, path:null, error:errors.join(' | ')}));"
+        "process.exit(1);"
+    )
+    try:
+        completed = subprocess.run(
+            [node, "-e", script],
+            cwd=str(cwd),
+            text=True,
+            capture_output=True,
+            timeout=5.0,
+        )
+        raw = (completed.stdout or "").strip().splitlines()[-1] if (completed.stdout or "").strip() else ""
+        parsed = json.loads(raw) if raw else {}
+        if not isinstance(parsed, dict):
+            parsed = {}
+        status = {
+            "ok": bool(parsed.get("ok")),
+            "package": str(parsed.get("package") or "") or None,
+            "path": str(parsed.get("path") or "") or None,
+            "error": str(parsed.get("error") or completed.stderr or "").strip() or None,
+        }
+    except Exception as exc:
+        status = {
+            "ok": False,
+            "package": None,
+            "path": None,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    _BROWSER_PLAYWRIGHT_PACKAGE_CACHE = (now, node, status)
+    return dict(status)
 
 
 def _isolated_browser_profile_app() -> dict[str, str] | None:
@@ -320,9 +509,219 @@ def _requests_isolated_browser_profile(args: dict[str, Any] | None) -> bool:
     return value not in {"", "user", "default", "host", "personal"}
 
 
+def _requests_user_browser_profile(args: dict[str, Any] | None) -> bool:
+    if not args:
+        return False
+    raw = args.get("profile") or args.get("browserProfile")
+    value = str(raw or "").strip().lower()
+    return value in {"user", "default", "host", "personal"}
+
+
+def _truthy_arg(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    if isinstance(value, (int, float)):
+        return value != 0
+    return False
+
+
+def _requests_native_desktop_ref_action(args: dict[str, Any] | None) -> bool:
+    if not args:
+        return False
+    ref = str(args.get("ref") or "").strip()
+    return bool(ref and _truthy_arg(args.get("requireNative")))
+
+
 def _windows_visual_preflight_reason(status: HostBridgeStatus) -> str:
     detail = str(status.windows_visual_preflight_error or "").strip()
     return f"win32 visual automation preflight failed: {detail}" if detail else "win32 visual automation preflight failed"
+
+
+def _macos_visual_preflight_reason(status: HostBridgeStatus, required: set[str] | None = None) -> str:
+    detail = str(status.macos_visual_preflight_error or "").strip()
+    checks = status.macos_visual_preflight_checks if isinstance(status.macos_visual_preflight_checks, dict) else {}
+    failed = [name for name in sorted(required or set(checks)) if checks.get(name) is not True]
+    if failed:
+        failed_text = f"failed checks: {', '.join(failed)}"
+        detail = f"{detail}; {failed_text}" if detail and failed_text not in detail else (detail or failed_text)
+    return f"darwin visual automation preflight failed: {detail}" if detail else "darwin visual automation preflight failed"
+
+
+def _macos_preflight_failed_for(status: HostBridgeStatus, required: set[str]) -> bool:
+    if status.platform != "darwin" or status.macos_visual_preflight_checked is not True:
+        return False
+    checks = status.macos_visual_preflight_checks if isinstance(status.macos_visual_preflight_checks, dict) else {}
+    for name in required:
+        value = checks.get(name)
+        if name == "foregroundSession" and value is None:
+            continue
+        if value is not True:
+            return True
+    return False
+
+
+def _macos_foreground_session_status() -> dict[str, Any]:
+    if sys.platform != "darwin":
+        return {"checked": False, "ok": None, "error": None, "details": {}}
+    try:
+        from . import visual_bridge
+
+        helper = visual_bridge._ensure_snapshot_helper()
+    except Exception as exc:
+        return {
+            "checked": False,
+            "ok": None,
+            "error": f"native foreground session helper unavailable: {exc}",
+            "details": {},
+        }
+    if helper is None:
+        return {
+            "checked": False,
+            "ok": None,
+            "error": "native foreground session helper unavailable",
+            "details": {},
+        }
+    try:
+        completed = subprocess.run(
+            [str(helper), "", "", "5", "1"],
+            text=True,
+            capture_output=True,
+            timeout=5.0,
+            check=False,
+        )
+    except Exception as exc:
+        return {
+            "checked": True,
+            "ok": False,
+            "error": f"native foreground session check failed: {exc}",
+            "details": {},
+        }
+    parsed: Any = None
+    raw_stdout = str(completed.stdout or "").strip()
+    if raw_stdout:
+        try:
+            parsed = json.loads(raw_stdout)
+        except json.JSONDecodeError:
+            parsed = None
+    details = parsed if isinstance(parsed, dict) else {}
+    app_name = str(details.get("appName") or "").strip()
+    process_id = details.get("processId")
+    if completed.returncode != 0:
+        detail = str(details.get("error") or completed.stderr or completed.stdout or "foreground session check failed").strip()
+        return {
+            "checked": True,
+            "ok": False,
+            "error": detail,
+            "details": details,
+        }
+    if not app_name:
+        return {
+            "checked": True,
+            "ok": False,
+            "error": "native foreground session check did not return an active app",
+            "details": details,
+        }
+    if app_name.lower() == "loginwindow":
+        return {
+            "checked": True,
+            "ok": False,
+            "error": "macOS foreground session is loginwindow; user GUI session is not foreground-controllable",
+            "details": details,
+        }
+    return {
+        "checked": True,
+        "ok": True,
+        "error": None,
+        "details": {
+            "appName": app_name,
+            "processId": process_id,
+            "title": details.get("title"),
+            "windowCount": details.get("windowCount"),
+            "method": details.get("method") or "native_ax_snapshot",
+        },
+    }
+
+
+def _macos_accessibility_enabled() -> bool | None:
+    global _MACOS_ACCESSIBILITY_CACHE
+    if sys.platform != "darwin":
+        return None
+    now = time.monotonic()
+    if _MACOS_ACCESSIBILITY_CACHE and now - _MACOS_ACCESSIBILITY_CACHE[0] < _MACOS_ACCESSIBILITY_CACHE_TTL_SECONDS:
+        return _MACOS_ACCESSIBILITY_CACHE[1]
+    osascript = shutil.which("osascript")
+    if not osascript:
+        _MACOS_ACCESSIBILITY_CACHE = (now, None)
+        return None
+    try:
+        completed = subprocess.run(
+            [osascript, "-e", 'tell application "System Events" to UI elements enabled'],
+            text=True,
+            capture_output=True,
+            timeout=3.0,
+            check=False,
+        )
+    except Exception:
+        _MACOS_ACCESSIBILITY_CACHE = (now, None)
+        return None
+    value = str(completed.stdout or "").strip().lower()
+    enabled = True if value == "true" else (False if value == "false" else None)
+    _MACOS_ACCESSIBILITY_CACHE = (now, enabled)
+    return enabled
+
+
+def _macos_visual_preflight() -> dict[str, Any]:
+    global _MACOS_PREFLIGHT_CACHE
+    if sys.platform != "darwin":
+        return {"checked": False, "ok": None, "error": None, "checks": {}}
+    now = time.monotonic()
+    if _MACOS_PREFLIGHT_CACHE and now - _MACOS_PREFLIGHT_CACHE[0] < _MACOS_PREFLIGHT_CACHE_TTL_SECONDS:
+        return dict(_MACOS_PREFLIGHT_CACHE[1])
+    accessibility = _macos_accessibility_enabled()
+    foreground_session = (
+        _macos_foreground_session_status()
+        if accessibility is True
+        else {"checked": False, "ok": None, "error": None, "details": {}}
+    )
+    checks: dict[str, Any] = {
+        "open": bool(shutil.which("open")),
+        "osascript": bool(shutil.which("osascript")),
+        "screencapture": bool(shutil.which("screencapture")),
+        "accessibility": accessibility is True,
+        "foregroundSession": foreground_session.get("ok") if foreground_session.get("checked") else None,
+    }
+    foreground_details = foreground_session.get("details") if isinstance(foreground_session.get("details"), dict) else {}
+    if foreground_details.get("appName"):
+        checks["foregroundAppName"] = foreground_details.get("appName")
+    if foreground_details.get("processId") is not None:
+        checks["foregroundProcessId"] = foreground_details.get("processId")
+    if foreground_details.get("windowCount") is not None:
+        checks["foregroundWindowCount"] = foreground_details.get("windowCount")
+    errors: dict[str, str] = {}
+    if accessibility is None:
+        errors["accessibility"] = "macOS Accessibility permission could not be verified"
+    elif accessibility is False:
+        errors["accessibility"] = "macOS Accessibility permission is disabled for System Events"
+    if foreground_session.get("checked") and foreground_session.get("ok") is False:
+        errors["foregroundSession"] = str(foreground_session.get("error") or "macOS foreground session could not be verified")
+    failed_checks = []
+    for name, value in checks.items():
+        if name in {"foregroundAppName", "foregroundProcessId", "foregroundWindowCount"}:
+            continue
+        if name == "foregroundSession" and value is None:
+            continue
+        if value is not True:
+            failed_checks.append(name)
+    ok = not failed_checks
+    detail = "; ".join(f"{key}: {value}" for key, value in errors.items() if value)
+    if failed_checks:
+        failed_text = f"failed checks: {', '.join(failed_checks)}"
+        detail = f"{detail}; {failed_text}" if detail else failed_text
+    result = {"checked": True, "ok": ok, "error": detail or None, "checks": checks}
+    _MACOS_PREFLIGHT_CACHE = (now, result)
+    return dict(result)
 
 
 def _windows_visual_preflight(powershell: str | None) -> dict[str, Any]:

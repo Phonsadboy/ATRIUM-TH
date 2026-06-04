@@ -991,12 +991,23 @@ export type ToolName =
   | 'git.diff'
   | 'git.commit'
   | 'git.push'
+  | 'browser.profiles'
   | 'browser.open'
+  | 'browser.snapshot'
+  | 'browser.act'
+  | 'browser.screenshot'
   | 'browser.click'
   | 'browser.type'
   | 'browser.keypress'
   | 'browser.paste_text'
+  | 'browser.scroll'
   | 'desktop.screenshot'
+  | 'desktop.apps'
+  | 'desktop.snapshot'
+  | 'desktop.act'
+  | 'desktop.open_app'
+  | 'desktop.activate_app'
+  | 'desktop.quit_app'
   | 'desktop.click'
   | 'desktop.type'
   | 'desktop.keypress'
@@ -1992,12 +2003,24 @@ export type ConnectorKind =
   | 'local_file'
   | 'git'
   | 'http'
+  | 'web'
   | 'browser'
   | 'desktop'
   | 'sandbox'
   | 'mcp'
 
 export type ConnectorStatus = 'available' | 'configured' | 'blocked_by_runtime'
+
+export type ConnectorProofStatus =
+  | 'not_required'
+  | 'local_blocked'
+  | 'cross_os_unverified'
+  | 'cross_os_verified'
+
+export type HostBridgeParityStatus =
+  | 'local_blocked'
+  | 'cross_os_unverified'
+  | 'cross_os_verified'
 
 export interface Connector {
   id: ID
@@ -2013,6 +2036,29 @@ export interface Connector {
   writeReady: boolean
   localFallback: boolean
   externalWriteRequires: string[]
+  proofStatus?: ConnectorProofStatus | null
+  proofSummary?: string | null
+  proofGaps?: string[]
+  proofDetails?: Record<string, unknown>
+}
+
+export interface HostBridgeParityConnectorProof {
+  id: ID
+  proofStatus: ConnectorProofStatus
+  proofSummary?: string | null
+  proofGaps: string[]
+  proofDetails: Record<string, unknown>
+}
+
+export interface HostBridgeParityStatusResponse {
+  ok: boolean
+  status: HostBridgeParityStatus
+  summary: string
+  gaps: string[]
+  report: Record<string, unknown>
+  local: Record<string, unknown>
+  connectors: HostBridgeParityConnectorProof[]
+  commands: Record<string, string>
 }
 
 /* ---------- Chat generation control ---------- */

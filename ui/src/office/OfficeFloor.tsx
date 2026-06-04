@@ -24,6 +24,7 @@ import { Actors } from './actors'
 import { installDevOffice } from './devOffice'
 import { deptIdFromThread } from '../lib/threads'
 import type { ThreadId } from '../contract/types'
+import { Icon } from '../components/Icon'
 
 const MIN_ZOOM = 0.18
 const MAX_ZOOM = 2.4
@@ -61,6 +62,7 @@ export function OfficeFloor() {
   const setRoomPosition = useUI((s) => s.setRoomPosition)
   const officeRoomCount = useUI((s) => s.officeRoomCount)
   const addOfficeRoom = useUI((s) => s.addOfficeRoom)
+  const removeOfficeRoom = useUI((s) => s.removeOfficeRoom)
   const officeRoomBackgrounds = useUI((s) => s.officeRoomBackgrounds)
   const setOfficeRoomBackground = useUI((s) => s.setOfficeRoomBackground)
   const applyOfficePlan = useUI((s) => s.applyOfficePlan)
@@ -607,6 +609,7 @@ export function OfficeFloor() {
         focusedBg={focusedBg}
         onFocusRoom={setOfficeRoom}
         onAddRoom={() => addOfficeRoom(world.rooms.length)}
+        onRemoveRoom={() => removeOfficeRoom(officeRoomIndex, world.rooms.length)}
         onSetBackground={(bg) => setOfficeRoomBackground(officeRoomIndex, bg)}
         arrange={arrangeMode}
         onToggleArrange={() => toggleArrange()}
@@ -639,6 +642,7 @@ function OfficeControls({
   focusedBg,
   onFocusRoom,
   onAddRoom,
+  onRemoveRoom,
   onSetBackground,
   arrange,
   onToggleArrange,
@@ -649,6 +653,7 @@ function OfficeControls({
   focusedBg: OfficeBackgroundId | undefined
   onFocusRoom: (index: number) => void
   onAddRoom: () => void
+  onRemoveRoom: () => void
   onSetBackground: (bg: OfficeBackgroundId) => void
   arrange: boolean
   onToggleArrange: () => void
@@ -656,6 +661,17 @@ function OfficeControls({
 }) {
   const chip =
     'rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition-colors shrink-0'
+  const focused = rooms.find((r) => r.index === focusedRoom)
+  const canRemoveFocusedRoom = !!focused && !focused.isExec && focused.count === 0 && rooms.length > 1
+  const removeTitle = !focused
+    ? 'เลือกห้องก่อน'
+    : focused.isExec
+      ? 'ลบห้องผู้บริหารไม่ได้'
+      : focused.count > 0
+        ? 'ลบได้เฉพาะห้องว่าง'
+        : rooms.length <= 1
+          ? 'ต้องมีอย่างน้อยหนึ่งห้อง'
+          : 'ลบห้องว่างนี้'
   const idle = {
     background: 'rgba(19,16,9,0.42)',
     borderColor: 'var(--color-line-soft)',
@@ -664,10 +680,10 @@ function OfficeControls({
   return (
     <>
       {/* top-left: room navigator + background */}
-      <div className="pointer-events-auto absolute top-3 left-3 z-10 flex max-w-[min(82vw,640px)] flex-col items-start gap-2">
-        <div className="flex items-center gap-1.5 rounded-xl px-2 py-1.5" style={cluster}>
+      <div className="pointer-events-auto absolute top-3 left-3 z-10 flex max-w-[min(92vw,760px)] flex-col items-start gap-2">
+        <div className="flex flex-wrap items-center gap-1.5 rounded-xl px-2 py-1.5" style={cluster}>
           <span className="mr-0.5 text-[10px] tracking-[0.14em] text-[var(--color-cream-faint)] uppercase">ตึก</span>
-          <div className="flex max-w-[min(60vw,460px)] items-center gap-1.5 overflow-x-auto">
+          <div className="flex max-w-[min(56vw,420px)] items-center gap-1.5 overflow-x-auto">
             {rooms.map((r) => {
               const active = r.index === focusedRoom
               return (
@@ -695,8 +711,24 @@ function OfficeControls({
             style={{ background: 'rgba(244,169,69,0.16)', borderColor: 'rgba(244,169,69,0.4)', color: '#ffc879' }}
             title="เพิ่มห้องใหม่ (ห้องว่าง — ลากแผนกเข้าไปได้)"
           >
-            <span className="text-sm leading-none">＋</span>
-            ห้อง
+            <Icon name="plus" size={12} />
+            เพิ่มห้อง
+          </button>
+          <button
+            type="button"
+            onClick={onRemoveRoom}
+            disabled={!canRemoveFocusedRoom}
+            className={`${chip} flex items-center gap-1 disabled:cursor-not-allowed disabled:opacity-45`}
+            style={{
+              background: canRemoveFocusedRoom ? 'rgba(240,115,95,0.14)' : 'rgba(19,16,9,0.28)',
+              borderColor: canRemoveFocusedRoom ? 'rgba(240,115,95,0.42)' : 'var(--color-line-soft)',
+              color: canRemoveFocusedRoom ? '#ff9685' : 'var(--color-cream-faint)',
+            }}
+            title={removeTitle}
+            aria-label={removeTitle}
+          >
+            <Icon name="close" size={12} />
+            ลบห้อง
           </button>
         </div>
 

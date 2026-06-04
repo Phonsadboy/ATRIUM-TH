@@ -1,0 +1,987 @@
+import importlib.util
+import json
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+from app.host_bridge_proof import host_bridge_source_provenance
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _load_report_module():
+    spec = importlib.util.spec_from_file_location(
+        "host_bridge_parity_report",
+        REPO_ROOT / "ops" / "host_bridge_parity_report.py",
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("host_bridge_parity_report.py could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_summary_module():
+    spec = importlib.util.spec_from_file_location(
+        "host_bridge_artifact_summary",
+        REPO_ROOT / "ops" / "host_bridge_artifact_summary.py",
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("host_bridge_artifact_summary.py could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_source_summary_module():
+    spec = importlib.util.spec_from_file_location(
+        "host_bridge_source_summary",
+        REPO_ROOT / "ops" / "host_bridge_source_summary.py",
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("host_bridge_source_summary.py could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _source(fingerprint: str | None = None, git_head: str | None = None) -> dict:
+    current = host_bridge_source_provenance(REPO_ROOT)
+    return {
+        "repoRoot": str(REPO_ROOT),
+        "gitHead": git_head or current.get("gitHead") or "b" * 40,
+        "gitDirty": False,
+        "gitStatusShort": [],
+        "sourceFingerprint": fingerprint or current["sourceFingerprint"],
+        "files": {},
+    }
+
+
+def _host(platform: str = "darwin", hostname: str = "atrium-macos") -> dict:
+    return {
+        "schemaVersion": 1,
+        "platform": platform,
+        "system": "Darwin" if platform == "darwin" else "Windows",
+        "release": "test",
+        "machine": "arm64" if platform == "darwin" else "AMD64",
+        "hostname": hostname,
+        "hostFingerprint": ("a" if platform == "darwin" else "b") * 64,
+    }
+
+
+MACOS_APPLESCRIPT_CLIPBOARD_TEXT = "ATRIUM macOS AppleScript probe ไทย"
+MACOS_TEXTEDIT_EXPECTED_TEXT = "ATRIUM macOS TextEdit probe ไทย"
+MACOS_CALCULATOR_EXPECTED_VALUE = "1"
+WINDOWS_INTERACTIVE_TYPE_TEXT = "ATRIUM Windows HostBridge probe ไทย"
+WINDOWS_INTERACTIVE_PASTE_TEXT = "ATRIUM paste probe ไทย"
+WINDOWS_INTERACTIVE_NATIVE_TEXT = "ATRIUM Windows ValuePattern probe ไทย"
+
+
+def _utf16_units(text: str) -> int:
+    return len(text.encode("utf-16-le", errors="surrogatepass")) // 2
+
+
+def _macos_artifact(**overrides):
+    artifact = {
+        "schemaVersion": 1,
+        "generatedAt": _now_ms(),
+        "parityRunId": "parity-run-1",
+        "source": _source(),
+        "host": _host("darwin", "atrium-macos"),
+        "ok": True,
+        "mode": "live",
+        "status": {
+            "platform": "darwin",
+            "browserBridge": True,
+            "desktopBridge": True,
+            "desktopAutomationReady": True,
+            "macosVisualPreflightChecks": {"foregroundSession": True},
+        },
+        "routes": {"desktop.act": {"blockReason": None}},
+        "runtimeBlocks": {"desktop.act": {"api": None, "chat": None}},
+        "checks": {
+            "apps": {"returnCode": 0, "runningMethod": "native_nsworkspace_apps"},
+            "screenshotFile": {"ok": True},
+            "notification": {"returnCode": 0},
+            "browserOpen": {"returnCode": 0, "profileKind": "isolated", "isOwnProfile": True},
+            "browserRef": {
+                "browserSnapshot": {"returnCode": 0, "refCount": 1, "backend": "playwright", "profileKind": "isolated", "isOwnProfile": True},
+                "browserActClick": {"returnCode": 0, "backend": "playwright", "profileKind": "isolated", "isOwnProfile": True},
+                "containsExpected": True,
+            },
+            "appleScriptClipboard": {
+                "returnCode": 0,
+                "method": "osascript",
+                "expected": MACOS_APPLESCRIPT_CLIPBOARD_TEXT,
+                "verified": True,
+                "textLength": len(MACOS_APPLESCRIPT_CLIPBOARD_TEXT),
+                "expectedLength": len(MACOS_APPLESCRIPT_CLIPBOARD_TEXT),
+                "expectedBytes": len(MACOS_APPLESCRIPT_CLIPBOARD_TEXT.encode("utf-8")),
+            },
+            "foregroundSnapshot": {"returnCode": 0, "snapshotBackend": "native_ax"},
+            "interactiveCalculator": {
+                "nativeActionVerified": True,
+                "displayValueVerified": True,
+                "nativeActionMetadataVerified": True,
+                "desktopSnapshot": {
+                    "returnCode": 0,
+                    "snapshot": {
+                        "elements": [
+                            {
+                                "role": "AXButton",
+                                "name": "1",
+                                "axActions": ["AXPress"],
+                                "nativeSupportedActions": ["click"],
+                            }
+                        ]
+                    },
+                },
+                "desktopActClick": {
+                    "returnCode": 0,
+                    "usedNativeAction": True,
+                    "nativeAttempt": {
+                        "returnCode": 0,
+                        "method": "accessibility_ax_helper",
+                        "inputMethod": "accessibility",
+                        "nativeStatus": "OK",
+                        "nativeAction": "AXPress",
+                    },
+                },
+                "desktopSnapshotAfter": {
+                    "returnCode": 0,
+                    "snapshot": {
+                        "elements": [
+                            {
+                                "role": "AXStaticText",
+                                "value": MACOS_CALCULATOR_EXPECTED_VALUE,
+                            }
+                        ]
+                    },
+                },
+            },
+            "interactiveTextEdit": {
+                "nativeActionVerified": True,
+                "textValueVerified": True,
+                "nativeActionMetadataVerified": True,
+                "nativeScrollMetadataVerified": True,
+                "nativeScrollVerified": True,
+                "desktopSnapshot": {
+                    "returnCode": 0,
+                    "snapshot": {
+                        "elements": [
+                            {
+                                "role": "AXScrollArea",
+                                "name": "Document",
+                                "axActions": ["AXScrollDownByPage", "AXScrollUpByPage"],
+                                "nativeSupportedActions": ["scroll"],
+                            },
+                            {
+                                "role": "AXTextArea",
+                                "name": "Text Area",
+                                "settableAttributes": ["AXValue"],
+                                "nativeSupportedActions": ["paste", "type"],
+                            }
+                        ]
+                    },
+                },
+                "desktopActScroll": {
+                    "returnCode": 0,
+                    "usedNativeAction": True,
+                    "nativeAttempt": {
+                        "returnCode": 0,
+                        "method": "accessibility_ax_helper",
+                        "inputMethod": "accessibility",
+                        "nativeStatus": "OK",
+                        "nativeAction": "AXScrollDownByPage",
+                    },
+                },
+                "desktopActSetText": {
+                    "returnCode": 0,
+                    "usedNativeAction": True,
+                    "nativeAttempt": {
+                        "returnCode": 0,
+                        "method": "accessibility_ax_helper",
+                        "inputMethod": "accessibility",
+                        "nativeStatus": "OK",
+                        "nativeAction": "setValue",
+                    },
+                },
+                "desktopSnapshotAfter": {
+                    "returnCode": 0,
+                    "snapshot": {
+                        "elements": [
+                            {
+                                "role": "AXTextArea",
+                                "value": MACOS_TEXTEDIT_EXPECTED_TEXT,
+                            }
+                        ]
+                    },
+                },
+            },
+        },
+    }
+    artifact.update(overrides)
+    return artifact
+
+
+def _windows_artifact(**overrides):
+    artifact = {
+        "schemaVersion": 1,
+        "generatedAt": _now_ms(),
+        "parityRunId": "parity-run-1",
+        "source": _source(),
+        "host": _host("win32", "atrium-windows"),
+        "ok": True,
+        "mode": "live",
+        "status": {
+            "platform": "win32",
+            "browserBridge": True,
+            "desktopBridge": True,
+            "desktopAutomationReady": True,
+            "interactiveSession": True,
+            "interactiveSessionName": "Console",
+            "interactiveSessionId": 1,
+            "windowsVisualPreflightOk": True,
+        },
+        "routes": {"desktop.act": {"blockReason": None}},
+        "runtimeBlocks": {"desktop.act": {"api": None, "chat": None}},
+        "checks": {
+            "apps": {"returnCode": 0},
+            "screenshotFile": {"ok": True},
+            "notification": {"returnCode": 0},
+            "browserOpen": {"returnCode": 0, "profileKind": "isolated", "isOwnProfile": True},
+            "browserRef": {
+                "browserSnapshot": {"returnCode": 0, "refCount": 1, "backend": "playwright", "profileKind": "isolated", "isOwnProfile": True},
+                "browserActClick": {"returnCode": 0, "backend": "playwright", "profileKind": "isolated", "isOwnProfile": True},
+                "containsExpected": True,
+            },
+            "helperSelftest": {
+                "ok": True,
+                "dpiAwareness": "per_monitor_v2",
+                "screenWidth": 1920,
+                "screenHeight": 1080,
+                "virtualLeft": 0,
+                "virtualTop": 0,
+                "virtualWidth": 1920,
+                "virtualHeight": 1080,
+            },
+            "powershellPreflight": {
+                "ok": True,
+                "checks": {"dpiAwareness": True, "virtualScreen": True},
+                "virtualScreen": {"left": 0, "top": 0, "width": 1920, "height": 1080},
+            },
+            "interactiveDesktop": {
+                "foregroundActivationVerified": True,
+                "activateApp": {
+                    "returnCode": 0,
+                    "processId": 42,
+                    "activeProcessId": 42,
+                    "foreground": True,
+                },
+                "unicodeTypeVerified": True,
+                "type": {
+                    "returnCode": 0,
+                    "textBytes": len(WINDOWS_INTERACTIVE_TYPE_TEXT.encode("utf-8")),
+                    "textCharacters": len(WINDOWS_INTERACTIVE_TYPE_TEXT),
+                    "textUnits": _utf16_units(WINDOWS_INTERACTIVE_TYPE_TEXT),
+                },
+                "selectAllKeypressVerified": True,
+                "keypress": {"returnCode": 0, "key": "a", "modifiers": ["control"]},
+                "nativeValueVerified": True,
+                "desktopActSetText": {
+                    "returnCode": 0,
+                    "usedNativeAction": True,
+                    "nativeAttempt": {
+                        "returnCode": 0,
+                        "method": "uia",
+                        "inputMethod": "uia",
+                        "nativeAction": "ValuePattern",
+                        "ok": True,
+                    },
+                },
+                "desktopSnapshotAfter": {
+                    "returnCode": 0,
+                    "snapshot": {
+                        "elements": [
+                            {
+                                "role": "Edit",
+                                "value": WINDOWS_INTERACTIVE_NATIVE_TEXT,
+                            }
+                        ]
+                    },
+                },
+                "clipboardRoundTrip": {
+                    "returnCode": 0,
+                    "expected": WINDOWS_INTERACTIVE_NATIVE_TEXT,
+                    "containsExpected": True,
+                    "verified": True,
+                    "textLength": len(WINDOWS_INTERACTIVE_NATIVE_TEXT),
+                    "textBytes": len(WINDOWS_INTERACTIVE_NATIVE_TEXT.encode("utf-8")),
+                    "expectedLength": len(WINDOWS_INTERACTIVE_NATIVE_TEXT),
+                    "expectedBytes": len(WINDOWS_INTERACTIVE_NATIVE_TEXT.encode("utf-8")),
+                },
+            },
+        },
+    }
+    artifact.update(overrides)
+    return artifact
+
+
+class HostBridgeParityReportTest(unittest.TestCase):
+    def _write_artifact(self, directory: Path, name: str, payload: dict) -> Path:
+        path = directory / name
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_parity_report_accepts_complete_full_live_artifacts(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact())
+            windows_path = self._write_artifact(directory, "windows.json", _windows_artifact())
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["schemaVersion"], 1)
+        self.assertEqual(report["proofSchemaVersion"], 1)
+        self.assertIsInstance(report["generatedAt"], int)
+        self.assertRegex(report["proofId"], r"^[0-9a-f]{64}$")
+        self.assertEqual(report["summary"], "full live HostBridge parity proof is complete")
+        self.assertEqual(report["findings"], [])
+        self.assertTrue(report["results"]["macos"]["ok"])
+        self.assertTrue(report["results"]["windows"]["ok"])
+        self.assertEqual(report["results"]["macos"]["schemaVersion"], 1)
+        self.assertEqual(report["results"]["macos"]["proofSchemaVersion"], 1)
+        self.assertIsInstance(report["results"]["macos"]["generatedAt"], int)
+        self.assertEqual(report["results"]["windows"]["parityRunId"], "parity-run-1")
+        self.assertEqual(report["results"]["macos"]["hostPlatform"], "darwin")
+        self.assertEqual(report["results"]["windows"]["hostPlatform"], "win32")
+        self.assertRegex(report["results"]["windows"]["hostFingerprint"], r"^[0-9a-f]{64}$")
+        self.assertEqual(report["results"]["macos"]["sourceFingerprint"], _source()["sourceFingerprint"])
+        self.assertEqual(report["results"]["windows"]["gitHead"], _source()["gitHead"])
+        self.assertEqual(report["currentSource"]["sourceFingerprint"], _source()["sourceFingerprint"])
+        self.assertGreater(report["results"]["macos"]["artifactBytes"], 0)
+        self.assertRegex(report["results"]["macos"]["artifactSha256"], r"^[0-9a-f]{64}$")
+        self.assertTrue(report["results"]["macos"]["proofs"]["browserActVerified"])
+        self.assertTrue(report["results"]["macos"]["proofs"]["browserSnapshotIsolatedPlaywright"])
+        self.assertTrue(report["results"]["macos"]["proofs"]["appleScriptClipboard"])
+        self.assertTrue(report["results"]["macos"]["proofs"]["macosNativeActionMetadata"])
+        self.assertTrue(report["results"]["macos"]["proofs"]["textEditNativeScroll"])
+        self.assertTrue(report["results"]["windows"]["proofs"]["windowsForegroundActivation"])
+        self.assertTrue(report["results"]["windows"]["proofs"]["windowsInteractiveSessionIdentity"])
+        self.assertTrue(report["results"]["windows"]["proofs"]["windowsUnicodeTyping"])
+        self.assertTrue(report["results"]["windows"]["proofs"]["windowsKeyboardShortcut"])
+        self.assertTrue(report["results"]["windows"]["proofs"]["notepadNativeAct"])
+
+    def test_parity_report_writes_persisted_output_for_connector_proof(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact())
+            windows_path = self._write_artifact(directory, "windows.json", _windows_artifact())
+            output_path = directory / "host-bridge-parity-report.json"
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path, generated_at_ms=1234)
+            same_inputs_report = report_module.evaluate_artifacts(macos_path, windows_path, generated_at_ms=5678)
+            report_module.write_report(report, output_path)
+            persisted = json.loads(output_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(persisted["ok"])
+        self.assertEqual(persisted["schemaVersion"], 1)
+        self.assertEqual(persisted["generatedAt"], 1234)
+        self.assertEqual(persisted["proofId"], same_inputs_report["proofId"])
+        self.assertTrue(persisted["results"]["macos"]["ok"])
+        self.assertTrue(persisted["results"]["windows"]["ok"])
+        self.assertGreater(persisted["results"]["macos"]["artifactBytes"], 0)
+        self.assertRegex(persisted["results"]["windows"]["artifactSha256"], r"^[0-9a-f]{64}$")
+        self.assertTrue(persisted["results"]["macos"]["proofs"]["browserSnapshot"])
+        self.assertTrue(persisted["results"]["windows"]["proofs"]["browserActIsolatedPlaywright"])
+        self.assertTrue(persisted["results"]["windows"]["proofs"]["clipboardRoundTrip"])
+
+    def test_parity_report_proof_id_changes_when_proof_facet_changes(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact())
+            windows_path = self._write_artifact(directory, "windows.json", _windows_artifact())
+            report_ok = report_module.evaluate_artifacts(macos_path, windows_path)
+
+            macos = _macos_artifact()
+            macos["checks"]["browserRef"]["containsExpected"] = False
+            macos_bad_path = self._write_artifact(directory, "macos-bad.json", macos)
+            report_bad = report_module.evaluate_artifacts(macos_bad_path, windows_path)
+
+        self.assertNotEqual(report_ok["proofId"], report_bad["proofId"])
+        self.assertFalse(report_bad["ok"])
+        self.assertFalse(report_bad["results"]["macos"]["proofs"]["browserActVerified"])
+        self.assertIn("macos: browser.act DOM-ref proof did not verify the post-click DOM state", "\n".join(report_bad["findings"]))
+
+    def test_parity_report_rejects_browser_ref_without_isolated_playwright_profile(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos = _macos_artifact()
+            macos["checks"]["browserOpen"] = {"returnCode": 0, "profileKind": "user", "isOwnProfile": False}
+            macos["checks"]["browserRef"]["browserSnapshot"]["profileKind"] = "user"
+            macos["checks"]["browserRef"]["browserSnapshot"]["isOwnProfile"] = False
+            macos["checks"]["browserRef"]["browserActClick"]["backend"] = "selenium"
+            macos_path = self._write_artifact(directory, "macos.json", macos)
+            windows_path = self._write_artifact(directory, "windows.json", _windows_artifact())
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertFalse(report["results"]["macos"]["proofs"]["browserOpenIsolatedProfile"])
+        self.assertFalse(report["results"]["macos"]["proofs"]["browserSnapshotIsolatedPlaywright"])
+        self.assertFalse(report["results"]["macos"]["proofs"]["browserActIsolatedPlaywright"])
+        self.assertIn("macos: browser.open proof did not use ATRIUM's isolated browser profile", findings)
+        self.assertIn("macos: browser.snapshot DOM-ref proof did not use Playwright with ATRIUM's isolated browser profile", findings)
+        self.assertIn("macos: browser.act DOM-ref click proof did not use Playwright with ATRIUM's isolated browser profile", findings)
+
+    def test_parity_report_rejects_macos_artifact_without_applescript_clipboard_proof(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos = _macos_artifact()
+            macos["checks"]["appleScriptClipboard"]["verified"] = False
+            macos["checks"]["appleScriptClipboard"]["method"] = "python"
+            macos_path = self._write_artifact(directory, "macos.json", macos)
+            windows_path = self._write_artifact(directory, "windows.json", _windows_artifact())
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("macos: AppleScript clipboard exact round-trip proof is missing", findings)
+        self.assertFalse(report["results"]["macos"]["proofs"]["appleScriptClipboard"])
+
+    def test_parity_report_rejects_macos_artifact_without_native_action_metadata(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos = _macos_artifact()
+            macos["checks"]["interactiveCalculator"]["desktopSnapshot"]["snapshot"]["elements"][0]["axActions"] = []
+            macos["checks"]["interactiveTextEdit"]["desktopSnapshot"]["snapshot"]["elements"][0]["settableAttributes"] = []
+            macos_path = self._write_artifact(directory, "macos.json", macos)
+            windows_path = self._write_artifact(directory, "windows.json", _windows_artifact())
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("macos: native AX action metadata proof is missing", findings)
+        self.assertFalse(report["results"]["macos"]["proofs"]["macosNativeActionMetadata"])
+
+    def test_parity_report_rejects_macos_calculator_artifact_without_axpress_metadata(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos = _macos_artifact()
+            macos["checks"]["interactiveCalculator"]["desktopActClick"]["nativeAttempt"]["nativeAction"] = "click"
+            macos_path = self._write_artifact(directory, "macos.json", macos)
+            windows_path = self._write_artifact(directory, "windows.json", _windows_artifact())
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("macos: Calculator desktop.act native AXPress display proof is missing", findings)
+        self.assertFalse(report["results"]["macos"]["proofs"]["calculatorNativeAct"])
+
+    def test_parity_report_rejects_macos_calculator_artifact_without_display_snapshot_proof(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos = _macos_artifact()
+            macos["checks"]["interactiveCalculator"]["displayValueVerified"] = False
+            macos["checks"]["interactiveCalculator"]["desktopSnapshotAfter"]["snapshot"]["elements"][0]["value"] = "0"
+            macos_path = self._write_artifact(directory, "macos.json", macos)
+            windows_path = self._write_artifact(directory, "windows.json", _windows_artifact())
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("macos: Calculator desktop.act native AXPress display proof is missing", findings)
+        self.assertFalse(report["results"]["macos"]["proofs"]["calculatorNativeAct"])
+
+    def test_parity_report_rejects_macos_textedit_artifact_without_setvalue_snapshot_proof(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos = _macos_artifact()
+            macos["checks"]["interactiveTextEdit"]["textValueVerified"] = False
+            macos["checks"]["interactiveTextEdit"]["desktopSnapshotAfter"]["snapshot"]["elements"][0]["value"] = "wrong"
+            macos_path = self._write_artifact(directory, "macos.json", macos)
+            windows_path = self._write_artifact(directory, "windows.json", _windows_artifact())
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("macos: TextEdit desktop.act native setValue proof is missing", findings)
+        self.assertFalse(report["results"]["macos"]["proofs"]["textEditNativeAct"])
+
+    def test_parity_report_rejects_simulated_artifacts(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact(mode="simulate"))
+            windows_path = self._write_artifact(directory, "windows.json", _windows_artifact())
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        self.assertFalse(report["ok"])
+        self.assertIn("macos: artifact mode must be live", "\n".join(report["findings"]))
+        self.assertFalse(report["results"]["macos"]["ok"])
+
+    def test_parity_report_rejects_unstamped_artifacts(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos = _macos_artifact()
+            macos.pop("schemaVersion")
+            macos.pop("generatedAt")
+            macos_path = self._write_artifact(directory, "macos.json", macos)
+            windows_path = self._write_artifact(directory, "windows.json", _windows_artifact())
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("macos: artifact schemaVersion must be 1", findings)
+        self.assertIn("macos: artifact generatedAt is missing or invalid", findings)
+
+    def test_parity_report_rejects_missing_source_provenance(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos = _macos_artifact()
+            macos.pop("source")
+            macos_path = self._write_artifact(directory, "macos.json", macos)
+            windows_path = self._write_artifact(directory, "windows.json", _windows_artifact())
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        self.assertFalse(report["ok"])
+        self.assertIn("macos: artifact source provenance is missing", "\n".join(report["findings"]))
+
+    def test_parity_report_rejects_missing_host_identity(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos = _macos_artifact()
+            macos.pop("host")
+            windows = _windows_artifact()
+            windows["host"]["platform"] = "darwin"
+            macos_path = self._write_artifact(directory, "macos.json", macos)
+            windows_path = self._write_artifact(directory, "windows.json", windows)
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("macos: artifact host identity is missing", findings)
+        self.assertIn("windows: artifact host platform must be 'win32'", findings)
+
+    def test_parity_report_rejects_source_fingerprint_mismatch(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact(source=_source("a" * 64)))
+            windows_path = self._write_artifact(directory, "windows.json", _windows_artifact(source=_source("c" * 64)))
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("source provenance mismatch", findings)
+        self.assertFalse(report["results"]["macos"]["ok"])
+        self.assertFalse(report["results"]["windows"]["ok"])
+
+    def test_parity_report_rejects_missing_or_mismatched_parity_run_id(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos = _macos_artifact()
+            macos.pop("parityRunId")
+            macos_path = self._write_artifact(directory, "macos.json", macos)
+            windows_path = self._write_artifact(directory, "windows.json", _windows_artifact(parityRunId="other-run"))
+
+            missing_report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+            macos_path = self._write_artifact(directory, "macos-2.json", _macos_artifact(parityRunId="mac-run"))
+            windows_path = self._write_artifact(directory, "windows-2.json", _windows_artifact(parityRunId="win-run"))
+            mismatch_report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        self.assertFalse(missing_report["ok"])
+        self.assertIn("macos: artifact parityRunId is missing or invalid", "\n".join(missing_report["findings"]))
+        self.assertFalse(missing_report["results"]["macos"]["ok"])
+        self.assertFalse(mismatch_report["ok"])
+        self.assertIn("parity run mismatch", "\n".join(mismatch_report["findings"]))
+        self.assertFalse(mismatch_report["results"]["windows"]["ok"])
+
+    def test_parity_report_rejects_windows_artifact_without_dpi_or_virtual_screen_proof(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            windows = _windows_artifact()
+            windows["checks"]["helperSelftest"] = {"ok": True}
+            windows["checks"]["powershellPreflight"] = {"ok": True}
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact())
+            windows_path = self._write_artifact(directory, "windows.json", windows)
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("windows: DPI awareness proof is missing", findings)
+        self.assertIn("windows: virtual screen bounds proof is missing", findings)
+        self.assertFalse(report["results"]["windows"]["proofs"]["windowsDpiAwareness"])
+        self.assertFalse(report["results"]["windows"]["proofs"]["windowsVirtualScreen"])
+
+    def test_parity_report_rejects_windows_artifact_without_foreground_activation_proof(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            windows = _windows_artifact()
+            windows["checks"]["interactiveDesktop"]["foregroundActivationVerified"] = False
+            windows["checks"]["interactiveDesktop"]["activateApp"]["foreground"] = False
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact())
+            windows_path = self._write_artifact(directory, "windows.json", windows)
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("windows: Notepad foreground activation proof is missing", findings)
+        self.assertFalse(report["results"]["windows"]["proofs"]["windowsForegroundActivation"])
+
+    def test_parity_report_rejects_windows_artifact_with_forged_foreground_activation_flag(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            windows = _windows_artifact()
+            windows["checks"]["interactiveDesktop"]["foregroundActivationVerified"] = True
+            windows["checks"]["interactiveDesktop"]["activateApp"]["activeProcessId"] = 99
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact())
+            windows_path = self._write_artifact(directory, "windows.json", windows)
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("windows: Notepad foreground activation proof is missing", findings)
+        self.assertFalse(report["results"]["windows"]["proofs"]["windowsForegroundActivation"])
+
+    def test_parity_report_rejects_windows_artifact_without_interactive_session_identity(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            windows = _windows_artifact()
+            windows["status"]["interactiveSessionName"] = "Services"
+            windows["status"]["interactiveSessionId"] = 0
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact())
+            windows_path = self._write_artifact(directory, "windows.json", windows)
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("windows: interactive session identity proof is missing", findings)
+        self.assertFalse(report["results"]["windows"]["proofs"]["windowsInteractiveSessionIdentity"])
+
+    def test_parity_report_rejects_windows_artifact_with_flag_but_no_session_name(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            windows = _windows_artifact()
+            windows["status"].pop("interactiveSessionName")
+            windows["status"]["interactiveSessionId"] = 1
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact())
+            windows_path = self._write_artifact(directory, "windows.json", windows)
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("windows: interactive session identity proof is missing", findings)
+        self.assertFalse(report["results"]["windows"]["proofs"]["windowsInteractiveSessionIdentity"])
+
+    def test_parity_report_rejects_windows_artifact_without_keyboard_or_unicode_proof(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            windows = _windows_artifact()
+            windows["checks"]["interactiveDesktop"]["unicodeTypeVerified"] = False
+            windows["checks"]["interactiveDesktop"]["type"]["textUnits"] = 0
+            windows["checks"]["interactiveDesktop"]["selectAllKeypressVerified"] = False
+            windows["checks"]["interactiveDesktop"]["keypress"]["modifiers"] = []
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact())
+            windows_path = self._write_artifact(directory, "windows.json", windows)
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("windows: Unicode typing proof is missing", findings)
+        self.assertIn("windows: keyboard shortcut mapping proof is missing", findings)
+        self.assertFalse(report["results"]["windows"]["proofs"]["windowsUnicodeTyping"])
+        self.assertFalse(report["results"]["windows"]["proofs"]["windowsKeyboardShortcut"])
+
+    def test_parity_report_rejects_windows_artifact_with_contains_only_clipboard_proof(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            windows = _windows_artifact()
+            windows["checks"]["interactiveDesktop"]["clipboardRoundTrip"]["verified"] = False
+            windows["checks"]["interactiveDesktop"]["clipboardRoundTrip"]["textLength"] += 1
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact())
+            windows_path = self._write_artifact(directory, "windows.json", windows)
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("windows: Notepad clipboard exact round-trip proof is missing", findings)
+        self.assertFalse(report["results"]["windows"]["proofs"]["clipboardRoundTrip"])
+
+    def test_parity_report_rejects_windows_artifact_without_valuepattern_native_proof(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            windows = _windows_artifact()
+            windows["checks"]["interactiveDesktop"]["desktopActSetText"]["nativeAttempt"]["nativeAction"] = "SendInput"
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact())
+            windows_path = self._write_artifact(directory, "windows.json", windows)
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("windows: Notepad desktop.act native ValuePattern text proof is missing", findings)
+        self.assertFalse(report["results"]["windows"]["proofs"]["notepadNativeAct"])
+
+    def test_parity_report_rejects_windows_artifact_without_distinct_valuepattern_text_proof(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            windows = _windows_artifact()
+            windows["checks"]["interactiveDesktop"]["nativeValueVerified"] = False
+            windows["checks"]["interactiveDesktop"]["desktopSnapshotAfter"]["snapshot"]["elements"][0]["value"] = WINDOWS_INTERACTIVE_PASTE_TEXT
+            windows["checks"]["interactiveDesktop"]["clipboardRoundTrip"].update({
+                "expected": WINDOWS_INTERACTIVE_PASTE_TEXT,
+                "textLength": len(WINDOWS_INTERACTIVE_PASTE_TEXT),
+                "textBytes": len(WINDOWS_INTERACTIVE_PASTE_TEXT.encode("utf-8")),
+                "expectedLength": len(WINDOWS_INTERACTIVE_PASTE_TEXT),
+                "expectedBytes": len(WINDOWS_INTERACTIVE_PASTE_TEXT.encode("utf-8")),
+            })
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact())
+            windows_path = self._write_artifact(directory, "windows.json", windows)
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("windows: Notepad desktop.act native ValuePattern text proof is missing", findings)
+        self.assertIn("windows: Notepad clipboard exact round-trip proof is missing", findings)
+        self.assertFalse(report["results"]["windows"]["proofs"]["notepadNativeAct"])
+
+    def test_parity_report_rejects_artifacts_from_old_current_source(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact(source=_source("a" * 64, "b" * 40)))
+            windows_path = self._write_artifact(directory, "windows.json", _windows_artifact(source=_source("a" * 64, "b" * 40)))
+
+            report = report_module.evaluate_artifacts(
+                macos_path,
+                windows_path,
+                current_source={"sourceFingerprint": "c" * 64, "gitHead": "d" * 40, "gitDirty": True},
+            )
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("macos: artifact sourceFingerprint does not match current HostBridge source", findings)
+        self.assertIn("windows: artifact gitHead does not match current checkout", findings)
+        self.assertEqual(report["currentSource"]["sourceFingerprint"], "c" * 64)
+        self.assertFalse(report["results"]["macos"]["ok"])
+        self.assertFalse(report["results"]["windows"]["ok"])
+
+    def test_parity_report_can_skip_current_source_check_for_offline_audits(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact(source=_source("a" * 64, "b" * 40)))
+            windows_path = self._write_artifact(directory, "windows.json", _windows_artifact(source=_source("a" * 64, "b" * 40)))
+
+            report = report_module.evaluate_artifacts(
+                macos_path,
+                windows_path,
+                current_source={"sourceFingerprint": "c" * 64, "gitHead": "d" * 40, "gitDirty": True},
+                enforce_current_source=False,
+            )
+
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["currentSource"]["sourceFingerprint"], "c" * 64)
+        self.assertNotIn("current HostBridge source", "\n".join(report["findings"]))
+
+    def test_parity_report_rejects_stale_artifacts(self) -> None:
+        report_module = _load_report_module()
+        now = 1_800_000_000_000
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            stale = now - (25 * 60 * 60 * 1000)
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact(generatedAt=stale))
+            windows_path = self._write_artifact(directory, "windows.json", _windows_artifact(generatedAt=now))
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path, now_ms=now)
+
+        self.assertFalse(report["ok"])
+        self.assertIn("macos: artifact is stale", "\n".join(report["findings"]))
+
+    def test_parity_report_rejects_missing_windows_live_artifact(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact())
+            windows_path = directory / "windows.json"
+
+            report = report_module.evaluate_artifacts(
+                macos_path,
+                windows_path,
+                artifact_source_paths={"windows": r"C:\Temp\atrium-windows-hostbridge-live.json"},
+            )
+
+        self.assertFalse(report["ok"])
+        self.assertIn("windows: artifact file is missing", report["findings"])
+        self.assertEqual(report["results"]["windows"]["artifactSourcePath"], r"C:\Temp\atrium-windows-hostbridge-live.json")
+        self.assertIn("Copy the Windows full-probe artifact", report["results"]["windows"]["copyHint"])
+        self.assertIn(str(windows_path), report["results"]["windows"]["copyHint"])
+
+    def test_artifact_summary_accepts_matching_windows_live_artifact(self) -> None:
+        summary_module = _load_summary_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            artifact = _windows_artifact()
+            artifact_path = self._write_artifact(directory, "windows.json", artifact)
+
+            summary = summary_module.summarize_artifact(
+                artifact_path,
+                label="windows",
+                expect_parity_run_id="parity-run-1",
+                expect_source_fingerprint=artifact["source"]["sourceFingerprint"],
+                max_artifact_age_hours=24.0,
+            )
+
+        self.assertTrue(summary["ok"])
+        self.assertEqual(summary["label"], "windows")
+        self.assertEqual(summary["hostPlatform"], "win32")
+        self.assertEqual(summary["statusPlatform"], "win32")
+        self.assertTrue(summary["proofs"]["notepadNativeAct"])
+        self.assertTrue(summary["proofs"]["browserActIsolatedPlaywright"])
+        self.assertEqual(summary["findings"], [])
+
+    def test_artifact_summary_rejects_source_mismatch(self) -> None:
+        summary_module = _load_summary_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            artifact = _windows_artifact()
+            artifact_path = self._write_artifact(directory, "windows.json", artifact)
+
+            summary = summary_module.summarize_artifact(
+                artifact_path,
+                label="windows",
+                expect_parity_run_id="parity-run-1",
+                expect_source_fingerprint="f" * 64,
+                max_artifact_age_hours=24.0,
+            )
+
+        self.assertFalse(summary["ok"])
+        self.assertIn("sourceFingerprint mismatch", " ".join(summary["findings"]))
+
+    def test_artifact_summary_rejects_missing_required_windows_proof_facet(self) -> None:
+        summary_module = _load_summary_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            artifact = _windows_artifact()
+            artifact["checks"]["interactiveDesktop"]["desktopActSetText"]["nativeAttempt"]["nativeAction"] = "SendInput"
+            artifact_path = self._write_artifact(directory, "windows.json", artifact)
+
+            summary = summary_module.summarize_artifact(
+                artifact_path,
+                label="windows",
+                expect_parity_run_id="parity-run-1",
+                expect_source_fingerprint=artifact["source"]["sourceFingerprint"],
+                max_artifact_age_hours=24.0,
+            )
+
+        self.assertFalse(summary["ok"])
+        self.assertFalse(summary["proofs"]["notepadNativeAct"])
+        self.assertIn("required proof facet notepadNativeAct", " ".join(summary["findings"]))
+
+    def test_source_summary_rejects_source_mismatch_before_probe_handoff(self) -> None:
+        source_summary_module = _load_source_summary_module()
+
+        summary = source_summary_module.summarize_source(
+            expect_source_fingerprint="f" * 64,
+            root=REPO_ROOT,
+        )
+
+        self.assertFalse(summary["ok"])
+        self.assertRegex(summary["sourceFingerprint"], r"^[0-9a-f]{64}$")
+        self.assertIn("sourceFingerprint mismatch", " ".join(summary["findings"]))
+
+    def test_parity_report_rejects_missing_browser_ref_proof(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos = _macos_artifact()
+            macos["checks"].pop("browserRef")
+            macos_path = self._write_artifact(directory, "macos.json", macos)
+            windows_path = self._write_artifact(directory, "windows.json", _windows_artifact())
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("macos: browser.snapshot DOM-ref proof is missing, skipped, or failed", findings)
+        self.assertIn("macos: browser.act DOM-ref click proof is missing, skipped, or failed", findings)
+        self.assertIn("macos: browser.act DOM-ref proof did not verify the post-click DOM state", findings)
+
+    def test_parity_report_rejects_interactive_skipped_artifact(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos = _macos_artifact(
+                ok=False,
+                status={
+                    "platform": "darwin",
+                    "browserBridge": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": False,
+                    "macosVisualPreflightChecks": {"foregroundSession": False},
+                },
+            )
+            macos["checks"]["interactiveSkipped"] = {"skipped": True}
+            macos_path = self._write_artifact(directory, "macos.json", macos)
+            windows_path = self._write_artifact(directory, "windows.json", _windows_artifact())
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("macos: interactive desktop proof was skipped", findings)
+        self.assertIn("macos: foregroundSession is not true", findings)
+
+
+if __name__ == "__main__":
+    unittest.main()

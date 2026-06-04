@@ -233,6 +233,8 @@ class Settings(BaseSettings):
     entitlement_desktop_automation: bool = True
     entitlement_external_send: bool = True
     entitlement_credentials: bool = True
+    host_bridge_parity_report_path: Path = Path("./data/host-bridge-parity-report.json")
+    host_bridge_parity_report_max_age_hours: float = 24.0
 
     # ---- eval harness (v2 regression scoring; not an approval gate) ----
     eval_harness_enabled: bool = True

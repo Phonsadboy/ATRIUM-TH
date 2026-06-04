@@ -61,6 +61,7 @@ import type {
   GraphHealthResponse,
   HealthResponse,
   HandoffMessage,
+  HostBridgeParityStatusResponse,
   ImportFileInput,
   ImportFileResponse,
   KnowledgeDebtReport,
@@ -1012,6 +1013,7 @@ export class ApiClient implements CompanyClient {
 
   // ----- Connectors -----
   listConnectors = (): Promise<Connector[]> => this.request('/api/connectors', 'GET')
+  getHostBridgeParity = (): Promise<HostBridgeParityStatusResponse> => this.request('/api/host-bridge/parity', 'GET')
 
   /* ==========================================================
      Phase 4 — Executive console (memory inspector, config diff,
