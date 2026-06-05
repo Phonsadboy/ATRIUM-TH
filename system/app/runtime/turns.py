@@ -104,6 +104,8 @@ def _content_to_text(content: Any) -> str:
             if isinstance(item, dict):
                 if item.get("type") == "text" and item.get("text"):
                     parts.append(str(item["text"]))
+                elif item.get("type") in {"input_image", "image_url"}:
+                    parts.append(_image_block_to_text(item))
                 elif item.get("text"):
                     parts.append(str(item["text"]))
                 else:
@@ -112,6 +114,27 @@ def _content_to_text(content: Any) -> str:
                 parts.append(str(item))
         return "\n".join(parts)
     return str(content or "")
+
+
+def _image_block_to_text(item: dict[str, Any]) -> str:
+    raw_url = str(item.get("image_url") or item.get("url") or "")
+    mime = "image"
+    byte_hint = ""
+    if raw_url.startswith("data:"):
+        header, _, data = raw_url.partition(",")
+        declared = header[5:].split(";", 1)[0].strip()
+        if declared:
+            mime = declared
+        if data:
+            byte_hint = f", approxBase64Chars={len(data)}"
+    elif raw_url:
+        byte_hint = ", url omitted from runtime prompt"
+    detail = str(item.get("detail") or "").strip()
+    detail_text = f", detail={detail}" if detail else ""
+    return (
+        f"[attached {mime} omitted from Letta runtime text prompt{detail_text}{byte_hint}; "
+        "use the adjacent attachment metadata or artifact id if visual inspection is required]"
+    )
 
 
 def _serialize_messages(messages: list[LLMMessage] | None) -> str:

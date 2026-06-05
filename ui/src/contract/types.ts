@@ -363,6 +363,7 @@ export interface ChatMessage {
   toolRunId?: ID | null
   contentFormat?: MessageRenderFormat | null
   render?: MessageRenderMetadata | null
+  runtime?: Record<string, unknown> | null
   /** adaptive-thinking transparency (present from the FastAPI backend) */
   reasoning?: string | null
   reasoningSummary?: string | null

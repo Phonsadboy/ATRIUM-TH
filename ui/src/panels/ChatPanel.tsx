@@ -86,6 +86,10 @@ function isWorkStatusLine(m: ChatMessage): boolean {
   return m.role === 'system' && (m.flow?.kind === 'department_work' || m.flow?.kind === 'handoff')
 }
 
+function isRuntimeDependencyMessage(m: ChatMessage): boolean {
+  return m.error?.code === 'runtime_dependency' || (m.render?.notices ?? []).includes('runtime_dependency')
+}
+
 function workStatusTone(m: ChatMessage): string {
   const event = String(m.flow?.refs?.event ?? '')
   if (event.includes('blocked') || event.includes('rejected') || event.includes('revising') || event.includes('escalated')) {
@@ -670,6 +674,7 @@ function MessageRow({
   // the final answer, which renders at the very bottom of the bubble.
   const { rail, answer } = mine ? { rail: null, answer: m.text } : splitTurnSegments(m)
   const tailActive = !!m.streaming && !answer.trim()
+  const runtimeDependency = isRuntimeDependencyMessage(m)
 
   if (m.role === 'system') {
     if (isWorkStatusLine(m)) {
@@ -713,7 +718,7 @@ function MessageRow({
                 )}
               </div>
             </div>
-            <NoticeCards m={m} onResolveApproval={(id, d) => client.resolveApproval(id, d)} />
+            <NoticeCards m={m} onResolveApproval={(id, d) => client.resolveApproval(id, d)} onOpenCitation={onOpenCitation} />
           </div>
         </div>
       )
@@ -726,7 +731,7 @@ function MessageRow({
             <span className="ml-1.5 opacity-70">{timeLabel(m.ts)}</span>
           </div>
         )}
-        <NoticeCards m={m} onResolveApproval={(id, d) => client.resolveApproval(id, d)} />
+        <NoticeCards m={m} onResolveApproval={(id, d) => client.resolveApproval(id, d)} onOpenCitation={onOpenCitation} />
         <FlowCard m={m} />
       </div>
     )
@@ -805,9 +810,9 @@ function MessageRow({
           )}
           <AttachmentStrip items={m.attachments} accent={accent} mine={mine} />
 
-          <NoticeCards m={m} onResolveApproval={(id, d) => client.resolveApproval(id, d)} />
+          <NoticeCards m={m} onResolveApproval={(id, d) => client.resolveApproval(id, d)} onOpenCitation={onOpenCitation} />
           <FlowCard m={m} />
-          {!mine && <Citations render={m.render} onOpen={onOpenCitation} />}
+          {!mine && !runtimeDependency && <Citations render={m.render} onOpen={onOpenCitation} />}
         </div>
 
         <Reactions m={m} onToggle={(e, on) => onAction(on ? 'react' : 'unreact', m, e)} />
