@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from email.message import Message
 from html.parser import HTMLParser
 from typing import Any
@@ -607,6 +608,64 @@ def _searxng_search(args: dict[str, Any], settings: Settings, *, count: int, tim
     return out
 
 
+def _bing_search(args: dict[str, Any], settings: Settings, *, count: int, timeout: float) -> dict[str, Any]:
+    query = _str_arg(args, "query")
+    if not query:
+        raise ValueError("web.search requires query")
+    market = _str_arg(args, "market") or _str_arg(args, "mkt") or "en-US"
+    params = {
+        "format": "rss",
+        "q": query,
+        "mkt": market,
+    }
+    url = f"https://www.bing.com/search?{urllib.parse.urlencode(params)}"
+    cache_key = json.dumps({"provider": "bing", "params": params, "count": count}, sort_keys=True)
+    ttl_s = max(0, int(settings.web_search_cache_ttl_s))
+    cached = _cache_get(cache_key, ttl_s)
+    if cached:
+        return cached
+    started = time.time()
+    response = _bounded_get(
+        url,
+        timeout=timeout,
+        max_bytes=1_000_000,
+        headers=_headers({"Accept": "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8"}),
+        allow_private_hosts=False,
+    )
+    text = _decode_body(response["body"], response["headers"])
+    if response["status"] >= 400:
+        raise ValueError(f"Bing returned HTTP {response['status']}: {_clip(text, 500)[0]}")
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as exc:
+        raise ValueError("Bing did not return parseable RSS") from exc
+    results: list[dict[str, Any]] = []
+    channel = root.find("channel")
+    items = channel.findall("item") if channel is not None else root.findall(".//item")
+    for index, item in enumerate(items):
+        title = _compact_space("".join(item.findtext("title") or ""))
+        result_url = _compact_space("".join(item.findtext("link") or ""))
+        description = _compact_space("".join(item.findtext("description") or ""))
+        if title and result_url:
+            results.append({
+                "title": html.unescape(title),
+                "url": html.unescape(result_url),
+                "description": html.unescape(description),
+                "position": index + 1,
+                "engine": "bing",
+            })
+        if len(results) >= count:
+            break
+    out = _search_payload(
+        provider="bing",
+        query=query,
+        results=results,
+        took_ms=int((time.time() - started) * 1000),
+    )
+    _cache_put(cache_key, out, ttl_s)
+    return out
+
+
 def _search_payload(*, provider: str, query: str, results: list[dict[str, Any]], took_ms: int) -> dict[str, Any]:
     normalized = []
     for index, item in enumerate(results):
@@ -656,12 +715,20 @@ def execute_web_search(args: dict[str, Any]) -> dict[str, Any]:
             return result
         except Exception as exc:
             errors.append(f"duckduckgo: {exc}")
+        try:
+            result = _bing_search(args, settings, count=count, timeout=timeout)
+            result["fallbackErrors"] = errors
+            return result
+        except Exception as exc:
+            errors.append(f"bing: {exc}")
             raise ValueError("; ".join(errors)) from exc
     if provider in {"duckduckgo", "ddg"}:
         return _duckduckgo_search(args, settings, count=count, timeout=timeout)
     if provider in {"searxng", "searx"}:
         return _searxng_search(args, settings, count=count, timeout=timeout)
-    raise ValueError("web.search provider must be auto, duckduckgo, or searxng")
+    if provider == "bing":
+        return _bing_search(args, settings, count=count, timeout=timeout)
+    raise ValueError("web.search provider must be auto, duckduckgo, searxng, or bing")
 
 
 def execute_web_fetch(args: dict[str, Any]) -> dict[str, Any]:
