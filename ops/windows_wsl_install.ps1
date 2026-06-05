@@ -189,8 +189,17 @@ Set-Content -Path $tempScript -Value $bashScript -Encoding ascii
 
 try {
     Write-Step "Run ATRIUM setup inside WSL"
-    $wslScriptPath = ((& wsl -d $Distro -- wslpath -a $tempScript) | Select-Object -Last 1).Trim()
-    & wsl -d $Distro -- bash $wslScriptPath
+    # Pipe the bash script to WSL via stdin instead of translating a Windows path
+    # to a WSL path. `wsl wslpath -a $tempScript` can return $null on some Windows
+    # configurations (PowerShell argument passing eats backslashes), which then
+    # caused `((... ) | Select-Object -Last 1).Trim()` to throw
+    # "You cannot call a method on a null-valued expression".
+    # Reading via stdin avoids any path translation; CRLF is normalised to LF so
+    # `set -e` style scripts do not break on Windows line endings.
+    $bashScript -replace "`r`n", "`n" | & wsl -d $Distro -- bash -s
+    if ($LASTEXITCODE -ne 0) {
+        throw "WSL bash script exited with code $LASTEXITCODE"
+    }
 }
 finally {
     Remove-Item -Path $tempScript -ErrorAction SilentlyContinue
