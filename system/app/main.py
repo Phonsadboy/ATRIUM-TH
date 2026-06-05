@@ -3993,14 +3993,14 @@ def _connector_catalog() -> list[dict[str, Any]]:
             name="Web search and page read",
             kind="web",
             status="available",
-            description="Search and read public web pages without paid API keys. Uses configured SearXNG when present, otherwise DuckDuckGo HTML for search; browser screenshots remain available for visual pages.",
+            description="Search and read public web pages without paid API keys. Uses configured SearXNG when present, otherwise DuckDuckGo HTML with Bing RSS fallback for search; browser screenshots remain available for visual pages.",
             tools=["web.search", "web.fetch"],
-            capabilities=["key_free_search", "duckduckgo_html", "searxng_optional", "page_text_extract", "image_url_extract"],
+            capabilities=["key_free_search", "duckduckgo_html", "bing_rss_fallback", "searxng_optional", "page_text_extract", "image_url_extract"],
             requires=[],
             runtime_status=(
-                "SearXNG configured; DuckDuckGo fallback ready"
+                "SearXNG configured; DuckDuckGo and Bing fallback ready"
                 if get_settings().web_search_searxng_url
-                else "DuckDuckGo key-free fallback ready"
+                else "DuckDuckGo/Bing key-free fallback ready"
             ),
             read_ready=True,
             write_ready=False,

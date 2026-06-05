@@ -292,8 +292,9 @@ class Settings(BaseSettings):
     telegram_gateway_timeout_s: float = 20.0
 
     # ---- key-free web research tools ----
-    # Search defaults to DuckDuckGo's HTML endpoint and can prefer a self-hosted
-    # SearXNG instance when ATRIUM_WEB_SEARCH_SEARXNG_URL is set.
+    # Search defaults to DuckDuckGo's HTML endpoint with Bing RSS as a fallback,
+    # and can prefer a self-hosted SearXNG instance when
+    # ATRIUM_WEB_SEARCH_SEARXNG_URL is set.
     web_search_provider: str = Field(
         default="auto",
         validation_alias=AliasChoices("ATRIUM_WEB_SEARCH_PROVIDER", "WEB_SEARCH_PROVIDER"),
