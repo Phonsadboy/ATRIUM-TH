@@ -9,6 +9,7 @@ import type {
 } from './client'
 import type {
   AiProviderId,
+  ActivityEvent,
   Approval,
   ApprovalStatus,
   Artifact,
@@ -247,6 +248,7 @@ export class ApiClient implements CompanyClient {
   /** Live token-stream overlays keyed by server message id (msg_start..msg_done). */
   private streaming = new Map<string, StreamState>()
   private streamRepaintQueued = false
+  private activityReplayQueued = false
 
   constructor(baseUrl: string) {
     this.baseUrl = baseUrl.replace(/\/+$/, '')
@@ -1225,6 +1227,7 @@ export class ApiClient implements CompanyClient {
   /** Adopt a fresh server snapshot, then re-apply still-relevant optimistic overlays. */
   private applyServerState(server: CompanyState): void {
     if (this.devHold) return // a local demo seed owns the store (DEV only)
+    const replayAfterId = this.state.activity[0]?.id ?? null
     this.serverThreads = server.threads ?? {}
     // drop finished streaming overlays once the snapshot carries the final
     // (non-pending) message — prevents flicker / double render.
@@ -1238,7 +1241,9 @@ export class ApiClient implements CompanyClient {
       const arr = this.serverThreads[m.threadId] ?? []
       return !arr.some((x) => !!m.clientMessageId && x.clientMessageId === m.clientMessageId)
     })
-    this.setState({ ...server, executiveQueue: server.executiveQueue ?? [], threads: this.mergedThreads() })
+    const activity = this.mergeActivity(server.activity ?? [], this.state.activity)
+    this.setState({ ...server, activity, executiveQueue: server.executiveQueue ?? [], threads: this.mergedThreads() })
+    if (replayAfterId) void this.replayActivitySince(replayAfterId)
   }
 
   private patchDeptLocal(departmentId: string, patch: EditDepartmentInput): void {
@@ -1294,6 +1299,7 @@ export class ApiClient implements CompanyClient {
       if (msg.type === 'state') this.applyServerState(msg.state)
       else if (msg.type === 'pulse') this.routePulse(msg.event)
       else if (msg.type === 'notify') this.onNotify(msg.notification as Notification)
+      else if (msg.type === 'activity') this.onActivity(msg.activity as ActivityEvent)
     }
     ws.onclose = () => {
       this.ws = null
@@ -1406,6 +1412,51 @@ export class ApiClient implements CompanyClient {
   private setState(state: CompanyState): void {
     this.state = state
     this.listeners.forEach((listener) => listener(this.state))
+  }
+
+  private mergeActivity(...groups: (ActivityEvent[] | undefined)[]): ActivityEvent[] {
+    const byId = new Map<string, ActivityEvent>()
+    for (const group of groups) {
+      for (const event of group ?? []) {
+        if (!event?.id) continue
+        const prev = byId.get(event.id)
+        byId.set(event.id, prev ? { ...prev, ...event } : event)
+      }
+    }
+    return Array.from(byId.values())
+      .sort((a, b) => (b.ts === a.ts ? b.id.localeCompare(a.id) : b.ts - a.ts))
+      .slice(0, 80)
+  }
+
+  private onActivity(event: ActivityEvent): void {
+    if (!event?.id) return
+    this.setState({
+      ...this.state,
+      now: Date.now(),
+      activity: this.mergeActivity([event], this.state.activity),
+    })
+  }
+
+  private async replayActivitySince(afterId: string): Promise<void> {
+    if (this.activityReplayQueued) return
+    this.activityReplayQueued = true
+    try {
+      const events = await this.request<ActivityEvent[]>(
+        `/api/activity${this.qs({ after: afterId, limit: 1000 })}`,
+        'GET',
+      )
+      if (events.length) {
+        this.setState({
+          ...this.state,
+          now: Date.now(),
+          activity: this.mergeActivity(events, this.state.activity),
+        })
+      }
+    } catch {
+      /* activity replay is best-effort; the next snapshot/reconnect retries. */
+    } finally {
+      this.activityReplayQueued = false
+    }
   }
 
   /* ---------- Live chat streaming overlay ---------- */

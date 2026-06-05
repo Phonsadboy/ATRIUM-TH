@@ -43,6 +43,7 @@ _engine: AsyncEngine | None = None
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
 SQLITE_SCHEMA_METADATA_TABLE = "atrium_schema_metadata"
 SQLITE_SCHEMA_STAMP_VERSION = 1
+_SESSION_ACTIVITY_EVENTS_KEY = "atrium_activity_events"
 
 _SQLITE_ADDITIVE_COLUMNS = {
     "tasks": {
@@ -200,15 +201,33 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
         try:
             yield session
             await session.commit()
+            publish_session_activity(session)
         except Exception:
             await session.rollback()
+            session.info.pop(_SESSION_ACTIVITY_EVENTS_KEY, None)
             raise
 
 
 async def commit_and_release(session: AsyncSession) -> None:
     """Commit pending work and return the checked-out connection to the pool."""
     await session.commit()
+    publish_session_activity(session)
     await session.close()
+
+
+def record_session_activity(session: AsyncSession, event: dict[str, Any]) -> None:
+    session.info.setdefault(_SESSION_ACTIVITY_EVENTS_KEY, []).append(dict(event))
+
+
+def publish_session_activity(session: AsyncSession) -> None:
+    events = session.info.pop(_SESSION_ACTIVITY_EVENTS_KEY, [])
+    if not events:
+        return
+    from ..events import hub
+
+    for event in events:
+        hub.activity(event)
+    hub.mark_dirty()
 
 
 async def init_db() -> None:

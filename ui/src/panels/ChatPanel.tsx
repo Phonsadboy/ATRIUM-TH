@@ -27,6 +27,7 @@ import {
   QuickReactBar,
   QuotePreview,
   Reactions,
+  StepTrail,
   TurnActivity,
   TurnTimeline,
   TypingDots,
@@ -680,44 +681,29 @@ function MessageRow({
     if (isWorkStatusLine(m)) {
       const tone = workStatusTone(m)
       const steps = m.flow?.steps ?? []
+      const kindLabel = m.flow?.kind === 'handoff' ? 'ส่งต่องาน' : 'สถานะงาน'
+      // Collapsed to a single muted line so the conversation (user + AI) stays
+      // in focus; the chevron reveals the full text + step trail on demand.
       return (
-        <div id={`msg-${m.id}`} className="my-2 flex justify-center">
-          <div
-            className="min-w-0 max-w-[92%] rounded-lg px-3 py-2 text-[12px]"
-            style={{
-              background: withAlpha(tone, 0.1),
-              border: `1px solid ${withAlpha(tone, 0.28)}`,
-              color: 'var(--color-cream-dim)',
-            }}
-          >
-            <div className="flex min-w-0 items-start gap-2">
-              <span className="mt-0.5 h-2 w-2 shrink-0 rounded-full" style={{ background: tone }} />
-              <div className="min-w-0 flex-1">
-                <div className="flex min-w-0 flex-wrap items-baseline gap-x-1.5 gap-y-0.5">
-                  <span className="font-medium" style={{ color: 'var(--color-cream)' }}>
-                    {m.flow?.kind === 'handoff' ? 'ส่งต่องาน' : 'สถานะงาน'}
-                  </span>
-                  <span className="min-w-0 break-words">{m.text}</span>
-                  <span className="shrink-0 opacity-70">{timeLabel(m.ts)}</span>
-                </div>
-                {steps.length > 0 && (
-                  <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-1 text-[11px] text-[var(--color-cream-faint)]">
-                    {steps.map((s, i) => (
-                      <span key={`${s.kind}-${i}`} className="inline-flex min-w-0 items-center gap-1">
-                        {i > 0 && <span style={{ color: withAlpha(tone, 0.85) }}>→</span>}
-                        <span
-                          className="max-w-[160px] truncate rounded-md px-1.5 py-0.5"
-                          style={{ background: withAlpha(tone, 0.12) }}
-                          title={s.label || s.kind}
-                        >
-                          {s.label || s.kind}
-                        </span>
-                      </span>
-                    ))}
-                  </div>
-                )}
-              </div>
+        <div id={`msg-${m.id}`} className="my-0.5 flex flex-col items-center">
+          <details className="group min-w-0 max-w-[94%]">
+            <summary
+              className="flex min-w-0 cursor-pointer list-none items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] text-[var(--color-cream-faint)] transition-colors hover:bg-[var(--color-surface)]"
+            >
+              <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: tone }} />
+              <span className="shrink-0 font-medium" style={{ color: withAlpha(tone, 0.92) }}>{kindLabel}</span>
+              <span className="min-w-0 flex-1 truncate group-open:hidden">{m.text}</span>
+              <span className="shrink-0 opacity-60">{timeLabel(m.ts)}</span>
+              <span className="shrink-0 opacity-60 transition-transform group-open:rotate-90">▸</span>
+            </summary>
+            <div className="mt-1 space-y-1.5 px-2 pb-1">
+              <p className="min-w-0 whitespace-pre-wrap break-words text-[12px] leading-relaxed text-[var(--color-cream-dim)]">
+                {m.text}
+              </p>
+              <StepTrail steps={steps} color={tone} />
             </div>
+          </details>
+          <div className="w-full max-w-[94%]">
             <NoticeCards m={m} onResolveApproval={(id, d) => client.resolveApproval(id, d)} onOpenCitation={onOpenCitation} />
           </div>
         </div>

@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { AnimatePresence, motion } from 'framer-motion'
 import { useSelector, shallowArrayEqual } from '../state/useCompany'
 import { Dot, withAlpha } from '../components/primitives'
@@ -43,7 +43,8 @@ function Chevron({ open }: { open: boolean }) {
 
 export function ActivityTicker() {
   const [open, setOpen] = useState(false)
-  const events = useSelector((s) => s.activity.slice(0, 6), shallowArrayEqual)
+  const [departmentFilter, setDepartmentFilter] = useState('all')
+  const activity = useSelector((s) => s.activity, shallowArrayEqual)
   const now = useSelector((s) => s.now)
   const departments = useSelector(
     (s) =>
@@ -54,10 +55,37 @@ export function ActivityTicker() {
         agentName: d.agentName,
         accent: d.accent,
       })),
-    (a, b) => a.length === b.length && a.every((x, i) => x.id === b[i].id),
+    (a, b) =>
+      a.length === b.length &&
+      a.every(
+        (x, i) =>
+          x.id === b[i].id &&
+          x.name === b[i].name &&
+          x.agentName === b[i].agentName &&
+          x.emoji === b[i].emoji &&
+          x.accent === b[i].accent,
+      ),
   )
+  const filteredActivity =
+    departmentFilter === 'all'
+      ? activity
+      : activity.filter((event) => event.departmentId === departmentFilter)
+  const events = filteredActivity.slice(0, 6)
   const deptOf = (id: string | null) => (id ? departments.find((d) => d.id === id) : undefined)
   const latest = events[0]
+  const filterDept = deptOf(departmentFilter)
+  const filterLabel =
+    departmentFilter === 'all'
+      ? 'ทุกแผนก'
+      : filterDept
+        ? `${filterDept.emoji} ${isExec(filterDept.id) ? filterDept.name : `ฝ่าย${filterDept.name}`}`
+        : 'แผนกนี้'
+
+  useEffect(() => {
+    if (departmentFilter !== 'all' && !departments.some((department) => department.id === departmentFilter)) {
+      setDepartmentFilter('all')
+    }
+  }, [departmentFilter, departments])
 
   return (
     <div
@@ -112,11 +140,38 @@ export function ActivityTicker() {
               className="overflow-hidden"
             >
               <div
-                className="max-h-[300px] space-y-px overflow-y-auto px-1.5 pb-2"
+                className="space-y-px px-1.5 pb-2"
                 style={{ borderTop: '1px solid var(--color-line-soft)' }}
               >
+                <div className="flex items-center gap-2 px-1.5 py-2">
+                  <select
+                    aria-label="กรองความเคลื่อนไหวตามแผนก"
+                    value={departmentFilter}
+                    onChange={(event) => setDepartmentFilter(event.target.value)}
+                    className="min-w-0 flex-1 rounded-md border px-2 py-1 text-[11px] text-[var(--color-cream-dim)] outline-none transition-colors focus:border-[var(--color-accent-amber)]"
+                    style={{
+                      background: withAlpha('#1a1610', 0.72),
+                      borderColor: 'var(--color-line-soft)',
+                    }}
+                  >
+                    <option value="all">ทุกแผนก</option>
+                    {departments.map((department) => (
+                      <option key={department.id} value={department.id}>
+                        {department.emoji} {isExec(department.id) ? department.name : `ฝ่าย${department.name}`}
+                      </option>
+                    ))}
+                  </select>
+                  <span className="shrink-0 text-[10px] tabular-nums text-[var(--color-cream-faint)]">
+                    {filteredActivity.length} รายการ
+                  </span>
+                </div>
+                <div className="max-h-[260px] space-y-px overflow-y-auto">
                 <AnimatePresence initial={false}>
-                  {events.map((e) => {
+                  {events.length === 0 ? (
+                    <div className="rounded-lg px-2 py-3 text-[12px] text-[var(--color-cream-faint)]">
+                      ยังไม่มีความเคลื่อนไหวของ{filterLabel}
+                    </div>
+                  ) : events.map((e) => {
                     const d = deptOf(e.departmentId)
                     const col = SEVERITY_HEX[e.severity]
                     return (
@@ -156,6 +211,7 @@ export function ActivityTicker() {
                     )
                   })}
                 </AnimatePresence>
+                </div>
               </div>
             </motion.div>
           )}

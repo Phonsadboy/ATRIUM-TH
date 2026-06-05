@@ -77,6 +77,17 @@ class SeedDefaultsTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(restored["autonomy"])
 
+    async def test_department_snapshot_defaults_missing_autonomy_by_department_kind(self) -> None:
+        from app.db.repo import _normalize_department_for_snapshot
+
+        executive = _normalize_department_for_snapshot({"id": "exec"})
+        regular = _normalize_department_for_snapshot({"id": "research"})
+        disabled = _normalize_department_for_snapshot({"id": "engineering", "autonomy": False})
+
+        self.assertTrue(executive["autonomy"])
+        self.assertFalse(regular["autonomy"])
+        self.assertFalse(disabled["autonomy"])
+
 
 if __name__ == "__main__":
     unittest.main()

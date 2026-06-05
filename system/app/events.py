@@ -4,6 +4,7 @@ The contract has two channels (mirroring CompanyClient.subscribe / onPulse):
   * `state`  — a full CompanyState snapshot (sent on every meaningful change)
   * `pulse`  — a transient effect signal for canvas animation
   * `notify` — v0.4 notifications (new addressable channel; UI may ignore)
+  * `activity` — a committed activity event for the live activity feed
 
 Full snapshots keep the WsClient trivial: it just replaces its state on each
 `state` message. For a local single-user company the snapshot is small and
@@ -75,6 +76,9 @@ class Hub:
 
     def notify(self, notification: dict[str, Any]) -> None:
         self._emit({"type": "notify", "notification": notification})
+
+    def activity(self, event: dict[str, Any]) -> None:
+        self._emit({"type": "activity", "activity": event})
 
     def mark_dirty(self) -> None:
         """Engine ticks call this; the flusher coalesces bursts into one snapshot."""

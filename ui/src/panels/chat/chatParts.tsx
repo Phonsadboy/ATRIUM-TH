@@ -8,6 +8,7 @@ import { client } from '../../state/useCompany'
 import { Markdown } from './Markdown'
 import type {
   AccentName,
+  ChatFlowStep,
   ChatMessage,
   ChatToolRun,
   MessageCitation,
@@ -880,6 +881,28 @@ export function NoticeCards({
 
 /* ============================ Flow card ============================ */
 
+/** A compact arrow-separated trail of flow steps. Shared by the inline FlowCard
+ *  and the collapsible work-status line so they read identically. */
+export function StepTrail({ steps, color }: { steps: ChatFlowStep[]; color: string }) {
+  if (!steps.length) return null
+  return (
+    <div className="flex min-w-0 flex-wrap items-center gap-1 text-[11px] text-[var(--color-cream-faint)]">
+      {steps.map((s, i) => (
+        <span key={`${s.kind}-${i}`} className="inline-flex min-w-0 items-center gap-1">
+          {i > 0 && <span style={{ color: withAlpha(color, 0.85) }}>→</span>}
+          <span
+            className="max-w-[160px] truncate rounded-md px-1.5 py-0.5"
+            style={{ background: withAlpha(color, 0.14) }}
+            title={s.label || s.kind}
+          >
+            {s.label || s.kind}
+          </span>
+        </span>
+      ))}
+    </div>
+  )
+}
+
 function sameFlowText(a?: string | null, b?: string | null): boolean {
   const x = (a ?? '').replace(/\s+/g, ' ').trim()
   const y = (b ?? '').replace(/\s+/g, ' ').trim()
@@ -898,25 +921,13 @@ export function FlowCard({ m }: { m: ChatMessage }) {
   ) {
     return null
   }
+  // Light inline trail (no boxed card) so the flow recedes behind the message text.
   return (
-    <div
-      className="mt-2 rounded-xl px-3 py-2 text-[13px]"
-      style={{ background: 'var(--color-surface)', border: '1px solid var(--color-line-soft)' }}
-    >
-      {flow.title && <div className="mb-1.5 font-medium" style={{ color: 'var(--color-cream)' }}>{flow.title}</div>}
-      <div className="flex flex-wrap items-center gap-1 text-[var(--color-cream-faint)]">
-        {flow.steps.map((s, i) => (
-          <span key={i} className="inline-flex items-center gap-1">
-            {i > 0 && <span style={{ color: '#b3a4ee' }}>→</span>}
-            <span
-              className="rounded-md px-1.5 py-0.5"
-              style={{ background: withAlpha('#b3a4ee', 0.12) }}
-            >
-              {s.label || s.kind}
-            </span>
-          </span>
-        ))}
-      </div>
+    <div className="mt-1.5 flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1">
+      {flow.title && (
+        <span className="text-[11px] font-medium text-[var(--color-cream-dim)]">{flow.title}</span>
+      )}
+      <StepTrail steps={flow.steps} color="#b3a4ee" />
     </div>
   )
 }

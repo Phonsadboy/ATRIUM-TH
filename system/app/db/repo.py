@@ -30,7 +30,7 @@ from ..memory.graph_store import get_graph_mirror
 from ..task_review import TASK_REVIEW_REMINDER_KIND
 from ..threads import EXEC_ID, EXEC_THREAD, thread_id_for
 from . import tables as T
-from .base import sqlite_schema_status
+from .base import record_session_activity, sqlite_schema_status
 
 MAX_ACTIVITY = 80
 MAX_MSGS = 60
@@ -264,6 +264,7 @@ def _normalize_department_for_snapshot(dept: dict[str, Any]) -> dict[str, Any]:
     data["model"] = model
     data["thinkingEffort"] = coerce_thinking_effort(model, str(data.get("thinkingEffort") or "high"))
     data["speed"] = coerce_model_speed(model, str(data.get("speed") or "standard"))
+    data["autonomy"] = bool(data.get("autonomy", data.get("id") == EXEC_ID))
     visibility = data.get("visibilityPolicy")
     if isinstance(visibility, dict):
         data["visibilityPolicy"] = {
@@ -1392,6 +1393,7 @@ class Repo:
     async def add_activity(self, ev: dict) -> None:
         ev = self._normalize_activity_event(ev)
         self.s.add(T.Activity(id=ev["id"], ts=ev["ts"], department_id=ev.get("departmentId"), data=ev))
+        record_session_activity(self.s, ev)
         if self._activity_should_add_chat_line(ev):
             await self.add_message(system_chat_message(
                 _activity_chat_thread_id(ev),

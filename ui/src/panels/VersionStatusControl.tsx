@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Icon } from '../components/Icon'
 import { withAlpha } from '../components/primitives'
 import type { VersionStatusResponse, VersionUpdateResponse } from '../contract/types'
@@ -6,6 +6,7 @@ import { ACCENT_HEX } from '../lib/visuals'
 import { client } from '../state/useCompany'
 
 const VERSION_CHECK_INTERVAL_MS = 5 * 60 * 1000
+const MIN_CHECK_VISIBLE_MS = 650
 
 function isWarning(status: VersionStatusResponse): boolean {
   return status.status === 'outdated' || status.status === 'diverged' || status.status === 'unknown'
@@ -18,7 +19,7 @@ function compactLabel(status: VersionStatusResponse, loadError: boolean, updateO
   if (status.status === 'diverged') return 'branch แยก'
   if (status.status === 'ahead') return 'ใหม่กว่า GitHub'
   if (status.status === 'unknown') return 'ตรวจไม่ชัด'
-  return 'ตรวจเวอร์ชัน'
+  return 'ล่าสุดแล้ว'
 }
 
 function compactColor(status: VersionStatusResponse | null, loadError: boolean, updateOk: boolean): string {
@@ -50,8 +51,12 @@ export function VersionStatusControl() {
   const [checking, setChecking] = useState(false)
   const [updating, setUpdating] = useState(false)
   const [updateResult, setUpdateResult] = useState<VersionUpdateResponse | null>(null)
+  const checkRunRef = useRef(0)
 
   const load = useCallback(async (isActive: () => boolean = () => true) => {
+    const runId = checkRunRef.current + 1
+    checkRunRef.current = runId
+    const startedAt = Date.now()
     setChecking(true)
     try {
       const next = await client.getVersionStatus()
@@ -64,7 +69,11 @@ export function VersionStatusControl() {
       setStatus(null)
       setLoadError(true)
     } finally {
-      if (isActive()) setChecking(false)
+      const remainingMs = MIN_CHECK_VISIBLE_MS - (Date.now() - startedAt)
+      if (remainingMs > 0) {
+        await new Promise((resolve) => window.setTimeout(resolve, remainingMs))
+      }
+      if (isActive() && checkRunRef.current === runId) setChecking(false)
     }
   }, [])
 
@@ -85,8 +94,18 @@ export function VersionStatusControl() {
   const warning = Boolean(status && isWarning(status)) || loadError
   const updateOk = Boolean(updateResult?.ok)
   const color = compactColor(status, loadError, updateOk)
-  const label = status ? compactLabel(status, loadError, updateOk) : checking ? 'กำลังตรวจ' : 'ตรวจเวอร์ชัน'
-  const detail = updateResult?.message ?? detailText(status, loadError)
+  const label = updating
+    ? 'กำลังอัปเดต'
+    : checking
+      ? 'กำลังตรวจ'
+      : status
+        ? compactLabel(status, loadError, updateOk)
+        : 'ตรวจเวอร์ชัน'
+  const detail = updating
+    ? 'กำลังอัปเดต, backup, migrate แล้ว restart'
+    : checking
+      ? 'กำลังตรวจเวอร์ชันจาก GitHub'
+      : updateResult?.message ?? detailText(status, loadError)
 
   const updateAndRestart = async () => {
     if (!status || !canUpdate) return
@@ -123,6 +142,7 @@ export function VersionStatusControl() {
         type="button"
         onClick={() => (canUpdate ? void updateAndRestart() : void load())}
         title={detail}
+        aria-busy={checking || updating}
         className="inline-flex h-7 max-w-[180px] items-center gap-1.5 rounded-xl border px-2 text-[10px] font-medium transition-colors hover:text-[var(--color-cream)]"
         style={{
           borderColor: warning ? withAlpha(color, 0.5) : 'var(--color-line-soft)',
@@ -130,10 +150,15 @@ export function VersionStatusControl() {
           background: warning ? withAlpha(color, 0.12) : 'transparent',
         }}
       >
-        <Icon name={warning ? 'alert' : 'clock'} size={12} />
-        <span className="truncate">
-          {updating ? 'กำลังอัปเดต' : label}
-        </span>
+        {checking || updating ? (
+          <span
+            aria-hidden="true"
+            className="inline-block h-3 w-3 shrink-0 animate-spin rounded-full border border-current border-t-transparent"
+          />
+        ) : (
+          <Icon name={warning ? 'alert' : 'clock'} size={12} />
+        )}
+        <span className="truncate">{label}</span>
       </button>
       {canUpdate && (
         <a
