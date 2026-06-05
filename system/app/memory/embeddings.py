@@ -1,9 +1,9 @@
 """Embeddings for RAG.
 
-Claude has no embeddings endpoint (REQUIREMENTS §4.4), so we use a separate
-provider. Voyage AI (Anthropic's recommendation) is the real path; a
-deterministic hash embedder is the offline fallback so retrieval works with
-zero setup. Both produce L2-normalized vectors that cosine-compare sensibly.
+Claude has no embeddings endpoint (REQUIREMENTS §4.4), so ATRIUM uses a
+separate embedding layer. The owner can choose local Ollama, OpenAI Platform,
+Voyage, or the deterministic hash fallback. All paths return L2-normalized
+vectors so cosine comparison remains consistent.
 """
 from __future__ import annotations
 
@@ -161,6 +161,59 @@ class VoyageEmbedder:
         return [_normalize(v) for v in out]
 
 
+class OpenAIEmbedder:
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        base_url: str,
+        *,
+        dimensions: int = 1024,
+        timeout: float = 30.0,
+        transport: httpx.AsyncBaseTransport | None = None,
+    ):
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+        self.dimensions = max(0, int(dimensions or 0))
+        self.timeout = timeout
+        self.dim = self.dimensions or (3072 if model == "text-embedding-3-large" else 1536)
+        self.name = f"openai:{model}"
+        self._transport = transport
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        payload: dict[str, object] = {
+            "input": texts,
+            "model": self.model,
+            "encoding_format": "float",
+        }
+        if self.dimensions > 0:
+            payload["dimensions"] = self.dimensions
+        async with httpx.AsyncClient(timeout=self.timeout, transport=self._transport) as client:
+            resp = await client.post(
+                f"{self.base_url}/embeddings",
+                headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                json=payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        rows = data.get("data")
+        if not isinstance(rows, list):
+            raise ValueError("OpenAI embeddings response missing data list")
+        out = []
+        for item in sorted(rows, key=lambda x: x.get("index", 0) if isinstance(x, dict) else 0):
+            if not isinstance(item, dict) or not isinstance(item.get("embedding"), list):
+                raise ValueError("OpenAI embeddings response contains invalid embedding row")
+            out.append([float(v) for v in item["embedding"]])
+        if len(out) != len(texts):
+            raise ValueError(f"OpenAI embeddings response returned {len(out)} vectors for {len(texts)} inputs")
+        if out:
+            self.dim = len(out[0])
+        return [_normalize(v) for v in out]
+
+
 _embedder: Embedder | None = None
 
 
@@ -182,7 +235,30 @@ def get_embedder(settings: Settings | None = None) -> Embedder:
     if _embedder is not None:
         return _embedder
     settings = settings or get_settings()
-    if settings.prefer_ollama_embeddings:
+    mode = settings.embedding_provider_mode
+    if mode == "openai":
+        api_key = settings.effective_openai_embedding_api_key
+        if not api_key:
+            raise RuntimeError("OpenAI embeddings require ATRIUM_OPENAI_API_KEY or ATRIUM_OPENAI_EMBEDDING_API_KEY")
+        _embedder = OpenAIEmbedder(
+            api_key,
+            settings.openai_embedding_model,
+            settings.effective_openai_embedding_base_url,
+            dimensions=settings.effective_openai_embedding_dimensions,
+        )
+    elif mode == "local":
+        _embedder = OllamaEmbedder(
+            settings.ollama_base_url,
+            settings.ollama_embedding_model,
+            dim=settings.embedding_dim,
+        )
+    elif mode == "voyage":
+        if not settings.voyage_api_key:
+            raise RuntimeError("Voyage embeddings require VOYAGE_API_KEY or ATRIUM_VOYAGE_API_KEY")
+        _embedder = VoyageEmbedder(settings.voyage_api_key, settings.voyage_model, settings.voyage_base_url)
+    elif mode == "hash":
+        _embedder = HashEmbedder(settings.embedding_dim)
+    elif settings.prefer_ollama_embeddings:
         _embedder = OllamaEmbedder(
             settings.ollama_base_url,
             settings.ollama_embedding_model,
@@ -196,8 +272,35 @@ def get_embedder(settings: Settings | None = None) -> Embedder:
 
 
 async def resolve_embedder(settings: Settings | None = None) -> Embedder:
-    """Pick the first working embedder: Ollama → Voyage → hash."""
+    """Resolve the configured embedder.
+
+    auto preserves legacy behavior: reachable Ollama → Voyage → hash. Explicit
+    modes do not silently switch to a paid or remote provider.
+    """
     settings = settings or get_settings()
+    mode = settings.embedding_provider_mode
+    if mode == "openai":
+        api_key = settings.effective_openai_embedding_api_key
+        if not api_key:
+            raise RuntimeError("OpenAI embeddings require ATRIUM_OPENAI_API_KEY or ATRIUM_OPENAI_EMBEDDING_API_KEY")
+        return OpenAIEmbedder(
+            api_key,
+            settings.openai_embedding_model,
+            settings.effective_openai_embedding_base_url,
+            dimensions=settings.effective_openai_embedding_dimensions,
+        )
+    if mode == "local":
+        return OllamaEmbedder(
+            settings.ollama_base_url,
+            settings.ollama_embedding_model,
+            dim=settings.embedding_dim,
+        )
+    if mode == "voyage":
+        if not settings.voyage_api_key:
+            raise RuntimeError("Voyage embeddings require VOYAGE_API_KEY or ATRIUM_VOYAGE_API_KEY")
+        return VoyageEmbedder(settings.voyage_api_key, settings.voyage_model, settings.voyage_base_url)
+    if mode == "hash":
+        return HashEmbedder(settings.embedding_dim)
     if settings.prefer_ollama_embeddings and await ollama_reachable(settings):
         return OllamaEmbedder(
             settings.ollama_base_url,

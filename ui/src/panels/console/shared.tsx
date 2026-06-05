@@ -5,6 +5,7 @@
 // across all console section files).
 import { useEffect, useRef, useState } from 'react'
 import type { ReactNode } from 'react'
+import { ProblemDetails } from '../../components/ProblemDetails'
 import { withAlpha } from '../../components/primitives'
 import { ACCENT_HEX } from '../../lib/visuals'
 import { useSelector, shallowArrayEqual } from '../../state/useCompany'
@@ -145,23 +146,34 @@ export function ErrorNote({ error, onRetry }: { error: string; onRetry?: () => v
   const hex = ACCENT_HEX.coral
   return (
     <div
-      className="mt-3 flex items-center justify-between gap-3 rounded-[14px] border px-3.5 py-3"
+      className="mt-3 rounded-[14px] border px-3.5 py-3"
       style={{ borderColor: withAlpha(hex, 0.35), background: withAlpha(hex, 0.08) }}
     >
-      <div className="min-w-0 text-[12px] leading-relaxed text-[var(--color-cream)] break-words [overflow-wrap:anywhere]">
-        <span className="font-semibold" style={{ color: hex }}>ยังเรียกข้อมูลส่วนนี้ไม่ได้</span>
-        <span className="ml-1 text-[var(--color-cream-faint)]">({error})</span>
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0 text-[12px] leading-relaxed text-[var(--color-cream)] break-words [overflow-wrap:anywhere]">
+          <span className="font-semibold" style={{ color: hex }}>ยังเรียกข้อมูลส่วนนี้ไม่ได้</span>
+          <span className="ml-1 text-[var(--color-cream-faint)]">เปิดรายละเอียดเพื่อดูสาเหตุจาก backend</span>
+        </div>
+        {onRetry && (
+          <button
+            type="button"
+            onClick={onRetry}
+            className="shrink-0 rounded-lg border px-2.5 py-1 text-[11px] text-[var(--color-cream-dim)] transition-colors hover:text-[var(--color-cream)]"
+            style={{ borderColor: withAlpha(hex, 0.35) }}
+          >
+            ลองใหม่
+          </button>
+        )}
       </div>
-      {onRetry && (
-        <button
-          type="button"
-          onClick={onRetry}
-          className="shrink-0 rounded-lg border px-2.5 py-1 text-[11px] text-[var(--color-cream-dim)] transition-colors hover:text-[var(--color-cream)]"
-          style={{ borderColor: withAlpha(hex, 0.35) }}
-        >
-          ลองใหม่
-        </button>
-      )}
+      <ProblemDetails
+        className="mt-2"
+        color={hex}
+        summary="ดูรายละเอียดการเรียกข้อมูล"
+        rows={[
+          { label: 'surface', value: 'console panel' },
+          { label: 'error', value: error },
+        ]}
+      />
     </div>
   )
 }

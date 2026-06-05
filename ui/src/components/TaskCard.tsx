@@ -3,10 +3,20 @@ import { motion } from 'framer-motion'
 import { useSelector, client } from '../state/useCompany'
 import { useUI } from '../state/ui'
 import { Progress, Pill, cx } from './primitives'
+import { ProblemDetails } from './ProblemDetails'
 import { PRIORITY_HEX, PRIORITY_LABEL, ACCENT_HEX } from '../lib/visuals'
 import { STATUS_HEX, originLabel, taskStatusLabel } from '../lib/tasks'
 import { relTime } from '../lib/format'
 import type { Task } from '../contract/types'
+
+function stringValue(value: unknown): string {
+  return typeof value === 'string' && value.trim() ? value.trim() : ''
+}
+
+function lastLogLine(task: Task): string {
+  const log = Array.isArray(task.log) ? task.log : []
+  return stringValue(log[log.length - 1])
+}
 
 export function TaskCard({ task, compact }: { task: Task; compact?: boolean }) {
   const departments = useSelector((s) => s.departments)
@@ -36,6 +46,7 @@ export function TaskCard({ task, compact }: { task: Task; compact?: boolean }) {
     ? task.blockedRetryGuard as Record<string, unknown>
     : null
   const blockedFrozen = blockedGuard?.status === 'frozen'
+  const blockedReason = stringValue(task.blockedLastReason) || stringValue(task.statusReason) || lastLogLine(task)
   const active =
     task.status === 'in_progress' ||
     task.status === 'review' ||
@@ -133,6 +144,21 @@ export function TaskCard({ task, compact }: { task: Task; compact?: boolean }) {
           {waitingReasonText ? ` · ${waitingReasonText}` : ''}
           {waitingStatus}
           {waitingPacket ? ` · packet: ${waitingPacket}` : ''}
+          <ProblemDetails
+            className="mt-1.5"
+            color={STATUS_HEX.waiting}
+            summary="ดูว่ารออยู่จุดไหน"
+            rows={[
+              { label: 'จุดที่หยุด', value: waitingOnName && waitingOnName !== '—' ? `ฝ่าย${waitingOnName}` : 'handoff/approval' },
+              { label: 'สาเหตุ', value: waitingReasonText || waitingReason },
+              { label: 'handoff', value: waitingHandoff?.id },
+              { label: 'สถานะ', value: waitingHandoff?.status },
+              { label: 'เหตุผลสถานะ', value: waitingHandoff?.statusReason },
+              { label: 'packet', value: waitingPacket },
+              { label: 'approval', value: task.waitingOn?.approvalId },
+              { label: 'decision', value: task.waitingOn?.decisionRequestId },
+            ]}
+          />
         </div>
       )}
 
@@ -148,6 +174,20 @@ export function TaskCard({ task, compact }: { task: Task; compact?: boolean }) {
             ? 'หยุดรันอัตโนมัติ: ให้ AI ผู้บริหารตัดสินแล้ว'
             : 'ติดปัญหา: แผนกหรือเครื่องมือไปต่อไม่ได้ รอผู้บริหารตรวจสาเหตุจากแชทและบันทึกงาน'}
           {blockedGuard?.executiveAction ? ` · action: ${String(blockedGuard.executiveAction)}` : ''}
+          <ProblemDetails
+            className="mt-1.5"
+            color={STATUS_HEX.blocked}
+            summary="ดูว่าติดที่จุดไหนและเพราะอะไร"
+            rows={[
+              { label: 'จุดที่หยุด', value: dept?.name ? `ฝ่าย${dept.name}` : task.departmentId },
+              { label: 'สาเหตุ', value: blockedReason },
+              { label: 'guard', value: blockedGuard?.status },
+              { label: 'จำนวน retry', value: task.blockedRetryCount },
+              { label: 'action', value: blockedGuard?.executiveAction },
+              { label: 'reason', value: blockedGuard?.reason },
+              { label: 'ล่าสุด', value: task.lastUnblockAttemptAt ? relTime(task.lastUnblockAttemptAt, now) : '' },
+            ]}
+          />
         </div>
       )}
 

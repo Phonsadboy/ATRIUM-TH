@@ -106,57 +106,22 @@ async def sync_company_memory_to_runtime(
     settings: Settings | None = None,
     labels: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Sync USER.md/MEMORY.md into ready runtime agents' core memory blocks."""
+    """Ensure USER.md/MEMORY.md exist for ATRIUM-native memory.
+
+    Native runtime reads app-owned memory/RAG directly, so there is no external
+    agent memory service to sync.
+    """
     settings = settings or get_settings()
     ensure_company_memory_files(settings)
-    if not settings.use_letta_runtime:
-        return {"ok": True, "enabled": False, "backend": settings.agent_backend, "updated": []}
-
-    from ..runtime.factory import get_agent_runtime
-    from ..runtime.letta_adapter import LettaRuntimeAdapter
-    from ..runtime.provisioning import runtime_agent_key
-
-    runtime = get_agent_runtime(settings)
-    if not isinstance(runtime, LettaRuntimeAdapter):
-        return {"ok": False, "enabled": True, "backend": settings.agent_backend, "updated": [], "error": "runtime is not Letta"}
-
     blocks = core_memory_blocks(settings)
     wanted = set(labels or blocks.keys())
-    departments = await repo.list_departments()
-    updated: list[dict[str, Any]] = []
-    errors: list[dict[str, str]] = []
-    for dept in departments:
-        meta = dept.get("runtime") if isinstance(dept.get("runtime"), dict) else {}
-        runtime_id = meta.get("lettaAgentId")
-        if not runtime_id:
-            continue
-        agent_key = str(meta.get("agentKey") or runtime_agent_key(dept))
-        runtime._agent_ids[agent_key] = str(runtime_id)
-        for label, value in blocks.items():
-            if label not in wanted:
-                continue
-            try:
-                result = await runtime.update_memory(agent_key, label=label, value=value)
-                updated.append({
-                    "departmentId": dept.get("id"),
-                    "agentKey": agent_key,
-                    "runtimeAgentId": runtime_id,
-                    "label": label,
-                    "ok": True,
-                    "result": result,
-                })
-            except Exception as exc:
-                errors.append({
-                    "departmentId": str(dept.get("id") or ""),
-                    "agentKey": agent_key,
-                    "label": label,
-                    "error": f"{type(exc).__name__}: {exc}",
-                })
+    del repo
     return {
-        "ok": not errors,
+        "ok": True,
         "enabled": True,
-        "backend": "letta",
+        "backend": "native",
+        "externalRuntime": False,
         "labels": sorted(wanted),
-        "updated": updated,
-        "errors": errors,
+        "updated": [],
+        "errors": [],
     }

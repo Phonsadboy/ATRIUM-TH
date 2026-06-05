@@ -119,6 +119,7 @@ def provider_credential_reference(settings: Settings | None = None) -> dict[str,
 
     has_direct_anthropic = _has_direct_anthropic_token(settings)
     has_openai = bool(settings.openai_api_key)
+    has_openai_embedding = bool(settings.effective_openai_embedding_api_key)
 
     credentials = [
         _credential_ref(
@@ -136,11 +137,12 @@ def provider_credential_reference(settings: Settings | None = None) -> dict[str,
             label="OpenAI Platform API key",
             kind="api_key",
             env=["ATRIUM_OPENAI_API_KEY", "OPENAI_API_KEY (system/.env only)"],
-            used_by=["openai", "audio_transcription", "future_openai_subsystems"],
+            used_by=["openai", "audio_transcription", "embeddings", "future_openai_subsystems"],
             enables=[
                 "GPT chat/provider calls through OpenAI Responses API",
                 "OpenAI subsystem calls such as audio transcription",
-                "Future OpenAI subsystem fallbacks such as TTS, realtime, embeddings, or file/media processing when wired",
+                "OpenAI embeddings when ATRIUM_EMBEDDING_PROVIDER=openai and no embedding key override is set",
+                "Future OpenAI subsystem fallbacks such as TTS, realtime, or file/media processing when wired",
             ],
             notes=[
                 "This is not ChatGPT OAuth and does not represent a logged-in ChatGPT subscription.",
@@ -148,6 +150,25 @@ def provider_credential_reference(settings: Settings | None = None) -> dict[str,
                 "Subsystems may have their own enablement flags and models.",
             ],
             configured=has_openai,
+        ),
+        _credential_ref(
+            "openai_embedding_key",
+            label="OpenAI Platform embedding key",
+            kind="api_key",
+            env=[
+                "ATRIUM_OPENAI_EMBEDDING_API_KEY",
+                "OPENAI_EMBEDDING_API_KEY (system/.env only)",
+                "falls back to ATRIUM_OPENAI_API_KEY",
+            ],
+            used_by=["embeddings"],
+            enables=[
+                "OpenAI /v1/embeddings for ATRIUM knowledge/RAG when ATRIUM_EMBEDDING_PROVIDER=openai",
+            ],
+            notes=[
+                "Defaults to text-embedding-3-large with dimensions=1024 for compatibility with the local bge-m3/pgvector setup.",
+                "This is an OpenAI Platform billing route, not ChatGPT OAuth.",
+            ],
+            configured=has_openai_embedding,
         ),
         _credential_ref(
             "image_generation_key",
@@ -220,7 +241,7 @@ def provider_credential_reference(settings: Settings | None = None) -> dict[str,
             "openai",
             credential_id="openai_platform_key",
             route_type="platform_api_key",
-            subsystems=["audio_transcription"],
+            subsystems=["audio_transcription", "embeddings"],
             preferred_when="Use when the owner wants OpenAI Platform API-key billing or when OpenAI subsystems are needed alongside chat.",
             cautions=["This route spends OpenAI Platform API quota; do not confuse it with ChatGPT subscription/OAuth."],
             configured=has_openai,

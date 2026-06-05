@@ -61,6 +61,7 @@ function providerGroupColor(id: string): string {
   if (id === 'openai' || id === 'audio_transcription') return ACCENT_HEX.sky
   if (id === 'chatgpt_account') return ACCENT_HEX.teal
   if (id === 'claude_code') return ACCENT_HEX.lavender
+  if (id === 'embeddings') return ACCENT_HEX.teal
   if (id === 'image_generation') return ACCENT_HEX.honey
   return ACCENT_HEX.amber
 }
@@ -214,18 +215,29 @@ function ProviderEnvSettings() {
                           }
                         >
                           <div className="flex gap-2">
-                            {field.kind === 'boolean' ? (
+                            {field.kind === 'boolean' || field.kind === 'select' ? (
                               <select
                                 className={inputClass}
                                 style={{ borderColor: 'var(--color-line-soft)' }}
                                 value={value}
                                 onChange={(e) => setDraft(field.key, e.target.value)}
                               >
-                                <option value="">default</option>
-                                <option value="true">true</option>
-                                <option value="false">false</option>
-                                <option value="1">1</option>
-                                <option value="0">0</option>
+                                {field.kind === 'select' ? (
+                                  <>
+                                    <option value="">default</option>
+                                    {(field.options ?? []).map((option) => (
+                                      <option key={option} value={option}>{option}</option>
+                                    ))}
+                                  </>
+                                ) : (
+                                  <>
+                                    <option value="">default</option>
+                                    <option value="true">true</option>
+                                    <option value="false">false</option>
+                                    <option value="1">1</option>
+                                    <option value="0">0</option>
+                                  </>
+                                )}
                               </select>
                             ) : (
                               <input

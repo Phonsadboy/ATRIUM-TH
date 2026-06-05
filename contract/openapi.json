@@ -12585,6 +12585,303 @@
         "title": "ValidationError",
         "type": "object"
       },
+      "VersionStatusResponse": {
+        "properties": {
+          "branch": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Branch"
+          },
+          "checkedAt": {
+            "title": "Checkedat",
+            "type": "integer"
+          },
+          "compareUrl": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Compareurl"
+          },
+          "dirty": {
+            "default": false,
+            "title": "Dirty",
+            "type": "boolean"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "localCommit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Localcommit"
+          },
+          "localShort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Localshort"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "relation": {
+            "title": "Relation",
+            "type": "string"
+          },
+          "remote": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remote"
+          },
+          "remoteCommit": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remotecommit"
+          },
+          "remoteRef": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remoteref"
+          },
+          "remoteShort": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remoteshort"
+          },
+          "remoteUrl": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remoteurl"
+          },
+          "status": {
+            "enum": [
+              "current",
+              "outdated",
+              "ahead",
+              "diverged",
+              "unknown"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "workspacePath": {
+            "title": "Workspacepath",
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "status",
+          "relation",
+          "message",
+          "checkedAt",
+          "workspacePath"
+        ],
+        "title": "VersionStatusResponse",
+        "type": "object"
+      },
+      "VersionUpdateInput": {
+        "properties": {
+          "restart": {
+            "default": true,
+            "title": "Restart",
+            "type": "boolean"
+          }
+        },
+        "title": "VersionUpdateInput",
+        "type": "object"
+      },
+      "VersionUpdateResponse": {
+        "properties": {
+          "after": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/VersionStatusResponse"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "backup": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Backup"
+          },
+          "before": {
+            "$ref": "#/components/schemas/VersionStatusResponse"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "migrations": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Migrations"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "restartLogPath": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Restartlogpath"
+          },
+          "restartMode": {
+            "default": "manual",
+            "enum": [
+              "screen",
+              "custom",
+              "manual"
+            ],
+            "title": "Restartmode",
+            "type": "string"
+          },
+          "restartScheduled": {
+            "default": false,
+            "title": "Restartscheduled",
+            "type": "boolean"
+          },
+          "status": {
+            "enum": [
+              "updated",
+              "blocked",
+              "current",
+              "failed"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "stderr": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stderr"
+          },
+          "stdout": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stdout"
+          }
+        },
+        "required": [
+          "ok",
+          "status",
+          "message",
+          "before"
+        ],
+        "title": "VersionUpdateResponse",
+        "type": "object"
+      },
       "VisibilityPolicy": {
         "properties": {
           "archive": {
@@ -21873,6 +22170,69 @@
           }
         },
         "summary": "Update Trigger"
+      }
+    },
+    "/api/version": {
+      "get": {
+        "operationId": "version_status_api_version_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Version Status"
+      }
+    },
+    "/api/version/update": {
+      "post": {
+        "operationId": "update_version_api_version_update_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/VersionUpdateInput"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Input"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VersionUpdateResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Version"
       }
     },
     "/api/war-rooms": {

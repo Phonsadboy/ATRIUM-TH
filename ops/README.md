@@ -1,7 +1,8 @@
 # ATRIUM Operations
 
 This folder is intentionally minimal. It contains only the files needed for
-local installation, macOS startup, account OAuth, and database maintenance.
+local installation, macOS startup, Windows WSL setup, account OAuth, and
+database maintenance.
 
 ## Included
 
@@ -10,6 +11,9 @@ local installation, macOS startup, account OAuth, and database maintenance.
   browser, desktop, notification, and Calculator Accessibility checks
 - `windows_host_bridge_probe.py` - Windows HostBridge parity probe for shell,
   browser, desktop, notification, and interactive desktop checks
+- `windows_wsl_install.ps1` - Windows-side shortcut that prepares WSL/Ubuntu,
+  Docker Desktop integration, dependencies, clone, bootstrap, and local start;
+  the root `atrium-windows.ps1` wrapper is the user-facing entrypoint
 - `windows_host_bridge_live_proof.ps1` - Windows-side runner that validates
   source fingerprint, runs the full live Windows probe, and validates the
   resulting artifact before handoff
@@ -26,7 +30,6 @@ From the repo root:
 ```bash
 cp system/.env.example system/.env
 docker compose up -d postgres ollama
-docker compose --profile v2 up -d letta
 cd system
 uv run --extra postgres alembic -c alembic.ini upgrade head
 uv run --extra live --extra postgres --extra graph python -m app

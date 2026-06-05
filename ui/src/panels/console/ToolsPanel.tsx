@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { client, useSelector } from '../../state/useCompany'
 import { Field, Pill, inputClass, withAlpha } from '../../components/primitives'
+import { ProblemDetails } from '../../components/ProblemDetails'
 import { ACCENT_HEX } from '../../lib/visuals'
 import { relTime } from '../../lib/format'
 import { isExec } from '../../lib/threads'
@@ -321,7 +322,21 @@ function RunsList() {
                     result: {JSON.stringify(r.result, null, 2)}
                   </pre>
                 )}
-                {r.error && <div className="text-[11px]" style={{ color: ACCENT_HEX.coral }}>{r.error}</div>}
+                {r.error && (
+                  <ProblemDetails
+                    color={ACCENT_HEX.coral}
+                    summary="ดูสาเหตุที่เครื่องมือรันไม่สำเร็จ"
+                    rows={[
+                      { label: 'tool', value: r.tool },
+                      { label: 'status', value: r.status },
+                      { label: 'policy', value: r.policyDecision },
+                      { label: 'risk', value: r.riskClass },
+                      { label: 'approval', value: r.approvalId },
+                      { label: 'task', value: r.taskId },
+                      { label: 'error', value: r.error },
+                    ]}
+                  />
+                )}
                 {r.status === 'pending_approval' && (
                   <button type="button" onClick={() => void client.cancelToolRun(r.id).then(reload).catch(() => undefined)} className="rounded-lg border px-2 py-0.5 text-[10px]" style={{ borderColor: withAlpha(ACCENT_HEX.coral, 0.4), color: ACCENT_HEX.coral }}>ยกเลิกการรัน</button>
                 )}

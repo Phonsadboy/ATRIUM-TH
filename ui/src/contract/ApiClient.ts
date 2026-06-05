@@ -134,6 +134,9 @@ import type {
   ThreadSearchResponse,
   ThreadStatsResponse,
   ThreadCostSummary,
+  VersionUpdateInput,
+  VersionUpdateResponse,
+  VersionStatusResponse,
 } from './types'
 import {
   coerceModelSpeed,
@@ -1027,6 +1030,9 @@ export class ApiClient implements CompanyClient {
   artifactOpenUrl = (artifactId: string, version?: number): string =>
     `${this.baseUrl}/api/artifacts/${encodeURIComponent(artifactId)}/download${this.qs({ version, inline: true })}`
   getHealth = (): Promise<HealthResponse> => this.request('/health', 'GET')
+  getVersionStatus = (): Promise<VersionStatusResponse> => this.request('/api/version', 'GET')
+  updateVersion = (input: VersionUpdateInput = { restart: true }): Promise<VersionUpdateResponse> =>
+    this.request('/api/version/update', 'POST', input)
   getGraphHealth = (): Promise<GraphHealthResponse> => this.request('/api/graph/health', 'GET')
 
   // ----- Connectors -----

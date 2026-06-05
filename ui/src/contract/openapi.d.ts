@@ -2629,6 +2629,40 @@ export interface paths {
         patch: operations["update_trigger_api_triggers__trigger_id__patch"];
         trace?: never;
     };
+    "/api/version": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Version Status */
+        get: operations["version_status_api_version_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/version/update": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Update Version */
+        post: operations["update_version_api_version_update_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/war-rooms": {
         parameters: {
             query?: never;
@@ -6595,6 +6629,98 @@ export interface components {
             msg: string;
             /** Error Type */
             type: string;
+        };
+        /** VersionStatusResponse */
+        VersionStatusResponse: {
+            /** Branch */
+            branch?: string | null;
+            /** Checkedat */
+            checkedAt: number;
+            /** Compareurl */
+            compareUrl?: string | null;
+            /**
+             * Dirty
+             * @default false
+             */
+            dirty: boolean;
+            /** Error */
+            error?: string | null;
+            /** Localcommit */
+            localCommit?: string | null;
+            /** Localshort */
+            localShort?: string | null;
+            /** Message */
+            message: string;
+            /** Ok */
+            ok: boolean;
+            /** Relation */
+            relation: string;
+            /** Remote */
+            remote?: string | null;
+            /** Remotecommit */
+            remoteCommit?: string | null;
+            /** Remoteref */
+            remoteRef?: string | null;
+            /** Remoteshort */
+            remoteShort?: string | null;
+            /** Remoteurl */
+            remoteUrl?: string | null;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "current" | "outdated" | "ahead" | "diverged" | "unknown";
+            /** Workspacepath */
+            workspacePath: string;
+        };
+        /** VersionUpdateInput */
+        VersionUpdateInput: {
+            /**
+             * Restart
+             * @default true
+             */
+            restart: boolean;
+        };
+        /** VersionUpdateResponse */
+        VersionUpdateResponse: {
+            after?: components["schemas"]["VersionStatusResponse"] | null;
+            /** Backup */
+            backup?: {
+                [key: string]: unknown;
+            } | null;
+            before: components["schemas"]["VersionStatusResponse"];
+            /** Error */
+            error?: string | null;
+            /** Message */
+            message: string;
+            /** Migrations */
+            migrations?: {
+                [key: string]: unknown;
+            } | null;
+            /** Ok */
+            ok: boolean;
+            /** Restartlogpath */
+            restartLogPath?: string | null;
+            /**
+             * Restartmode
+             * @default manual
+             * @enum {string}
+             */
+            restartMode: "screen" | "custom" | "manual";
+            /**
+             * Restartscheduled
+             * @default false
+             */
+            restartScheduled: boolean;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "updated" | "blocked" | "current" | "failed";
+            /** Stderr */
+            stderr?: string | null;
+            /** Stdout */
+            stdout?: string | null;
         };
         /** VisibilityPolicy */
         VisibilityPolicy: {
@@ -12613,6 +12739,59 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Trigger"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    version_status_api_version_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VersionStatusResponse"];
+                };
+            };
+        };
+    };
+    update_version_api_version_update_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["VersionUpdateInput"] | null;
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["VersionUpdateResponse"];
                 };
             };
             /** @description Validation Error */

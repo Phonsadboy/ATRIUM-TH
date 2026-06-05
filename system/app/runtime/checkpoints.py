@@ -6,8 +6,7 @@ from typing import Any
 from ..clock import now_ms
 from ..ids import uid
 from .factory import get_agent_runtime
-from .letta_adapter import LettaRuntimeAdapter
-from .provisioning import ensure_department_runtime_agent_safely, runtime_agent_key
+from .provisioning import runtime_agent_key
 
 
 def _activity(text: str, *, department_id: str | None = None, severity: str = "good") -> dict[str, Any]:
@@ -30,15 +29,12 @@ async def create_runtime_checkpoint(
 ) -> dict[str, Any]:
     """Create an ATRIUM-owned checkpoint record for a runtime agent.
 
-    The runtime adapter owns its internal state, but ATRIUM stays the system of
-    record. This function binds/provisions the runtime agent, asks the adapter
-    for a checkpoint snapshot, and stores the result as a durable entity.
+    ATRIUM is the runtime system of record. This stores a durable checkpoint
+    marker for regression/rollback evidence without calling an external agent
+    runtime service.
     """
     runtime = get_agent_runtime()
     runtime_meta = dept.get("runtime") if isinstance(dept.get("runtime"), dict) else {}
-    if isinstance(runtime, LettaRuntimeAdapter):
-        runtime_meta = await ensure_department_runtime_agent_safely(repo, dept, runtime=runtime) or runtime_meta
-        dept = await repo.get_department(dept["id"]) or dept
     agent_key = str((runtime_meta or {}).get("agentKey") or runtime_agent_key(dept))
     if not agent_key:
         raise ValueError("department has no runtime agent key")
@@ -51,13 +47,13 @@ async def create_runtime_checkpoint(
         "reason": reason,
         "backend": checkpoint_result.get("backend") or getattr(runtime, "backend", None),
         "agentKey": agent_key,
-        "runtimeAgentId": checkpoint_result.get("runtimeAgentId") or (runtime_meta or {}).get("lettaAgentId"),
+        "runtimeAgentId": checkpoint_result.get("runtimeAgentId") or runtime_meta.get("runtimeAgentId"),
         "status": "created" if checkpoint_result.get("ok") else "error",
         "snapshotAvailable": bool(checkpoint_result.get("snapshotAvailable")),
         "runtimeResult": checkpoint_result,
         "rollbackPlan": {
-            "mode": "runtime_adapter_checkpoint",
-            "note": "Use this record as the pre-change runtime-agent evidence when evaluating rollback/regression.",
+            "mode": "atrium_native_checkpoint",
+            "note": "Use this record as the pre-change native runtime evidence when evaluating rollback/regression.",
         },
         "ts": now_ms(),
     }

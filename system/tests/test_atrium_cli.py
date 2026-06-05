@@ -21,7 +21,7 @@ class AtriumCliEnvTests(unittest.TestCase):
             "ATRIUM_DATABASE_URL=\n"
             "ATRIUM_OPENAI_API_KEY=sk-secret\n",
             {
-                "ATRIUM_AGENT_BACKEND": "letta",
+                "ATRIUM_AGENT_BACKEND": "native",
                 "ATRIUM_DATABASE_URL": "postgresql+asyncpg://atrium:atrium@127.0.0.1:5432/atrium",
                 "ATRIUM_GRAPH_BACKEND": "auto",
             },
@@ -39,7 +39,7 @@ class AtriumCliEnvTests(unittest.TestCase):
             env_path = Path(tmp) / ".env"
             update = atrium_cli.update_env_file(
                 env_path,
-                {"ATRIUM_AGENT_BACKEND": "letta"},
+                {"ATRIUM_AGENT_BACKEND": "native"},
                 dry_run=True,
             )
 

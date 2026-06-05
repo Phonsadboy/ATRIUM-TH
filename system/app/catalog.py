@@ -75,8 +75,12 @@ PROVIDERS: dict[str, dict] = {
     },
 }
 
-ACCOUNT_RUNTIME_BYPASS_PROVIDER_IDS: set[str] = set()
-NATIVE_CHAT_STREAM_BYPASS_PROVIDER_IDS: set[str] = set()
+DIRECT_PROVIDER_IDS: set[str] = {"anthropic", "openai", "chatgpt_account", "claude_code"}
+
+# Direct provider routes own native chat/tool/streaming paths, so no external
+# agent runtime should gate provider availability.
+ACCOUNT_RUNTIME_BYPASS_PROVIDER_IDS: set[str] = set(DIRECT_PROVIDER_IDS)
+NATIVE_CHAT_STREAM_BYPASS_PROVIDER_IDS: set[str] = set(DIRECT_PROVIDER_IDS)
 
 
 def provider_bypasses_agent_runtime(provider_id: str | None) -> bool:

@@ -151,11 +151,7 @@ def provider_health(settings: Settings | None = None, *, probe_accounts: bool = 
     return {
         "mode": "live" if ready else "unconfigured",
         "ready": ready,
-        "embeddings": (
-            f"ollama:{settings.ollama_embedding_model}"
-            if settings.prefer_ollama_embeddings
-            else "voyage" if settings.live_embeddings else "hash"
-        ),
+        "embeddings": settings.configured_embedding_label,
         "openAIBaseUrl": settings.openai_base_url,
         "chatgptAccountBaseUrl": settings.chatgpt_account_base_url,
         "anthropicBaseUrl": settings.anthropic_base_url,

@@ -1775,22 +1775,35 @@ class Repo:
         settings = get_settings()
         vector = await self._pgvector_status()
         embedder = None
+        embedder_error = ""
         if resolve_embeddings:
             from ..memory.embeddings import resolve_embedder
 
             try:
                 embedder = await resolve_embedder(settings)
-            except Exception:
+            except Exception as exc:
                 embedder = None
-        elif settings.prefer_ollama_embeddings:
+                embedder_error = f"{type(exc).__name__}: {str(exc)[:240]}"
+        if embedder is None and settings.openai_embeddings_enabled:
+            dim = settings.effective_openai_embedding_dimensions or (
+                3072 if settings.openai_embedding_model == "text-embedding-3-large" else 1536
+            )
+            embedder = type("ConfiguredEmbedder", (), {
+                "name": f"openai:{settings.openai_embedding_model}",
+                "model": settings.openai_embedding_model,
+                "dim": dim,
+            })()
+        elif embedder is None and settings.prefer_ollama_embeddings:
             embedder = type("ConfiguredEmbedder", (), {
                 "name": f"ollama:{settings.ollama_embedding_model}",
                 "model": settings.ollama_embedding_model,
+                "dim": settings.embedding_dim,
             })()
-        elif settings.live_embeddings:
+        elif embedder is None and settings.live_embeddings:
             embedder = type("ConfiguredEmbedder", (), {
-                "name": "voyage",
+                "name": f"voyage:{settings.voyage_model}",
                 "model": settings.voyage_model,
+                "dim": settings.embedding_dim,
             })()
         return {
             "storage": vector["backend"],
@@ -1802,9 +1815,12 @@ class Repo:
                 "alembicVersionTable": vector.get("alembicVersionTable"),
             },
             "embeddings": {
+                "mode": settings.embedding_provider_mode,
                 "provider": getattr(embedder, "name", f"hash-{settings.embedding_dim}"),
                 "model": getattr(embedder, "model", getattr(embedder, "name", f"hash-{settings.embedding_dim}")),
+                "dim": getattr(embedder, "dim", settings.embedding_dim),
                 "fallback": bool(getattr(embedder, "name", "").startswith("hash-")) if embedder else True,
+                "error": embedder_error or None,
             },
             "graph": settings.graph_backend,
         }

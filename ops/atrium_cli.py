@@ -40,12 +40,11 @@ PORTS = {
     8787: "backend",
     5173: "frontend",
     5432: "postgres",
-    8283: "letta",
     11434: "ollama",
 }
 SECRET_MARKERS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "AUTH")
 FULL_STACK_DEFAULTS = {
-    "ATRIUM_AGENT_BACKEND": "letta",
+    "ATRIUM_AGENT_BACKEND": "native",
     "ATRIUM_DATABASE_URL": "postgresql+asyncpg://atrium:atrium@127.0.0.1:5432/atrium",
     "ATRIUM_DATA_DIR": "./data",
     "ATRIUM_GRAPH_BACKEND": "auto",
@@ -55,7 +54,6 @@ FULL_STACK_DEFAULTS = {
     "ATRIUM_OLLAMA_BASE_URL": "http://127.0.0.1:11434",
     "ATRIUM_OLLAMA_EMBEDDING_MODEL": "bge-m3",
     "ATRIUM_EMBEDDING_DIM": "1024",
-    "ATRIUM_LETTA_BASE_URL": "http://127.0.0.1:8283",
     "ATRIUM_OBJECT_STORE_ENABLED": "true",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     "ATRIUM_CHAT_REPLY_WORKER_CONCURRENCY": "5",
@@ -514,7 +512,6 @@ def command_bootstrap(args: argparse.Namespace) -> int:
     else:
         print("[DRY-RUN] docker info")
     compose(["up", "-d", "postgres", "ollama"], dry_run=args.dry_run, timeout=600)
-    compose(["--profile", "v2", "up", "-d", "letta"], dry_run=args.dry_run, timeout=600)
     compose(["exec", "ollama", "ollama", "pull", "bge-m3"], dry_run=args.dry_run, timeout=1200)
 
     print_header("Database")
@@ -547,7 +544,6 @@ def command_start(args: argparse.Namespace) -> int:
     if command_path("docker") and docker_compose_cmd():
         if run(["docker", "info"], timeout=10).returncode == 0:
             compose(["up", "-d", "postgres", "ollama"], timeout=300)
-            compose(["--profile", "v2", "up", "-d", "letta"], timeout=300)
         else:
             print_check(False, "Docker", "not running; open Docker Desktop if full stack services are missing")
 
@@ -750,7 +746,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("doctor", help="check local setup without changing files").set_defaults(func=command_doctor)
 
     bootstrap = sub.add_parser("bootstrap", help="prepare the full local stack")
-    bootstrap.add_argument("--full", action="store_true", help="prepare Postgres/Ollama/Letta/backend/frontend")
+    bootstrap.add_argument("--full", action="store_true", help="prepare Postgres/Ollama/backend/frontend")
     bootstrap.add_argument("--dry-run", action="store_true", help="print planned actions without changing files or services")
     bootstrap.set_defaults(func=command_bootstrap)
 

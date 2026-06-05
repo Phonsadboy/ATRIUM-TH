@@ -37,7 +37,11 @@ export function KnowledgeDebtPanel() {
                 <span className="text-[var(--color-cream)]">{runtime.data.memory.vectorSearch}</span>
               </span>
               <span className="text-[var(--color-cream-faint)]">storage: {runtime.data.memory.storage}</span>
-              <span className="text-[var(--color-cream-faint)]">· embeddings: {runtime.data.memory.embeddings.provider}</span>
+              <span className="text-[var(--color-cream-faint)]">
+                · embeddings: {runtime.data.memory.embeddings.mode ? `${runtime.data.memory.embeddings.mode} · ` : ''}{runtime.data.memory.embeddings.provider}
+                {runtime.data.memory.embeddings.dim ? ` · ${runtime.data.memory.embeddings.dim}d` : ''}
+              </span>
+              {runtime.data.memory.embeddings.error && <span style={{ color: ACCENT_HEX.coral }}>· {runtime.data.memory.embeddings.error}</span>}
             </>
           )}
           {graph.data && (

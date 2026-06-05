@@ -34,7 +34,7 @@
     <key>ATRIUM_GRAPH_BACKEND</key>
     <string>relational</string>
     <key>ATRIUM_AGENT_BACKEND</key>
-    <string>letta</string>
+    <string>native</string>
     <key>ATRIUM_ENTITLEMENT_HOST_SHELL</key>
     <string>true</string>
     <key>ATRIUM_ENTITLEMENT_HOST_FILESYSTEM</key>

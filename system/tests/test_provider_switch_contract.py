@@ -77,11 +77,11 @@ class ProviderSwitchContractTest(unittest.TestCase):
     def test_unsupported_or_unintentional_provider_choices_are_coerced_safely(self) -> None:
         self.assertEqual(coerce_provider("__unknown__"), "claude_code")
 
-    def test_switching_provider_does_not_disable_runtime_capabilities(self) -> None:
+    def test_direct_provider_choices_bypass_external_chat_runtime_gate(self) -> None:
         for provider_id in sorted(EXPECTED_PROVIDERS):
             with self.subTest(provider=provider_id):
-                self.assertFalse(provider_bypasses_agent_runtime(provider_id))
-                self.assertFalse(provider_has_native_chat_stream(provider_id))
+                self.assertTrue(provider_bypasses_agent_runtime(provider_id))
+                self.assertTrue(provider_has_native_chat_stream(provider_id))
 
     def test_invalid_explicit_supported_efforts_falls_back_without_crashing(self) -> None:
         model_id = "__test_bad_efforts__"

@@ -117,14 +117,14 @@ class ProviderMultimodalMappingTest(unittest.TestCase):
         self.assertNotIn(PNG_DATA_URL, prompt)
         self.assertNotIn("omitted", prompt.lower())
 
-    def test_letta_runtime_text_prompt_does_not_embed_base64_image_payload(self) -> None:
+    def test_native_runtime_text_prompt_does_not_embed_base64_image_payload(self) -> None:
         text = _content_to_text([
             {"type": "text", "text": "inspect"},
             {"type": "input_image", "image_url": PNG_DATA_URL, "detail": "auto"},
         ])
 
         self.assertIn("inspect", text)
-        self.assertIn("attached image/png omitted from Letta runtime text prompt", text)
+        self.assertIn("attached image/png omitted from ATRIUM native runtime text prompt", text)
         self.assertIn("approxBase64Chars=", text)
         self.assertNotIn(PNG_DATA_URL, text)
         self.assertNotIn(base64.b64encode(PNG_BYTES).decode("ascii"), text)

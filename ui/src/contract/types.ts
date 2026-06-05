@@ -239,6 +239,8 @@ export interface Task {
   waitingOn?: { dept?: ID; handoffId?: ID | null; reason?: string | null; decisionRequestId?: ID | null; approvalId?: ID | null }
   blockedRetryCount?: number
   blockedRetryGuard?: Record<string, unknown> | null
+  blockedLastReason?: string | null
+  statusReason?: string | null
   lastUnblockAttemptAt?: number | null
   handoffChainId?: ID | null
   /** v0.4: optional project grouping and durable outputs. */
@@ -1782,7 +1784,7 @@ export interface ProviderAuthStartResponse {
   statusDetail?: Record<string, unknown>
 }
 
-export type ProviderEnvFieldKind = 'text' | 'secret' | 'number' | 'boolean'
+export type ProviderEnvFieldKind = 'text' | 'secret' | 'number' | 'boolean' | 'select'
 
 export interface ProviderEnvField {
   key: string
@@ -1790,6 +1792,7 @@ export interface ProviderEnvField {
   kind: ProviderEnvFieldKind
   setting?: string
   aliases: string[]
+  options?: string[]
   placeholder?: string
   configured: boolean
   source: 'dotenv' | 'process' | 'default' | 'empty' | string
@@ -2068,9 +2071,12 @@ export interface MemoryRuntimeHealth {
     column: boolean
   }
   embeddings: {
+    mode?: string
     provider: string
     model: string
+    dim?: number
     fallback: boolean
+    error?: string | null
   }
   graph: string
 }
@@ -2081,6 +2087,50 @@ export interface HealthResponse {
   graph: GraphHealthResponse
   memory: MemoryRuntimeHealth
   counts: Record<string, number>
+}
+
+export type VersionStatus = 'current' | 'outdated' | 'ahead' | 'diverged' | 'unknown'
+
+export interface VersionStatusResponse {
+  ok: boolean
+  status: VersionStatus
+  relation: string
+  message: string
+  checkedAt: number
+  workspacePath: string
+  branch?: string | null
+  remote?: string | null
+  remoteUrl?: string | null
+  remoteRef?: string | null
+  localCommit?: string | null
+  localShort?: string | null
+  remoteCommit?: string | null
+  remoteShort?: string | null
+  dirty: boolean
+  compareUrl?: string | null
+  error?: string | null
+}
+
+export interface VersionUpdateInput {
+  restart?: boolean
+}
+
+export type VersionUpdateStatus = 'updated' | 'blocked' | 'current' | 'failed'
+
+export interface VersionUpdateResponse {
+  ok: boolean
+  status: VersionUpdateStatus
+  message: string
+  before: VersionStatusResponse
+  after?: VersionStatusResponse | null
+  backup?: Record<string, unknown> | null
+  migrations?: Record<string, unknown> | null
+  restartScheduled: boolean
+  restartMode: 'screen' | 'custom' | 'manual'
+  restartLogPath?: string | null
+  stdout?: string | null
+  stderr?: string | null
+  error?: string | null
 }
 
 export interface EntityInput {

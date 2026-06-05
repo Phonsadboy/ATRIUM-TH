@@ -339,16 +339,16 @@ def _runtime_degraded_reason(health: dict[str, Any]) -> str:
 
 
 def _uses_agent_runtime(settings: Settings, dept: dict[str, Any]) -> bool:
-    return bool(settings.use_letta_runtime and not provider_bypasses_agent_runtime(dept.get("providerId")))
+    return bool(settings.use_external_agent_runtime and not provider_bypasses_agent_runtime(dept.get("providerId")))
 
 
 def _uses_agent_runtime_for_chat(settings: Settings, dept: dict[str, Any]) -> bool:
-    return bool(settings.use_letta_runtime and not provider_has_native_chat_stream(dept.get("providerId")))
+    return bool(settings.use_external_agent_runtime and not provider_has_native_chat_stream(dept.get("providerId")))
 
 
 async def _runtime_degraded_retry_reason(settings: Settings | None = None, dept: dict[str, Any] | None = None) -> str | None:
     settings = settings or get_settings()
-    if not settings.use_letta_runtime or not settings.runtime_degraded_queue:
+    if not settings.use_external_agent_runtime or not settings.runtime_degraded_queue:
         return None
     if dept is not None and not _uses_agent_runtime(settings, dept):
         return None
@@ -1088,7 +1088,7 @@ async def _complete_runtime_turn(
     )
 
     meta = await ensure_department_runtime_agent_safely(repo, dept, settings=settings)
-    if not meta or not meta.get("lettaAgentId"):
+    if not meta or not meta.get("runtimeAgentId"):
         detail = f"runtime agent is not provisioned for department {dept.get('id') or 'unknown'}"
         if category == "chat":
             return runtime_dependency_result(dept, detail, category=category, source="engine", settings=settings)
@@ -2002,7 +2002,7 @@ async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int)
             "status": "queued",
             "replyToMessageId": user_message_id,
             "runtime": {
-                "backend": settings.agent_backend,
+                "backend": settings.agent_backend_mode,
                 "degraded": True,
                 "retryAfter": retry_after,
             },

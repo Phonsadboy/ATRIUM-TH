@@ -2,6 +2,7 @@ import { useMemo } from 'react'
 import { useSelector } from '../state/useCompany'
 import { useUI } from '../state/ui'
 import { Avatar, Dot, Progress, withAlpha } from '../components/primitives'
+import { ProblemDetails } from '../components/ProblemDetails'
 import { STATUS_HEX, STATUS_LABEL, taskStatusLabel } from '../lib/tasks'
 import { threadIdFor } from '../lib/threads'
 import { ACCENT_HEX, SEVERITY_HEX, STATE_HEX, STATE_LABEL } from '../lib/visuals'
@@ -28,6 +29,11 @@ function timeLabel(ms?: number | null): string {
 function shortText(value?: string | null, limit = 170): string {
   const text = String(value || '').replace(/\s+/g, ' ').trim()
   return text.length > limit ? `${text.slice(0, limit - 1).trimEnd()}…` : text
+}
+
+function blockedReason(task: Task | null): string {
+  if (!task) return ''
+  return task.blockedLastReason || task.statusReason || task.log?.[task.log.length - 1] || ''
 }
 
 function latestMessage(messages: ChatMessage[]): ChatMessage | null {
@@ -141,6 +147,22 @@ function ExecutiveQueueCard({
                 <span className="shrink-0 rounded-full px-1.5 py-0.5 text-[10px]" style={{ color: status.color, background: withAlpha(status.color, 0.12) }}>
                   {waitMs > 1_000 && item.status === 'queued' ? timeLabel(item.runAfter) : status.label}
                 </span>
+                {item.lastError && (
+                  <div className="col-start-2 col-end-4">
+                    <ProblemDetails
+                      color={ACCENT_HEX.coral}
+                      summary="ดูสาเหตุที่คิวรอลองใหม่"
+                      rows={[
+                        { label: 'queueId', value: item.id },
+                        { label: 'kind', value: item.kind },
+                        { label: 'status', value: item.status },
+                        { label: 'attempts', value: item.attempts },
+                        { label: 'task', value: item.taskId },
+                        { label: 'error', value: item.lastError },
+                      ]}
+                    />
+                  </div>
+                )}
               </div>
             )
           })}
@@ -228,6 +250,22 @@ function DepartmentWorkCard({
           </div>
           <Progress value={Math.max(0, Math.min(1, task.progress ?? 0))} color={accent} className="mt-2" />
           {lastLog && <div className="mt-1.5 text-[11px] leading-relaxed text-[var(--color-cream-dim)]">{shortText(lastLog, 190)}</div>}
+          {(task.status === 'blocked' || stale) && (
+            <ProblemDetails
+              className="mt-1.5"
+              color={task.status === 'blocked' ? STATUS_HEX.blocked : ACCENT_HEX.coral}
+              summary={task.status === 'blocked' ? 'ดูว่าติดที่จุดไหนและเพราะอะไร' : 'ดูสาเหตุที่สัญญาณเงียบ'}
+              rows={[
+                { label: 'ฝ่าย', value: dept.name },
+                { label: 'taskId', value: task.id },
+                { label: 'status', value: task.status },
+                { label: 'สาเหตุ', value: blockedReason(task) },
+                { label: 'updated', value: timeLabel(task.updatedAt) },
+                { label: 'state', value: dept.state },
+                { label: 'agent', value: dept.agentName },
+              ]}
+            />
+          )}
         </div>
       )}
 

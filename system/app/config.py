@@ -183,28 +183,40 @@ class Settings(BaseSettings):
     # deliberate local debugging of very long model turns.
     request_timeout_s: float | None = 300.0
 
-    # ---- agent runtime (v2) ----
-    # engine = v1 in-process LLM loop; letta = stateful runtime adapter (Phase 0+)
+    # ---- agent runtime (native) ----
+    # ATRIUM owns provider turns, tool loops, memory, checkpoints, and jobs in-process.
     agent_backend: str = Field(
-        default="letta",
+        default="native",
         validation_alias=AliasChoices("ATRIUM_AGENT_BACKEND", "AGENT_BACKEND"),
     )
-    letta_base_url: str = "http://127.0.0.1:8283"
-    letta_request_timeout_s: float = 120.0
-    # Optional Letta provider embedding handle, e.g. "letta/letta-free" or a
-    # registered Ollama handle. ATRIUM's own memory embeddings stay on Ollama.
-    letta_embedding_model: str = ""
     runtime_degraded_queue: bool = True
     runtime_degraded_retry_s: float = 30.0
     runtime_provider_fallback_enabled: bool = True
 
     # ---- embeddings ----
-    # Priority: Ollama (local bge-m3) → Voyage → hash fallback
+    # Mode: auto preserves the legacy priority (local Ollama → Voyage → hash).
+    # Choose openai explicitly when the owner wants OpenAI Platform embeddings.
+    embedding_provider: str = Field(
+        default="auto",
+        validation_alias=AliasChoices("ATRIUM_EMBEDDING_PROVIDER", "EMBEDDING_PROVIDER"),
+    )
     ollama_base_url: str = Field(
         default="http://127.0.0.1:11434",
         validation_alias=AliasChoices("ATRIUM_OLLAMA_BASE_URL", "OLLAMA_HOST"),
     )
     ollama_embedding_model: str = "bge-m3"
+    openai_embedding_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("ATRIUM_OPENAI_EMBEDDING_API_KEY"),
+    )
+    openai_embedding_base_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("ATRIUM_OPENAI_EMBEDDING_BASE_URL"),
+    )
+    openai_embedding_model: str = "text-embedding-3-large"
+    # Keep the default compatible with the existing bge-m3/pgvector dimension.
+    # Set <= 0 to request the OpenAI model's native dimension.
+    openai_embedding_dimensions: int = 1024
     voyage_api_key: str = Field(
         default="",
         validation_alias=AliasChoices("VOYAGE_API_KEY", "ATRIUM_VOYAGE_API_KEY"),
@@ -420,6 +432,22 @@ class Settings(BaseSettings):
             public_openai_base_url = dotenv.get("ATRIUM_OPENAI_BASE_URL") or dotenv.get("OPENAI_BASE_URL")
             if public_openai_base_url:
                 self.openai_base_url = public_openai_base_url
+        if "ATRIUM_OPENAI_EMBEDDING_API_KEY" in os.environ:
+            self.openai_embedding_api_key = os.environ["ATRIUM_OPENAI_EMBEDDING_API_KEY"]
+        else:
+            openai_embedding_key = (
+                dotenv.get("ATRIUM_OPENAI_EMBEDDING_API_KEY")
+                or dotenv.get("OPENAI_EMBEDDING_API_KEY")
+            )
+            if openai_embedding_key:
+                self.openai_embedding_api_key = openai_embedding_key
+        if "ATRIUM_OPENAI_EMBEDDING_BASE_URL" not in os.environ:
+            openai_embedding_base_url = (
+                dotenv.get("ATRIUM_OPENAI_EMBEDDING_BASE_URL")
+                or dotenv.get("OPENAI_EMBEDDING_BASE_URL")
+            )
+            if openai_embedding_base_url:
+                self.openai_embedding_base_url = openai_embedding_base_url
         if "ATRIUM_AUDIO_TRANSCRIPTION_BASE_URL" not in os.environ:
             audio_base_url = dotenv.get("ATRIUM_AUDIO_TRANSCRIPTION_BASE_URL") or dotenv.get("OPENAI_AUDIO_BASE_URL")
             if audio_base_url:
@@ -482,16 +510,72 @@ class Settings(BaseSettings):
         return default if default.exists() else None
 
     @property
-    def use_letta_runtime(self) -> bool:
-        return self.agent_backend.strip().lower() in {"letta", "memgpt"}
+    def use_external_agent_runtime(self) -> bool:
+        return False
+
+    @property
+    def agent_backend_mode(self) -> str:
+        mode = self.agent_backend.strip().lower()
+        return "native" if mode in {"", "native", "engine", "atrium"} else "native"
 
     @property
     def live_embeddings(self) -> bool:
-        return bool(self.voyage_api_key)
+        mode = self.embedding_provider_mode
+        return mode == "voyage" or (mode == "auto" and bool(self.voyage_api_key))
 
     @property
     def prefer_ollama_embeddings(self) -> bool:
-        return bool(self.ollama_base_url.strip())
+        mode = self.embedding_provider_mode
+        return mode in {"auto", "local", "ollama"} and bool(self.ollama_base_url.strip())
+
+    @property
+    def embedding_provider_mode(self) -> str:
+        mode = (self.embedding_provider or "auto").strip().lower()
+        aliases = {
+            "ollama": "local",
+            "local_ai": "local",
+            "local-ai": "local",
+            "openai_platform": "openai",
+            "none": "hash",
+            "offline": "hash",
+        }
+        mode = aliases.get(mode, mode)
+        return mode if mode in {"auto", "local", "openai", "voyage", "hash"} else "auto"
+
+    @property
+    def effective_openai_embedding_api_key(self) -> str:
+        return (self.openai_embedding_api_key or self.openai_api_key or "").strip()
+
+    @property
+    def effective_openai_embedding_base_url(self) -> str:
+        return (self.openai_embedding_base_url or self.openai_base_url or "https://api.openai.com/v1").strip()
+
+    @property
+    def effective_openai_embedding_dimensions(self) -> int:
+        return max(0, int(self.openai_embedding_dimensions or 0))
+
+    @property
+    def openai_embeddings_enabled(self) -> bool:
+        return self.embedding_provider_mode == "openai"
+
+    @property
+    def configured_embedding_label(self) -> str:
+        mode = self.embedding_provider_mode
+        if mode == "openai":
+            dim = self.effective_openai_embedding_dimensions
+            suffix = f":{dim}" if dim else ""
+            return f"openai:{self.openai_embedding_model}{suffix}"
+        if mode == "voyage":
+            return f"voyage:{self.voyage_model}"
+        if mode == "hash":
+            return f"hash-{self.embedding_dim}"
+        if mode == "local":
+            return f"ollama:{self.ollama_embedding_model}"
+        if self.prefer_ollama_embeddings:
+            return f"auto:ollama:{self.ollama_embedding_model}"
+        if self.live_embeddings:
+            return f"auto:voyage:{self.voyage_model}"
+        return f"auto:hash-{self.embedding_dim}"
 
     @property
     def chat_max_input_char_limit(self) -> int:

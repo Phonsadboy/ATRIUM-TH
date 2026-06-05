@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import { motion } from 'framer-motion'
+import { ProblemDetails } from '../../components/ProblemDetails'
 import { withAlpha } from '../../components/primitives'
 import { ACCENT_HEX } from '../../lib/visuals'
 import { clockLabel, money } from '../../lib/format'
@@ -493,7 +494,22 @@ function VideoJobCard({ job }: { job: VideoJobSummary }) {
         </div>
       )}
       {displayed.artifactId && <div className="sr-only" data-testid="video-job-result-artifact">{displayed.artifactId}</div>}
-      {displayed.error && <div className="mt-1.5 text-[11px]" style={{ color: ACCENT_HEX.coral }}>{displayed.error}</div>}
+      {displayed.error && (
+        <ProblemDetails
+          className="mt-1.5"
+          color={ACCENT_HEX.coral}
+          summary="ดูสาเหตุที่งานวิดีโอหยุด"
+          rows={[
+            { label: 'jobId', value: displayed.jobId },
+            { label: 'tool', value: displayed.tool },
+            { label: 'status', value: displayed.status },
+            { label: 'phase', value: displayed.phase },
+            { label: 'error', value: displayed.error },
+            { label: 'log', value: displayed.logPath },
+            { label: 'manifest', value: displayed.manifestPath },
+          ]}
+        />
+      )}
       {refreshError && <div className="mt-1.5 text-[11px] text-[var(--color-cream-faint)]">{refreshError}</div>}
     </div>
   )
@@ -535,7 +551,19 @@ function ToolRunCard({ run }: { run: ChatToolRun }) {
           {run.args && Object.keys(run.args).length > 0 && (
             <pre className="overflow-x-auto whitespace-pre-wrap">{JSON.stringify(run.args, null, 2)}</pre>
           )}
-          {run.error && <div style={{ color: '#f0735f' }}>error: {run.error}</div>}
+          {run.error && (
+            <ProblemDetails
+              color="#f0735f"
+              summary="ดูสาเหตุที่เครื่องมือรันไม่สำเร็จ"
+              rows={[
+                { label: 'tool', value: run.tool },
+                { label: 'status', value: run.status },
+                { label: 'policy', value: run.policyDecision },
+                { label: 'risk', value: run.riskClass },
+                { label: 'error', value: run.error },
+              ]}
+            />
+          )}
           {run.result != null && (
             <pre className="overflow-x-auto whitespace-pre-wrap">
               {typeof run.result === 'string' ? run.result : JSON.stringify(run.result, null, 2)}
@@ -739,45 +767,47 @@ function runtimeDetailRows(m: ChatMessage): { label: string; value: string }[] {
   return rows.filter((row) => row.value)
 }
 
-function RuntimeDependencyDetails({
+function MessageProblemDetails({
   m,
+  tone,
+  summary,
   onOpenCitation,
 }: {
   m: ChatMessage
+  tone: string
+  summary: string
   onOpenCitation?: (c: MessageCitation) => void
 }) {
   const rows = runtimeDetailRows(m)
   const citations = m.render?.citations ?? []
   return (
-    <details className="group mt-2 rounded-lg bg-[rgba(0,0,0,0.16)]">
-      <summary className="flex min-w-0 cursor-pointer list-none items-center gap-1.5 px-2.5 py-1.5 text-[12px] text-[var(--color-cream-dim)] hover:text-[var(--color-cream)]">
-        <span className="shrink-0 transition-transform group-open:rotate-90">▸</span>
-        <span className="min-w-0 flex-1 truncate">
-          ดูเหตุผลที่เจอข้อความนี้{citations.length ? `, มีบริบท ${citations.length} รายการ` : ''}
-        </span>
-      </summary>
-      <div className="space-y-2 px-2.5 pb-2.5 text-[12px] leading-[1.55] text-[var(--color-cream-dim)]">
-        <div>
-          ระบบหยุดตรงนี้เพื่อไม่ fallback ไป provider เดิมแล้วทำให้ stateful agent context หลุด
-        </div>
-        {rows.length > 0 && (
-          <div className="space-y-1">
-            {rows.map((row) => (
-              <div key={row.label} className="grid min-w-0 grid-cols-[104px_minmax(0,1fr)] gap-2">
-                <span className="text-[var(--color-cream-faint)]">{row.label}</span>
-                <span className="min-w-0 break-words">{row.value}</span>
-              </div>
-            ))}
-          </div>
-        )}
-        {citations.length > 0 && (
-          <div>
-            <div className="mb-1 text-[var(--color-cream-faint)]">บริบทที่ถูกดึงมาก่อน runtime หยุด</div>
+    <div className="mt-2">
+      <ProblemDetails
+        color={tone}
+        summary={summary}
+        note={m.error?.code === 'runtime_dependency'
+          ? 'ระบบหยุดตรงนี้เพื่อไม่ fallback ไป provider เดิมแล้วทำให้ stateful agent context หลุด'
+          : undefined}
+        rows={[
+          ...rows,
+          { label: 'messageId', value: m.id },
+          { label: 'threadId', value: m.threadId },
+          { label: 'status', value: m.status },
+          { label: 'retryable', value: m.error?.retryable },
+        ]}
+      />
+      {citations.length > 0 && (
+        <details className="group mt-1.5 rounded-lg bg-[rgba(0,0,0,0.16)]">
+          <summary className="flex min-w-0 cursor-pointer list-none items-center gap-1.5 px-2.5 py-1.5 text-[12px] text-[var(--color-cream-dim)] hover:text-[var(--color-cream)]">
+            <span className="shrink-0 transition-transform group-open:rotate-90">▸</span>
+            <span className="min-w-0 flex-1 truncate">ดูบริบทก่อนปัญหา ({citations.length})</span>
+          </summary>
+          <div className="px-2.5 pb-2.5">
             <Citations render={m.render} onOpen={onOpenCitation} />
           </div>
-        )}
-      </div>
-    </details>
+        </details>
+      )}
+    </div>
   )
 }
 
@@ -790,7 +820,10 @@ export function NoticeCards({
   onResolveApproval?: (approvalId: string, decision: 'approved' | 'rejected') => void
   onOpenCitation?: (c: MessageCitation) => void
 }) {
-  const notices = (m.render?.notices ?? []).filter(
+  const notices = Array.from(new Set([
+    ...(m.render?.notices ?? []),
+    ...((m.status === 'failed' || m.error) ? ['message_failed' as MessageRenderNotice] : []),
+  ])).filter(
     (n) => n !== 'approval_required' || (m.approvalId && m.approvalStatus === 'pending' && m.status === 'pending_approval'),
   )
   if (!notices.length) return null
@@ -810,8 +843,13 @@ export function NoticeCards({
               <span>{spec.emoji}</span>
               <span className="font-medium">{spec.label}</span>
             </div>
-            {n === 'runtime_dependency' && (
-              <RuntimeDependencyDetails m={m} onOpenCitation={onOpenCitation} />
+            {(n === 'runtime_dependency' || n === 'message_failed') && (
+              <MessageProblemDetails
+                m={m}
+                tone={spec.c}
+                summary={n === 'runtime_dependency' ? 'ดูว่า runtime หยุดที่จุดไหน' : 'ดูสาเหตุที่ส่งข้อความไม่สำเร็จ'}
+                onOpenCitation={onOpenCitation}
+              />
             )}
             {showApproval && onResolveApproval && (
               <div className="mt-2 flex gap-1.5">

@@ -2,7 +2,7 @@ from .base import AgentRuntime, AgentRuntimeConfig, RuntimeEvent
 from .executive import (
     complete_executive_via_runtime,
     ensure_executive_runtime_agent,
-    letta_recall_snippet,
+    runtime_recall_compat_snippet,
 )
 from .factory import agent_runtime_health, get_agent_runtime, reset_agent_runtime
 from .checkpoints import create_runtime_checkpoint
@@ -27,7 +27,7 @@ __all__ = [
     "ensure_department_runtime_agent_safely",
     "ensure_executive_runtime_agent",
     "get_agent_runtime",
-    "letta_recall_snippet",
+    "runtime_recall_compat_snippet",
     "reset_agent_runtime",
     "runtime_agent_provisioning_status",
     "runtime_recall_snippet",

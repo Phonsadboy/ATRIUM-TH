@@ -23,6 +23,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import uuid
 import urllib.error
 import urllib.request
@@ -459,6 +460,46 @@ class HealthResponse(Schema):
     graph: GraphHealthResponse
     memory: dict[str, Any]
     counts: dict[str, int]
+
+
+class VersionStatusResponse(Schema):
+    ok: bool
+    status: Literal["current", "outdated", "ahead", "diverged", "unknown"]
+    relation: str
+    message: str
+    checkedAt: int
+    workspacePath: str
+    branch: str | None = None
+    remote: str | None = None
+    remoteUrl: str | None = None
+    remoteRef: str | None = None
+    localCommit: str | None = None
+    localShort: str | None = None
+    remoteCommit: str | None = None
+    remoteShort: str | None = None
+    dirty: bool = False
+    compareUrl: str | None = None
+    error: str | None = None
+
+
+class VersionUpdateInput(Schema):
+    restart: bool = True
+
+
+class VersionUpdateResponse(Schema):
+    ok: bool
+    status: Literal["updated", "blocked", "current", "failed"]
+    message: str
+    before: VersionStatusResponse
+    after: VersionStatusResponse | None = None
+    backup: dict[str, Any] | None = None
+    migrations: dict[str, Any] | None = None
+    restartScheduled: bool = False
+    restartMode: Literal["screen", "custom", "manual"] = "manual"
+    restartLogPath: str | None = None
+    stdout: str | None = None
+    stderr: str | None = None
+    error: str | None = None
 
 
 class EngineTickResponse(Schema):
@@ -1203,6 +1244,578 @@ def _git_run(path: Path, *args: str) -> subprocess.CompletedProcess[str]:
         timeout=10,
         check=False,
     )
+
+
+def _app_repo_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+_VERSION_UPDATE_LOCK = threading.Lock()
+_ATRIUM_BACKEND_SCREEN = "ai-company-backend"
+_ATRIUM_UI_SCREEN = "ai-company-ui"
+
+
+def _git_read(path: Path, *args: str, timeout: float = 4.0) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=path,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def _git_value(path: Path, *args: str, timeout: float = 4.0) -> tuple[str, str | None]:
+    try:
+        result = _git_read(path, *args, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return "", f"git {' '.join(args)} timed out"
+    except Exception as exc:
+        return "", str(exc)
+    if result.returncode != 0:
+        return "", (result.stderr or result.stdout or f"git {' '.join(args)} failed").strip()
+    return result.stdout.strip(), None
+
+
+def _short_commit(value: str | None) -> str | None:
+    if not value:
+        return None
+    return value[:12]
+
+
+def _github_repo_slug(remote_url: str | None) -> str | None:
+    if not remote_url:
+        return None
+    cleaned = remote_url.strip()
+    path = ""
+    if cleaned.startswith("git@") and ":" in cleaned:
+        path = cleaned.split(":", 1)[1]
+    else:
+        parsed = urlparse(cleaned)
+        path = parsed.path.lstrip("/")
+    if path.endswith(".git"):
+        path = path[:-4]
+    parts = [part for part in path.split("/") if part]
+    if len(parts) < 2:
+        return None
+    owner, repo = parts[-2], parts[-1]
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", owner) or not re.fullmatch(r"[A-Za-z0-9_.-]+", repo):
+        return None
+    return f"{owner}/{repo}"
+
+
+def _github_compare(repo_slug: str, local_commit: str, remote_commit: str) -> tuple[str, str | None]:
+    token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+    request = urllib.request.Request(
+        f"https://api.github.com/repos/{repo_slug}/compare/{local_commit}...{remote_commit}",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "atrium-version-check",
+            **({"Authorization": f"Bearer {token}"} if token else {}),
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        return "unknown", str(exc)
+    status = str(payload.get("status") or "").strip().lower()
+    if status in {"identical", "ahead", "behind", "diverged"}:
+        return status, None
+    return "unknown", f"GitHub compare returned status={status or 'empty'}"
+
+
+def _local_commit_relation(path: Path, local_commit: str, remote_commit: str) -> tuple[str, str | None]:
+    has_remote_commit, error = _git_value(path, "cat-file", "-e", f"{remote_commit}^{{commit}}")
+    if error:
+        return "unknown", error
+    if has_remote_commit:
+        # cat-file -e writes no stdout on success; this branch is kept for
+        # defensive completeness if git ever changes output shape.
+        pass
+    local_ancestor = _git_read(path, "merge-base", "--is-ancestor", local_commit, remote_commit)
+    if local_ancestor.returncode == 0:
+        return "ahead", None
+    remote_ancestor = _git_read(path, "merge-base", "--is-ancestor", remote_commit, local_commit)
+    if remote_ancestor.returncode == 0:
+        return "behind", None
+    return "diverged", None
+
+
+def _version_status(path: Path | None = None) -> dict[str, Any]:
+    path = (path or _app_repo_root()).resolve()
+    checked_at = now_ms()
+    inside, error = _git_value(path, "rev-parse", "--is-inside-work-tree")
+    if error or inside != "true":
+        return {
+            "ok": False,
+            "status": "unknown",
+            "relation": "unknown",
+            "message": "ไม่พบ git repository สำหรับตรวจเวอร์ชัน",
+            "checkedAt": checked_at,
+            "workspacePath": str(path),
+            "dirty": False,
+            "error": error or "not inside a git work tree",
+        }
+
+    local_commit, local_error = _git_value(path, "rev-parse", "HEAD")
+    branch, branch_error = _git_value(path, "rev-parse", "--abbrev-ref", "HEAD")
+    if branch == "HEAD":
+        branch = ""
+    upstream, upstream_error = _git_value(path, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    remote = "origin"
+    remote_branch = branch or "main"
+    if upstream and "/" in upstream:
+        remote, remote_branch = upstream.split("/", 1)
+    remote_url, remote_url_error = _git_value(path, "remote", "get-url", remote)
+    remote_ref = f"refs/heads/{remote_branch}"
+    remote_line, remote_error = _git_value(path, "ls-remote", remote, remote_ref, timeout=6.0)
+    dirty_out, _dirty_error = _git_value(path, "status", "--porcelain")
+    dirty = bool(dirty_out.strip())
+
+    if local_error or not local_commit:
+        error = local_error or "local HEAD is unavailable"
+    elif remote_error or not remote_line:
+        error = remote_error or upstream_error or remote_url_error or "remote HEAD is unavailable"
+    else:
+        error = None
+
+    remote_commit = remote_line.split()[0] if remote_line else ""
+    repo_slug = _github_repo_slug(remote_url)
+    compare_url = (
+        f"https://github.com/{repo_slug}/compare/{_short_commit(local_commit)}...{_short_commit(remote_commit)}"
+        if repo_slug and local_commit and remote_commit
+        else None
+    )
+
+    if error:
+        return {
+            "ok": False,
+            "status": "unknown",
+            "relation": "unknown",
+            "message": "ยังตรวจเวอร์ชันกับ GitHub ไม่ได้",
+            "checkedAt": checked_at,
+            "workspacePath": str(path),
+            "branch": branch or None,
+            "remote": remote,
+            "remoteUrl": remote_url or None,
+            "remoteRef": remote_ref,
+            "localCommit": local_commit or None,
+            "localShort": _short_commit(local_commit),
+            "remoteCommit": remote_commit or None,
+            "remoteShort": _short_commit(remote_commit),
+            "dirty": dirty,
+            "compareUrl": compare_url,
+            "error": error,
+        }
+
+    if local_commit == remote_commit:
+        relation = "identical"
+        status = "current"
+        message = "เวอร์ชันนี้ตรงกับ GitHub แล้ว"
+    else:
+        relation, relation_error = ("unknown", None)
+        if repo_slug:
+            relation, relation_error = _github_compare(repo_slug, local_commit, remote_commit)
+        if relation == "unknown":
+            relation, local_relation_error = _local_commit_relation(path, local_commit, remote_commit)
+            relation_error = relation_error or local_relation_error
+        if relation == "ahead":
+            status = "outdated"
+            message = "มี commit ใหม่บน GitHub แล้ว ควรอัปเดตระบบ"
+        elif relation == "behind":
+            status = "ahead"
+            message = "เครื่องนี้มี commit ใหม่กว่า GitHub หรือยังไม่ได้ push"
+        elif relation == "diverged":
+            status = "diverged"
+            message = "commit ในเครื่องและ GitHub แยกสายกัน ควรตรวจ branch ก่อนอัปเดต"
+        else:
+            status = "unknown"
+            message = "commit ในเครื่องไม่ตรงกับ GitHub แต่ยังยืนยันลำดับไม่ได้"
+            error = relation_error
+
+    return {
+        "ok": status in {"current", "ahead"},
+        "status": status,
+        "relation": relation,
+        "message": message,
+        "checkedAt": checked_at,
+        "workspacePath": str(path),
+        "branch": branch or None,
+        "remote": remote,
+        "remoteUrl": remote_url or None,
+        "remoteRef": remote_ref,
+        "localCommit": local_commit,
+        "localShort": _short_commit(local_commit),
+        "remoteCommit": remote_commit,
+        "remoteShort": _short_commit(remote_commit),
+        "dirty": dirty,
+        "compareUrl": compare_url,
+        "error": error,
+    }
+
+
+def _screen_sessions() -> str:
+    if not shutil.which("screen"):
+        return ""
+    try:
+        result = subprocess.run(
+            ["screen", "-ls"],
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+    except Exception:
+        return ""
+    return f"{result.stdout}\n{result.stderr}"
+
+
+def _can_restart_with_screen() -> bool:
+    sessions = _screen_sessions()
+    return _ATRIUM_BACKEND_SCREEN in sessions and _ATRIUM_UI_SCREEN in sessions
+
+
+def _schedule_version_restart(path: Path) -> dict[str, Any]:
+    log_path = path / "system" / "logs" / "self-update-restart.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    custom_cmd = os.getenv("ATRIUM_SELF_UPDATE_RESTART_CMD", "").strip()
+    if custom_cmd:
+        command = custom_cmd
+        mode = "custom"
+    elif _can_restart_with_screen():
+        command = "./atrium stop && ./atrium start --force"
+        mode = "screen"
+    else:
+        return {
+            "scheduled": False,
+            "mode": "manual",
+            "logPath": str(log_path),
+            "error": "ATRIUM screen sessions were not detected; restart manually after update.",
+        }
+
+    script = (
+        "sleep 1\n"
+        f"cd {shlex.quote(str(path))}\n"
+        f"{{ {command}; }} >>{shlex.quote(str(log_path))} 2>&1\n"
+    )
+    subprocess.Popen(
+        ["bash", "-lc", script],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    return {"scheduled": True, "mode": mode, "logPath": str(log_path), "error": None}
+
+
+def _resolve_system_path(repo_root: Path, value: Path | str) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    return (repo_root / "system" / path).resolve()
+
+
+def _sqlite_path_from_database_url(url: str) -> Path | None:
+    if not url.startswith("sqlite"):
+        return None
+    parsed = urlparse(url)
+    if parsed.path in {"", "/:memory:"}:
+        return None
+    return Path(unquote(parsed.path)).expanduser().resolve()
+
+
+def _run_sqlite_backup(repo_root: Path, settings: Any, stamp: int) -> dict[str, Any]:
+    db_path = _sqlite_path_from_database_url(str(settings.effective_database_url))
+    backup_dir = _resolve_system_path(repo_root, getattr(settings, "backup_dir", Path("./data/backups")))
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    if not db_path or not db_path.exists():
+        return {
+            "ok": True,
+            "backend": "sqlite",
+            "skipped": True,
+            "message": "SQLite database file does not exist yet",
+            "backupDir": str(backup_dir),
+        }
+    dest = backup_dir / f"atrium-sqlite-{stamp}.db"
+    copied: list[str] = []
+    shutil.copy2(db_path, dest)
+    copied.append(str(dest))
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(str(db_path) + suffix)
+        if sidecar.exists():
+            sidecar_dest = Path(str(dest) + suffix)
+            shutil.copy2(sidecar, sidecar_dest)
+            copied.append(str(sidecar_dest))
+    manifest_path = backup_dir / f"atrium-sqlite-{stamp}.manifest.json"
+    manifest = {
+        "format": "atrium-sqlite-backup-manifest-v1",
+        "createdAt": stamp,
+        "source": str(db_path),
+        "files": copied,
+        "sha256": _sha256_file(dest),
+    }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return {
+        "ok": True,
+        "backend": "sqlite",
+        "backupDir": str(backup_dir),
+        "files": copied,
+        "manifest": str(manifest_path),
+    }
+
+
+def _run_postgres_backup(repo_root: Path, settings: Any) -> dict[str, Any]:
+    script = repo_root / "ops" / "scripts" / "backup_postgres.sh"
+    if not script.exists():
+        return {"ok": False, "backend": "postgres", "error": "backup_postgres.sh is missing"}
+    env = os.environ.copy()
+    env["ATRIUM_DATABASE_URL"] = str(settings.effective_database_url)
+    env.setdefault("ATRIUM_BACKUP_DIR", str(_resolve_system_path(repo_root, getattr(settings, "backup_dir", Path("./data/backups")))))
+    if getattr(settings, "backup_offsite_dir", ""):
+        env.setdefault("ATRIUM_BACKUP_OFFSITE_DIR", str(getattr(settings, "backup_offsite_dir")))
+    if getattr(settings, "backup_require_offsite", False):
+        env.setdefault("ATRIUM_BACKUP_REQUIRE_OFFSITE", "true")
+    result = subprocess.run(
+        [str(script)],
+        cwd=repo_root,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=300,
+        check=False,
+    )
+    return {
+        "ok": result.returncode == 0,
+        "backend": "postgres",
+        "stdout": result.stdout[-4000:] or None,
+        "stderr": result.stderr[-4000:] or None,
+        "error": None if result.returncode == 0 else (result.stderr.strip() or result.stdout.strip() or "Postgres backup failed"),
+    }
+
+
+def _run_pre_update_backup(repo_root: Path) -> dict[str, Any]:
+    settings = get_settings()
+    stamp = now_ms()
+    if settings.is_postgres:
+        return _run_postgres_backup(repo_root, settings)
+    return _run_sqlite_backup(repo_root, settings, stamp)
+
+
+def _run_update_migrations(repo_root: Path) -> dict[str, Any]:
+    log_path = repo_root / "system" / "logs" / "self-update-migrations.log"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    result = subprocess.run(
+        ["uv", "run", "--extra", "postgres", "python", "-m", "app.update_migrations", "--json"],
+        cwd=repo_root / "system",
+        text=True,
+        capture_output=True,
+        timeout=900,
+        check=False,
+    )
+    log_path.write_text(
+        "\n".join([
+            "== stdout ==",
+            result.stdout,
+            "== stderr ==",
+            result.stderr,
+        ]),
+        encoding="utf-8",
+    )
+    parsed: dict[str, Any] | None = None
+    for line in reversed(result.stdout.splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(line)
+            break
+        except json.JSONDecodeError:
+            continue
+    if result.returncode != 0:
+        return {
+            "ok": False,
+            "logPath": str(log_path),
+            "stdout": result.stdout[-4000:] or None,
+            "stderr": result.stderr[-4000:] or None,
+            "error": result.stderr.strip() or result.stdout.strip() or "update migrations failed",
+        }
+    if not parsed:
+        return {
+            "ok": False,
+            "logPath": str(log_path),
+            "stdout": result.stdout[-4000:] or None,
+            "stderr": result.stderr[-4000:] or None,
+            "error": "migration runner did not return JSON",
+        }
+    return {**parsed, "logPath": str(log_path)}
+
+
+def _version_update(path: Path | None = None, *, restart: bool = True) -> dict[str, Any]:
+    path = (path or _app_repo_root()).resolve()
+    if not _VERSION_UPDATE_LOCK.acquire(blocking=False):
+        before = _version_status(path)
+        return {
+            "ok": False,
+            "status": "blocked",
+            "message": "มีการอัปเดตระบบกำลังทำงานอยู่",
+            "before": before,
+            "after": None,
+            "backup": None,
+            "migrations": None,
+            "restartScheduled": False,
+            "restartMode": "manual",
+            "restartLogPath": None,
+            "error": "update already running",
+        }
+    try:
+        before = _version_status(path)
+        if before.get("dirty"):
+            return {
+                "ok": False,
+                "status": "blocked",
+                "message": "อัปเดตไม่ได้ เพราะมีไฟล์ที่แก้ค้างอยู่ในเครื่อง",
+                "before": before,
+                "after": before,
+                "backup": None,
+                "migrations": None,
+                "restartScheduled": False,
+                "restartMode": "manual",
+                "restartLogPath": None,
+                "error": "working tree is dirty",
+            }
+        if before.get("status") == "current":
+            return {
+                "ok": True,
+                "status": "current",
+                "message": "ระบบเป็นเวอร์ชันล่าสุดอยู่แล้ว",
+                "before": before,
+                "after": before,
+                "backup": None,
+                "migrations": None,
+                "restartScheduled": False,
+                "restartMode": "manual",
+                "restartLogPath": None,
+            }
+        if before.get("status") != "outdated":
+            return {
+                "ok": False,
+                "status": "blocked",
+                "message": "อัปเดตอัตโนมัติได้เฉพาะกรณี GitHub ใหม่กว่าแบบ fast-forward เท่านั้น",
+                "before": before,
+                "after": before,
+                "backup": None,
+                "migrations": None,
+                "restartScheduled": False,
+                "restartMode": "manual",
+                "restartLogPath": None,
+                "error": str(before.get("error") or before.get("status") or "not fast-forwardable"),
+            }
+
+        backup = _run_pre_update_backup(path)
+        if not backup.get("ok"):
+            return {
+                "ok": False,
+                "status": "failed",
+                "message": "backup ก่อนอัปเดตไม่สำเร็จ จึงยังไม่แก้โค้ดระบบ",
+                "before": before,
+                "after": before,
+                "backup": backup,
+                "migrations": None,
+                "restartScheduled": False,
+                "restartMode": "manual",
+                "restartLogPath": None,
+                "error": str(backup.get("error") or "backup failed"),
+            }
+
+        remote = str(before.get("remote") or "origin")
+        remote_ref = str(before.get("remoteRef") or "refs/heads/main")
+        remote_branch = remote_ref.removeprefix("refs/heads/") or "main"
+        fetch = _git_read(path, "fetch", "--prune", remote, remote_branch, timeout=60)
+        if fetch.returncode != 0:
+            return {
+                "ok": False,
+                "status": "failed",
+                "message": "git fetch ไม่สำเร็จ",
+                "before": before,
+                "after": _version_status(path),
+                "backup": backup,
+                "migrations": None,
+                "restartScheduled": False,
+                "restartMode": "manual",
+                "restartLogPath": None,
+                "stdout": fetch.stdout[-4000:] or None,
+                "stderr": fetch.stderr[-4000:] or None,
+                "error": fetch.stderr.strip() or fetch.stdout.strip() or "git fetch failed",
+            }
+
+        merge = _git_read(path, "merge", "--ff-only", "FETCH_HEAD", timeout=120)
+        after = _version_status(path)
+        if merge.returncode != 0:
+            return {
+                "ok": False,
+                "status": "failed",
+                "message": "git fast-forward ไม่สำเร็จ",
+                "before": before,
+                "after": after,
+                "backup": backup,
+                "migrations": None,
+                "restartScheduled": False,
+                "restartMode": "manual",
+                "restartLogPath": None,
+                "stdout": merge.stdout[-4000:] or None,
+                "stderr": merge.stderr[-4000:] or None,
+                "error": merge.stderr.strip() or merge.stdout.strip() or "git merge --ff-only failed",
+            }
+
+        migrations = _run_update_migrations(path)
+        if not migrations.get("ok"):
+            return {
+                "ok": False,
+                "status": "failed",
+                "message": "อัปเดตโค้ดแล้ว แต่ migration ไม่สำเร็จ จึงยังไม่รีสตาร์ท",
+                "before": before,
+                "after": after,
+                "backup": backup,
+                "migrations": migrations,
+                "restartScheduled": False,
+                "restartMode": "manual",
+                "restartLogPath": None,
+                "stdout": merge.stdout[-4000:] or None,
+                "stderr": merge.stderr[-4000:] or None,
+                "error": str(migrations.get("error") or "migration failed"),
+            }
+
+        restart_info = (
+            _schedule_version_restart(path)
+            if restart
+            else {"scheduled": False, "mode": "manual", "logPath": None, "error": None}
+        )
+        restart_scheduled = bool(restart_info.get("scheduled"))
+        ok = after.get("status") in {"current", "ahead"}
+        return {
+            "ok": ok,
+            "status": "updated" if ok else "failed",
+            "message": (
+                "อัปเดตแล้ว และกำลังรีสตาร์ท ATRIUM"
+                if restart_scheduled
+                else "อัปเดตแล้ว แต่ต้องรีสตาร์ท ATRIUM เอง"
+            ),
+            "before": before,
+            "after": after,
+            "backup": backup,
+            "migrations": migrations,
+            "restartScheduled": restart_scheduled,
+            "restartMode": str(restart_info.get("mode") or "manual"),
+            "restartLogPath": restart_info.get("logPath"),
+            "stdout": merge.stdout[-4000:] or None,
+            "stderr": merge.stderr[-4000:] or None,
+            "error": restart_info.get("error") if not restart_scheduled and restart else None,
+        }
+    finally:
+        _VERSION_UPDATE_LOCK.release()
 
 
 def _git_status(path: Path, error: str | None = None) -> dict[str, Any]:
@@ -6828,7 +7441,7 @@ async def _complete_with_provider(
         system = f"{system}\n\n{chat_tool_system_instructions(departments, dept)}"
     messages = _llm_history(history, user_msg)
     runtime_tools = tools
-    use_agent_runtime = settings.use_letta_runtime and not provider_has_native_chat_stream(dept.get("providerId"))
+    use_agent_runtime = settings.use_external_agent_runtime and not provider_has_native_chat_stream(dept.get("providerId"))
     if use_agent_runtime:
         from .runtime.provisioning import ensure_department_runtime_agent_safely
         from .runtime.turns import (
@@ -6842,7 +7455,7 @@ async def _complete_with_provider(
             repo = Repo(s)
             active = await repo.get_department(dept["id"]) or dept
             meta = await ensure_department_runtime_agent_safely(repo, active, settings=settings)
-            if meta and meta.get("lettaAgentId"):
+            if meta and meta.get("runtimeAgentId"):
                 active = {**active, "runtime": meta}
 
         runtime_thread_id = str(user_msg.get("threadId") or "")
@@ -7965,7 +8578,7 @@ async def _complete_chat_turn(
 
         if (
             is_exec(turn_dept["id"])
-            and settings.use_letta_runtime
+            and settings.use_external_agent_runtime
             and not provider_bypasses_agent_runtime(turn_dept.get("providerId"))
         ):
             from .runtime.executive import ensure_executive_runtime_agent
@@ -8152,7 +8765,7 @@ async def health() -> dict[str, Any]:
 @app.get("/api/runtime")
 async def runtime_status() -> dict[str, Any]:
     from .eval.harness import EvalHarness
-    from .memory.embeddings import ollama_reachable, resolve_embedder
+    from .memory.embeddings import embedding_metadata, ollama_reachable, resolve_embedder
     from .runtime import agent_runtime_health
     from .runtime.provisioning import runtime_agent_provisioning_status
     from .tools import HostBridge, build_default_tool_registry, load_custom_tools
@@ -8179,13 +8792,31 @@ async def runtime_status() -> dict[str, Any]:
     engine = engine_runtime_snapshot(settings)
     provider = await asyncio.to_thread(provider_health, settings, probe_accounts=False)
     agent_runtime = await agent_runtime_health(settings)
-    embedder = await resolve_embedder(settings)
+    external_runtime_required_department_ids = [
+        str(dept.get("id") or "")
+        for dept in departments
+        if not provider_bypasses_agent_runtime(dept.get("providerId") or "claude_code")
+    ]
+    agent_runtime["requiredForDepartmentIds"] = external_runtime_required_department_ids
+    agent_runtime["optionalForDirectProviders"] = not bool(external_runtime_required_department_ids)
+    embedding_error = ""
+    try:
+        embedder = await resolve_embedder(settings)
+        embedder_meta = embedding_metadata(embedder)
+    except Exception as exc:
+        embedder = None
+        embedding_error = f"{type(exc).__name__}: {str(exc)[:240]}"
+        embedder_meta = {
+            "provider": settings.configured_embedding_label,
+            "model": settings.openai_embedding_model if settings.openai_embeddings_enabled else settings.configured_embedding_label,
+            "dim": settings.effective_openai_embedding_dimensions or settings.embedding_dim,
+        }
     host_bridge = HostBridge(settings).status().to_dict()
     eval_status = EvalHarness(settings).status()
     graph = graph_health()
     memory["graphHealth"] = graph
     v2_ok = True
-    if settings.use_letta_runtime and not agent_runtime.get("ok"):
+    if settings.use_external_agent_runtime and external_runtime_required_department_ids and not agent_runtime.get("ok"):
         v2_ok = False
     return {
         "ok": (
@@ -8202,14 +8833,16 @@ async def runtime_status() -> dict[str, Any]:
         "provider": provider,
         "wsClients": hub.client_count,
         "v2": {
-            "agentBackend": settings.agent_backend,
+            "agentBackend": settings.agent_backend_mode,
             "agentRuntime": agent_runtime,
             "agentProvisioning": runtime_agent_provisioning_status(departments),
             "embeddings": {
-                "provider": embedder.name,
-                "dim": embedder.dim,
+                "mode": settings.embedding_provider_mode,
+                "provider": str(embedder_meta.get("provider") or ""),
+                "dim": int(embedder_meta.get("dim") or 0),
                 "ollamaReachable": await ollama_reachable(settings),
-                "model": settings.ollama_embedding_model,
+                "model": str(embedder_meta.get("model") or ""),
+                "error": embedding_error or None,
             },
             "memory": memory,
         "database": database,
@@ -8252,6 +8885,17 @@ async def runtime_status() -> dict[str, Any]:
     }
 
 
+@app.get("/api/version", response_model=VersionStatusResponse)
+async def version_status() -> dict[str, Any]:
+    return await asyncio.to_thread(_version_status)
+
+
+@app.post("/api/version/update", response_model=VersionUpdateResponse)
+async def update_version(input: VersionUpdateInput | None = None) -> dict[str, Any]:
+    restart = True if input is None else bool(input.restart)
+    return await asyncio.to_thread(_version_update, restart=restart)
+
+
 @app.get("/api/provider-auth/status")
 async def provider_auth_status(probe: bool = False) -> dict[str, Any]:
     from .provider.chatgpt_oauth import chatgpt_oauth_login_state, chatgpt_oauth_status
@@ -8288,6 +8932,7 @@ async def provider_auth_env_settings() -> dict[str, Any]:
 
 @app.patch("/api/provider-auth/env")
 async def update_provider_auth_env_settings(input: ProviderEnvUpdateInput) -> dict[str, Any]:
+    from .memory.embeddings import reset_embedder
     from .provider.env_settings import provider_env_settings, update_provider_env_settings
     from .provider.registry import reset_providers
 
@@ -8296,6 +8941,7 @@ async def update_provider_auth_env_settings(input: ProviderEnvUpdateInput) -> di
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     get_settings.cache_clear()
+    reset_embedder()
     reset_providers()
     hub.mark_dirty()
     settings = get_settings()

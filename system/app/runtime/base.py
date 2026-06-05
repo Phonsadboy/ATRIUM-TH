@@ -1,7 +1,8 @@
-"""Pluggable agent runtime interface (ATRIUM v2).
+"""Native ATRIUM agent runtime interface.
 
-ATRIUM remains orchestrator + system of record; the runtime owns per-agent LLM
-loops and memory paging. Letta/MemGPT is the first adapter.
+ATRIUM is the orchestrator and system of record: provider turns, tool loops,
+memory, checkpoints, and job recovery live in the app instead of an external
+agent runtime service.
 """
 from __future__ import annotations
 

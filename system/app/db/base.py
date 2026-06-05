@@ -154,6 +154,7 @@ def _configure_sqlite_connection(dbapi_connection, _connection_record) -> None:
     cursor = dbapi_connection.cursor()
     try:
         cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA synchronous=NORMAL")
         # Background chat jobs and the live UI can write at the same time
         # during local SQLite development. Wait long enough for short UI writes
@@ -256,8 +257,6 @@ async def init_db() -> None:
         async with engine.begin() as conn:
             await _ensure_sqlite_additive_schema(conn)
             await _write_sqlite_schema_stamp(conn)
-            await conn.execute(text("PRAGMA journal_mode=WAL"))
-            await conn.execute(text("PRAGMA synchronous=NORMAL"))
             await conn.execute(text("PRAGMA busy_timeout=30000"))
 
 

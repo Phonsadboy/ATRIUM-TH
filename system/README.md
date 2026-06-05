@@ -1,7 +1,7 @@
 # ATRIUM Backend
 
 This folder contains the FastAPI backend, runtime code, migrations, and tests.
-Use the root `README.md` for the full beginner-friendly Mac installation guide.
+Use the root `README.md` for the full beginner-friendly macOS/Windows installation guide.
 
 ## Setup
 

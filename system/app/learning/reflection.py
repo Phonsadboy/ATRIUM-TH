@@ -85,7 +85,7 @@ async def _generate_reflection_lesson_via_runtime(
     system: str,
     user: str,
 ) -> str | None:
-    if not settings.use_letta_runtime:
+    if not settings.use_external_agent_runtime:
         return None
     try:
         from ..runtime.provisioning import ensure_department_runtime_agent_safely
@@ -94,7 +94,7 @@ async def _generate_reflection_lesson_via_runtime(
         active = dept
         if repo is not None:
             meta = await ensure_department_runtime_agent_safely(repo, dept, settings=settings)
-            if meta and meta.get("lettaAgentId"):
+            if meta and meta.get("runtimeAgentId"):
                 active = {**dept, "runtime": meta}
             session = getattr(repo, "s", None)
             if session is not None:
@@ -257,7 +257,7 @@ async def record_learning_signal(
         )
     )
     settings = get_settings()
-    if settings.use_letta_runtime and dept_id == "exec":
+    if settings.use_external_agent_runtime and dept_id == "exec":
         try:
             from ..memory.company_memory import append_company_memory_entry, sync_company_memory_to_runtime
 
