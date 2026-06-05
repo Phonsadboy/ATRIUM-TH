@@ -531,7 +531,25 @@ def command_bootstrap(args: argparse.Namespace) -> int:
         compose(["up", "-d", "postgres"], dry_run=args.dry_run, timeout=600)
     else:
         compose(["up", "-d", "postgres", "ollama"], dry_run=args.dry_run, timeout=600)
-        compose(["exec", "ollama", "ollama", "pull", "bge-m3"], dry_run=args.dry_run, timeout=1200)
+        # The bge-m3 pull is best-effort. On some networks the in-container
+        # TLS handshake to registry.ollama.ai fails with
+        # `x509: certificate signed by unknown authority` (corporate proxy,
+        # outdated CA bundle, etc.). Treat this as a warning rather than a
+        # hard failure so the rest of bootstrap can finish — the user can
+        # either retry the pull manually or point at an external Ollama.
+        try:
+            compose(["exec", "ollama", "ollama", "pull", "bge-m3"], dry_run=args.dry_run, timeout=1200)
+        except StepFailure as exc:
+            print()
+            print("[WARN] Could not pull bge-m3 in the Ollama container.")
+            reason = str(exc).strip()
+            if reason:
+                print(f"       Reason: {reason[:200]}")
+            print("       Continuing — embeddings will not work until the model is available.")
+            print("       Resolve with either of:")
+            print("         1) docker compose exec ollama ollama pull bge-m3   (retry after fixing the network)")
+            print("         2) Set ATRIUM_OLLAMA_BASE_URL to an Ollama that already has bge-m3,")
+            print("            then re-run ./atrium bootstrap --full")
 
     print_header("Database")
     run_or_plan(["uv", "run", "--extra", "postgres", "alembic", "-c", "alembic.ini", "upgrade", "head"], cwd=SYSTEM_DIR, dry_run=args.dry_run, timeout=600)
