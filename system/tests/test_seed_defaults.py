@@ -34,6 +34,48 @@ class SeedDefaultsTest(unittest.IsolatedAsyncioTestCase):
         executive = repo.departments["exec"]
         self.assertEqual(executive["providerId"], "claude_code")
         self.assertEqual(executive["model"], "claude-opus-4-8")
+        self.assertTrue(executive["autonomy"])
+
+    async def test_seed_blueprints_default_autonomy_to_executive_only(self) -> None:
+        from app.config import Settings
+        from app import seed
+
+        now = 1_000_000
+        with tempfile.TemporaryDirectory() as tmpdir:
+            settings = Settings(data_dir=tmpdir)
+            with mock.patch.object(seed, "get_settings", return_value=settings):
+                departments = [
+                    seed._department_from_blueprint(bp, now=now, seed_demo_data=True)
+                    for bp in seed.BLUEPRINTS
+                ]
+
+        autonomy_by_id = {dept["id"]: dept["autonomy"] for dept in departments}
+        self.assertTrue(autonomy_by_id["exec"])
+        self.assertTrue(all(not enabled for dept_id, enabled in autonomy_by_id.items() if dept_id != "exec"))
+
+    async def test_checkpoint_restore_missing_autonomy_defaults_to_non_autonomous_department(self) -> None:
+        from app.org import checkpoints
+
+        restored = checkpoints._restore_department_spec({"id": "research", "name": "Research"})
+
+        self.assertFalse(restored["autonomy"])
+
+    async def test_checkpoint_restore_missing_autonomy_defaults_executive_to_autonomous(self) -> None:
+        from app.org import checkpoints
+
+        restored = checkpoints._restore_department_spec({"id": "exec", "name": "ผู้บริหาร"})
+
+        self.assertTrue(restored["autonomy"])
+
+    async def test_checkpoint_restore_preserves_explicit_disabled_autonomy(self) -> None:
+        from app.org import checkpoints
+
+        restored = checkpoints._restore_department_spec(
+            {"id": "strategy", "name": "Strategy"},
+            {"id": "strategy", "name": "Strategy", "autonomy": False},
+        )
+
+        self.assertFalse(restored["autonomy"])
 
 
 if __name__ == "__main__":

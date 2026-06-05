@@ -59,7 +59,7 @@ function dept(
     state,
     mood,
     currentTaskId: null,
-    autonomy: true,
+    autonomy: id === EXEC_ID,
     createdAt: nowMs(),
     room: { x: 0, y: 0, w: 1, h: 1 },
     memory: { archiveChunks: 0, ragEntries: 0, graphNodes: 0, graphEdges: 0, lastCompactionAt: null, tokensSaved: 0 },

@@ -81,7 +81,7 @@ async def spawn_department(
         "state": "idle",
         "mood": 0.85,
         "currentTaskId": None,
-        "autonomy": True,
+        "autonomy": False,
         "createdAt": now_ms(),
         "room": {"x": 1 + (len(departments) % 6) * 2, "y": 2, "w": 3, "h": 3},
         "memory": {"archiveChunks": 0, "ragEntries": 0, "graphNodes": 0, "graphEdges": 0, "tokensSaved": 0},

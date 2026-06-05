@@ -115,9 +115,10 @@ from .work_visibility import emit_work_status_notice
 MAX_ACTIVITY = 80
 MAX_TRIGGER_CATCH_UP_RUNS = 8
 CATCH_UP_RUN_SPACING_MS = 60_000
-AUTONOMY_IDLE_ROLL_INTERVAL_MS = 30_000
-AUTONOMY_IDLE_BASE_CHANCE = 0.05
-AUTONOMY_IDLE_HOURLY_CHANCE_INCREMENT = 0.02
+AUTONOMY_IDLE_ROLL_INTERVAL_MS = 15_000
+AUTONOMY_IDLE_BASE_CHANCE = 0.10
+AUTONOMY_IDLE_RESET_CHANCE = 0.05
+AUTONOMY_IDLE_HOURLY_CHANCE_INCREMENT = 0.06
 AUTONOMY_IDLE_MAX_CHANCE = 0.95
 _OBJECTIVE_ENQUEUE_LOCK = asyncio.Lock()
 _TRIGGER_ENQUEUE_LOCK = asyncio.Lock()
@@ -2538,32 +2539,50 @@ def _safe_int(value: Any, default: int) -> int:
         return default
 
 
-def _reset_autonomy_schedule_for_work(dept: dict[str, Any]) -> bool:
-    if "autonomySchedule" not in dept:
+def _reset_autonomy_schedule_for_work(dept: dict[str, Any], now: int | None = None) -> bool:
+    existing = dept.get("autonomySchedule") if isinstance(dept.get("autonomySchedule"), dict) else {}
+    if (
+        existing.get("status") == "reset_on_work"
+        and float(existing.get("chance") or 0) == AUTONOMY_IDLE_RESET_CHANCE
+    ):
         return False
-    dept.pop("autonomySchedule", None)
+    schedule = {
+        "trigger": "idle_department_autonomy",
+        "status": "reset_on_work",
+        "resetAt": now,
+        "resetChancePending": True,
+        "chance": AUTONOMY_IDLE_RESET_CHANCE,
+        "chancePercent": round(AUTONOMY_IDLE_RESET_CHANCE * 100, 2),
+        "rollIntervalMs": AUTONOMY_IDLE_ROLL_INTERVAL_MS,
+    }
+    dept["autonomySchedule"] = schedule
     return True
 
 
 def _prepare_autonomy_idle_roll(dept: dict[str, Any], now: int) -> tuple[bool, float, dict[str, Any], bool]:
     raw = dept.get("autonomySchedule")
     schedule = dict(raw) if isinstance(raw, dict) else {}
-    is_new_schedule = not schedule
+    reset_pending = bool(schedule.get("resetChancePending"))
+    is_new_schedule = not schedule or schedule.get("status") == "reset_on_work"
     idle_since = _safe_int(schedule.get("idleSinceAt"), now)
+    if is_new_schedule:
+        idle_since = now
     if idle_since > now:
         idle_since = now
     last_roll_at = _safe_int(schedule.get("lastRollAt"), now if is_new_schedule else idle_since)
     if last_roll_at > now:
         last_roll_at = now
     idle_hours = max(0, (now - idle_since) // (60 * 60 * 1000))
+    base_chance = AUTONOMY_IDLE_RESET_CHANCE if reset_pending else AUTONOMY_IDLE_BASE_CHANCE
     chance = min(
         AUTONOMY_IDLE_MAX_CHANCE,
-        AUTONOMY_IDLE_BASE_CHANCE + (AUTONOMY_IDLE_HOURLY_CHANCE_INCREMENT * idle_hours),
+        base_chance + (AUTONOMY_IDLE_HOURLY_CHANCE_INCREMENT * idle_hours),
     )
     due = not is_new_schedule and now - last_roll_at >= AUTONOMY_IDLE_ROLL_INTERVAL_MS
     next_roll_at = now + AUTONOMY_IDLE_ROLL_INTERVAL_MS if due else last_roll_at + AUTONOMY_IDLE_ROLL_INTERVAL_MS
     schedule.update({
         "trigger": "idle_department_autonomy",
+        "status": "idle_waiting",
         "idleSinceAt": idle_since,
         "lastRollAt": now if due else last_roll_at,
         "nextRollAt": next_roll_at,
@@ -2572,6 +2591,8 @@ def _prepare_autonomy_idle_roll(dept: dict[str, Any], now: int) -> tuple[bool, f
         "idleHours": idle_hours,
         "rollIntervalMs": AUTONOMY_IDLE_ROLL_INTERVAL_MS,
     })
+    if due:
+        schedule["resetChancePending"] = False
     dept["autonomySchedule"] = schedule
     return due, chance, schedule, is_new_schedule or due
 
@@ -6138,7 +6159,7 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
     state = dept.get("state")
     task = _task_by_id(tasks, dept.get("currentTaskId"))
     base_task = copy.deepcopy(task) if task else None
-    reset_autonomy_schedule = _reset_autonomy_schedule_for_work(dept) if task else False
+    reset_autonomy_schedule = _reset_autonomy_schedule_for_work(dept, now) if task else False
     if reset_autonomy_schedule:
         await repo.save_department(dept)
 
@@ -6507,7 +6528,7 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
         return False
 
     if task and task.get("status") in {"assigned", "backlog", "revising", "in_progress"}:
-        _reset_autonomy_schedule_for_work(dept)
+        _reset_autonomy_schedule_for_work(dept, now)
         _clear_blocked_retry_guard(task)
         task["status"] = "in_progress"
         task["updatedAt"] = now
@@ -6537,7 +6558,7 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
 
     open_task = _open_task_for(dept["id"], tasks)
     if open_task:
-        _reset_autonomy_schedule_for_work(dept)
+        _reset_autonomy_schedule_for_work(dept, now)
         base_open_task = copy.deepcopy(open_task)
         _clear_blocked_retry_guard(open_task)
         open_task["status"] = "in_progress"
@@ -6606,7 +6627,7 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
             "createdAt": now,
         }
         await repo.save_task(task)
-        _reset_autonomy_schedule_for_work(dept)
+        _reset_autonomy_schedule_for_work(dept, now)
         await repo.save_department(dept)
         if proposal.get("needsApproval"):
             await _create_approval(
@@ -6631,7 +6652,8 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
             (
                 f"Full Auto: ฝ่าย{dept.get('name', dept['id'])}ริเริ่มงานเอง "
                 f"“{task['title']}” เพราะ {why_now}\n\n"
-                "บริบทผู้บริหาร: ถ้าไม่เกี่ยวข้องกับงานช่วงนี้หรือสโคปงานหลัก ไม่จำเป็นต้องอนุมัติ"
+                "บริบทผู้บริหาร: ถ้าไม่เกี่ยวข้องกับงานช่วงนี้หรือสโคปงานหลัก ไม่จำเป็นต้องอนุมัติ "
+                "ยกเว้นกรณีผู้บริหารเป็นคนเริ่มงานใหม่นั้นขึ้นมาเอง"
             ),
             event="task_autonomous",
             severity="good",

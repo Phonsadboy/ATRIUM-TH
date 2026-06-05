@@ -76,7 +76,7 @@ def _department_from_blueprint(bp: dict, *, now: int, seed_demo_data: bool) -> d
         "emoji": bp["emoji"], "accent": bp["accent"], "providerId": bp["providerId"], "model": bp["model"],
         "thinkingEffort": bp["thinkingEffort"], "speed": bp.get("speed", "standard"),
         "agentName": bp["agentName"], "state": bp["state"] if seed_demo_data else "idle",
-        "mood": bp["mood"], "currentTaskId": None, "autonomy": bp["autonomy"], "createdAt": _hrs(now, 72),
+        "mood": bp["mood"], "currentTaskId": None, "autonomy": bp["id"] == EXEC_ID, "createdAt": _hrs(now, 72),
         "room": bp["room"], "skills": bp["skills"], "tools": bp["tools"],
         "workspacePath": _workspace_path(bp["id"]), "visibilityPolicy": _visibility_policy(bp["id"]),
         "memory": _memory_stats(bp["mem"], seed_demo_data, now),
@@ -138,7 +138,7 @@ BLUEPRINTS: list[dict] = [
         "charter": "แปลงเป้าหมายเป็นแผนที่ทำได้จริง จัดลำดับความสำคัญ และวัดผล",
         "emoji": "🧭", "accent": "honey", "providerId": "claude_code", "model": "claude-opus-4-7",
         "thinkingEffort": "high", "agentName": "ไอริส", "state": "working", "mood": 0.7,
-        "skills": ["วิเคราะห์ตลาด", "โรดแมป", "OKR"], "tools": ["ค้นเว็บ", "สเปรดชีต", "ปฏิทิน"], "autonomy": True,
+        "skills": ["วิเคราะห์ตลาด", "โรดแมป", "OKR"], "tools": ["ค้นเว็บ", "สเปรดชีต", "ปฏิทิน"], "autonomy": False,
         "room": {"x": 1, "y": 6, "w": 5, "h": 4},
         "mem": {
             "concepts": ["ส่วนแบ่งตลาด", "คู่แข่ง", "จุดต่าง"], "people": ["ผู้ใช้", "ฝ่ายวิจัย"],
@@ -194,7 +194,7 @@ BLUEPRINTS: list[dict] = [
         "charter": "สร้างและดูแลระบบให้เสถียร ปลอดภัย และต่อยอดได้",
         "emoji": "⚙️", "accent": "teal", "providerId": "claude_code", "model": "claude-opus-4-8",
         "thinkingEffort": "xhigh", "agentName": "คิท", "state": "working", "mood": 0.6,
-        "skills": ["ฟรอนต์เอนด์", "แบ็กเอนด์", "อินฟรา", "ทดสอบ"], "tools": ["รันโค้ด", "Git", "เทอร์มินัล", "CI/CD"], "autonomy": True,
+        "skills": ["ฟรอนต์เอนด์", "แบ็กเอนด์", "อินฟรา", "ทดสอบ"], "tools": ["รันโค้ด", "Git", "เทอร์มินัล", "CI/CD"], "autonomy": False,
         "room": {"x": 1, "y": 11, "w": 5, "h": 4},
         "mem": {
             "concepts": ["สถาปัตยกรรม", "สัญญา API", "ประสิทธิภาพ"], "people": ["ฝ่ายออกแบบ", "ฝ่าย QA"],
@@ -213,7 +213,7 @@ BLUEPRINTS: list[dict] = [
         "charter": "เล่าเรื่องแบรนด์ให้คนเข้าใจและจดจำ ผลิตคอนเทนต์สม่ำเสมอ",
         "emoji": "✍️", "accent": "honey", "providerId": "claude_code", "model": "claude-sonnet-4-6",
         "thinkingEffort": "low", "agentName": "โซล", "state": "idle", "mood": 0.9,
-        "skills": ["เขียนบทความ", "แคปชัน", "อีเมลการตลาด"], "tools": ["ค้นเว็บ", "ตัวตรวจไวยากรณ์", "ปฏิทินคอนเทนต์"], "autonomy": True,
+        "skills": ["เขียนบทความ", "แคปชัน", "อีเมลการตลาด"], "tools": ["ค้นเว็บ", "ตัวตรวจไวยากรณ์", "ปฏิทินคอนเทนต์"], "autonomy": False,
         "room": {"x": 7, "y": 11, "w": 5, "h": 4},
         "mem": {
             "concepts": ["น้ำเสียงแบรนด์", "ช่องทาง", "ปฏิทินคอนเทนต์"], "people": ["ฝ่ายวิจัย", "ฝ่ายออกแบบ"],

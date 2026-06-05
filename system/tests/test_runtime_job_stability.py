@@ -1336,16 +1336,16 @@ class RuntimeJobStabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(repo.saved_departments), 1)
         schedule = repo.saved_departments[-1]["autonomySchedule"]
         self.assertEqual(schedule["lastRollAt"], 1_000)
-        self.assertEqual(schedule["nextRollAt"], 31_000)
-        self.assertEqual(schedule["chancePercent"], 5.0)
+        self.assertEqual(schedule["nextRollAt"], 16_000)
+        self.assertEqual(schedule["chancePercent"], 10.0)
 
         repo.saved_departments.clear()
-        changed = await engine._advance_department(repo, dept, [], [dept], 30_999)
+        changed = await engine._advance_department(repo, dept, [], [dept], 15_999)
 
         self.assertFalse(changed)
         self.assertEqual(repo.saved_departments, [])
 
-    async def test_idle_autonomy_rolls_every_30_seconds_with_hourly_chance_increase_and_reset(self) -> None:
+    async def test_idle_autonomy_rolls_every_15_seconds_with_hourly_chance_increase_and_reset(self) -> None:
         from app import engine
 
         class FakeRepo:
@@ -1380,13 +1380,13 @@ class RuntimeJobStabilityTest(unittest.IsolatedAsyncioTestCase):
             "autonomySchedule": {
                 "idleSinceAt": 0,
                 "lastRollAt": 3_600_000,
-                "chancePercent": 5.0,
+                "chancePercent": 10.0,
             },
         }
         repo = FakeRepo()
 
         with (
-            mock.patch.object(engine.random, "random", return_value=0.06),
+            mock.patch.object(engine.random, "random", return_value=0.15),
             mock.patch.object(
                 engine,
                 "_llm_autonomous_task",
@@ -1399,16 +1399,47 @@ class RuntimeJobStabilityTest(unittest.IsolatedAsyncioTestCase):
                 }),
             ),
         ):
-            changed = await engine._advance_department(repo, dept, [], [dept], 3_630_000)
+            changed = await engine._advance_department(repo, dept, [], [dept], 3_615_000)
 
         self.assertTrue(changed)
         self.assertEqual(len(repo.saved_tasks), 1)
         task = repo.saved_tasks[-1]
-        self.assertEqual(task["autonomyTrace"]["rollIntervalMs"], 30_000)
-        self.assertEqual(task["autonomyTrace"]["chancePercent"], 7.0)
+        self.assertEqual(task["autonomyTrace"]["rollIntervalMs"], 15_000)
+        self.assertEqual(task["autonomyTrace"]["chancePercent"], 16.0)
         self.assertEqual(task["autonomyTrace"]["idleHours"], 1)
-        self.assertNotIn("autonomySchedule", repo.saved_departments[-1])
-        self.assertTrue(any("ไม่จำเป็นต้องอนุมัติ" in message.get("text", "") for message in repo.messages))
+        reset_schedule = repo.saved_departments[-1]["autonomySchedule"]
+        self.assertEqual(reset_schedule["chancePercent"], 5.0)
+        self.assertTrue(reset_schedule["resetChancePending"])
+        self.assertTrue(any("ยกเว้นกรณีผู้บริหารเป็นคนเริ่มงานใหม่นั้นขึ้นมาเอง" in message.get("text", "") for message in repo.messages))
+
+    async def test_idle_autonomy_first_roll_after_work_reset_uses_five_percent(self) -> None:
+        from app import engine
+
+        dept = {
+            "id": "dept_auto",
+            "name": "Auto Dept",
+            "agentName": "Auto Agent",
+            "state": "idle",
+            "currentTaskId": None,
+            "autonomy": True,
+            "autonomySchedule": {
+                "trigger": "idle_department_autonomy",
+                "status": "reset_on_work",
+                "resetAt": 100,
+                "resetChancePending": True,
+                "chance": 0.05,
+                "chancePercent": 5.0,
+                "rollIntervalMs": 15_000,
+            },
+        }
+
+        due, chance, schedule, changed = engine._prepare_autonomy_idle_roll(dept, 200)
+
+        self.assertFalse(due)
+        self.assertTrue(changed)
+        self.assertEqual(chance, 0.05)
+        self.assertEqual(schedule["chancePercent"], 5.0)
+        self.assertEqual(schedule["nextRollAt"], 15_200)
 
     async def test_department_work_step_preserves_concurrent_task_edits(self) -> None:
         from app import engine

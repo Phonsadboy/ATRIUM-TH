@@ -6,6 +6,7 @@ from typing import Any
 
 from ..clock import now_ms
 from ..ids import uid
+from ..threads import EXEC_ID
 from .capabilities import deactivate_department_capabilities, sync_department_capabilities
 
 
@@ -32,7 +33,7 @@ def _restore_department_spec(spec: dict[str, Any], existing: dict[str, Any] | No
     dept.setdefault("state", "idle")
     dept.setdefault("mood", 0.75)
     dept.setdefault("currentTaskId", None)
-    dept.setdefault("autonomy", True)
+    dept.setdefault("autonomy", dept.get("id") == EXEC_ID)
     dept.setdefault("createdAt", now)
     dept.setdefault("room", {"x": 1, "y": 2, "w": 3, "h": 3})
     dept.setdefault(
