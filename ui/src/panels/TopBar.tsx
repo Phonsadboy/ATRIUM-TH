@@ -7,6 +7,7 @@ import { useUI } from '../state/ui'
 import { Dot, withAlpha } from '../components/primitives'
 import { Logo, Icon } from '../components/Icon'
 import { ModeSwitch } from './ModeSwitch'
+import { VersionStatusControl } from './VersionStatusControl'
 import { clockSeconds, money } from '../lib/format'
 import { ACCENT_HEX } from '../lib/visuals'
 import { EXEC_ID } from '../lib/threads'
@@ -75,6 +76,7 @@ export function TopBar() {
         <span className="text-[10px] tracking-widest text-[var(--color-cream-faint)]">
           {running ? 'กำลังเดินระบบ' : 'หยุดชั่วคราว'}
         </span>
+        <VersionStatusControl />
       </div>
 
       <div className="flex-1" />

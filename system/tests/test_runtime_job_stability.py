@@ -1308,6 +1308,108 @@ class RuntimeJobStabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task["status"], "in_progress")
         self.assertIn("resume จาก currentTaskId", task["log"][-1])
 
+    async def test_idle_autonomy_roll_waits_for_department_interval(self) -> None:
+        from app import engine
+
+        class FakeRepo:
+            def __init__(self) -> None:
+                self.saved_departments: list[dict] = []
+
+            async def save_department(self, dept):
+                self.saved_departments.append(dict(dept))
+
+        dept = {
+            "id": "dept_auto",
+            "name": "Auto Dept",
+            "agentName": "Auto Agent",
+            "state": "idle",
+            "currentTaskId": None,
+            "autonomy": True,
+        }
+        repo = FakeRepo()
+
+        with mock.patch.object(engine, "_llm_autonomous_task", new=mock.AsyncMock()) as llm_task:
+            changed = await engine._advance_department(repo, dept, [], [dept], 1_000)
+
+        self.assertFalse(changed)
+        llm_task.assert_not_awaited()
+        self.assertEqual(len(repo.saved_departments), 1)
+        schedule = repo.saved_departments[-1]["autonomySchedule"]
+        self.assertEqual(schedule["lastRollAt"], 1_000)
+        self.assertEqual(schedule["nextRollAt"], 31_000)
+        self.assertEqual(schedule["chancePercent"], 5.0)
+
+        repo.saved_departments.clear()
+        changed = await engine._advance_department(repo, dept, [], [dept], 30_999)
+
+        self.assertFalse(changed)
+        self.assertEqual(repo.saved_departments, [])
+
+    async def test_idle_autonomy_rolls_every_30_seconds_with_hourly_chance_increase_and_reset(self) -> None:
+        from app import engine
+
+        class FakeRepo:
+            def __init__(self) -> None:
+                self.saved_tasks: list[dict] = []
+                self.saved_departments: list[dict] = []
+                self.activities: list[dict] = []
+                self.messages: list[dict] = []
+
+            async def save_task(self, task):
+                self.saved_tasks.append(dict(task))
+
+            async def save_department(self, dept):
+                self.saved_departments.append(dict(dept))
+
+            async def add_activity(self, activity):
+                self.activities.append(dict(activity))
+
+            async def thread_messages(self, thread_id, limit=500):
+                return []
+
+            async def add_message(self, message):
+                self.messages.append(dict(message))
+
+        dept = {
+            "id": "dept_auto",
+            "name": "Auto Dept",
+            "agentName": "Auto Agent",
+            "state": "idle",
+            "currentTaskId": None,
+            "autonomy": True,
+            "autonomySchedule": {
+                "idleSinceAt": 0,
+                "lastRollAt": 3_600_000,
+                "chancePercent": 5.0,
+            },
+        }
+        repo = FakeRepo()
+
+        with (
+            mock.patch.object(engine.random, "random", return_value=0.06),
+            mock.patch.object(
+                engine,
+                "_llm_autonomous_task",
+                new=mock.AsyncMock(return_value={
+                    "title": "Proactive check",
+                    "detail": "Check a useful area",
+                    "priority": "normal",
+                    "whyNow": "ไม่มีงานค้างและถึงรอบตรวจคุณภาพรายชั่วโมง",
+                    "needsApproval": False,
+                }),
+            ),
+        ):
+            changed = await engine._advance_department(repo, dept, [], [dept], 3_630_000)
+
+        self.assertTrue(changed)
+        self.assertEqual(len(repo.saved_tasks), 1)
+        task = repo.saved_tasks[-1]
+        self.assertEqual(task["autonomyTrace"]["rollIntervalMs"], 30_000)
+        self.assertEqual(task["autonomyTrace"]["chancePercent"], 7.0)
+        self.assertEqual(task["autonomyTrace"]["idleHours"], 1)
+        self.assertNotIn("autonomySchedule", repo.saved_departments[-1])
+        self.assertTrue(any("ไม่จำเป็นต้องอนุมัติ" in message.get("text", "") for message in repo.messages))
+
     async def test_department_work_step_preserves_concurrent_task_edits(self) -> None:
         from app import engine
 

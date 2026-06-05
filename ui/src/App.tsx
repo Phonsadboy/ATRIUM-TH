@@ -4,7 +4,6 @@ import { LeftRail } from './panels/LeftRail'
 import { OfficeFloor } from './office/OfficeFloor'
 import { ActivityTicker } from './panels/ActivityTicker'
 import { RightDock } from './panels/RightDock'
-import { VersionBanner } from './panels/VersionBanner'
 import { ApprovalsDrawer } from './panels/ApprovalsDrawer'
 import { NotificationsDrawer } from './panels/NotificationsDrawer'
 import { DecisionsDrawer } from './panels/DecisionsDrawer'
@@ -67,7 +66,6 @@ export default function App() {
   return (
     <div className="flex h-full flex-col">
       <TopBar />
-      <VersionBanner />
 
       <main className="app-main grid min-h-0 flex-1" data-section={mobileSection} style={mainStyle}>
         <LeftRail />
