@@ -1350,10 +1350,18 @@ class Repo:
         generic_pending = {"", "กำลังคิดและทำงานต่อในคิวเบื้องหลัง..."}
         for row in rows:
             data = dict(row.data or {})
-            if not data.get("pending") and data.get("status") not in {"queued", "sending"}:
-                continue
             job = terminal_jobs.get(row.id)
             if not job:
+                continue
+            completed_at = int(job.updated_at or now_ms())
+            if not data.get("pending") and data.get("status") not in {"queued", "sending"}:
+                existing_completed_at = int(data.get("completedAt") or 0)
+                existing_ts = int(data.get("ts") or row.ts or 0)
+                if not existing_completed_at and completed_at > existing_ts:
+                    data.update({"ts": completed_at, "completedAt": completed_at})
+                    row.ts = completed_at
+                    row.data = ensure_rendering_metadata(data)
+                    repaired += 1
                 continue
             if job.status == "cancelled":
                 status = "cancelled"
@@ -1366,7 +1374,6 @@ class Repo:
                 detail = job.last_error or "background chat generation ended without finalizing the reply"
                 fallback = "งานตอบกลับก่อนหน้าล้มเหลวในคิวเบื้องหลัง"
             text = str(data.get("text") or "").strip()
-            completed_at = int(job.updated_at or now_ms())
             data.update({
                 "pending": False,
                 "status": status,

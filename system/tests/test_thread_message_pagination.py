@@ -136,6 +136,46 @@ class ThreadMessagePaginationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(newer[0]["completedAt"], 5000)
         self.assertFalse(newer[0]["pending"])
 
+    async def test_reconciled_finished_chat_reply_backfills_completion_time(self) -> None:
+        async with self.sessionmaker() as session:
+            reply = {
+                "id": "reply_done",
+                "threadId": "executive",
+                "role": "executive",
+                "authorName": "ออตโต้",
+                "text": "คำตอบเสร็จแล้ว",
+                "ts": 1000,
+                "pending": False,
+                "status": "sent",
+                "replyToMessageId": "user_1",
+            }
+            session.add(T.Message(id="reply_done", thread_id="executive", ts=1000, data=reply))
+            session.add(T.Job(
+                id="job_done",
+                kind="chat_reply",
+                status="done",
+                run_after=1000,
+                priority=1,
+                payload={"replyMessageId": "reply_done"},
+                attempts=0,
+                last_error=None,
+                created_at=1000,
+                updated_at=6000,
+            ))
+            await session.commit()
+
+        async with self.sessionmaker() as session:
+            repo = Repo(session)
+            repaired = await repo.reconcile_chat_reply_placeholders()
+            newer = await repo.thread_messages_after("executive", after_ts=3000, after_id="later", limit=30)
+
+        self.assertEqual(repaired, 1)
+        self.assertEqual([m["id"] for m in newer], ["reply_done"])
+        self.assertEqual(newer[0]["status"], "sent")
+        self.assertEqual(newer[0]["ts"], 6000)
+        self.assertEqual(newer[0]["completedAt"], 6000)
+        self.assertFalse(newer[0]["pending"])
+
     async def test_all_threads_limits_threads_preserves_preferred_and_batches_messages(self) -> None:
         await self._seed_thread_messages()
 
