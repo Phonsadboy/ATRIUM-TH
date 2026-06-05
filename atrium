@@ -1,5 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Ensure user-local tools (uv, etc.) are on PATH for non-login shells.
+# When this script is invoked from `wsl -d Ubuntu -- ...` or any other
+# non-interactive context, ~/.bashrc/.profile are not sourced, so the
+# default PATH does not include $HOME/.local/bin where `uv` lands. The
+# CLI's doctor step then reports `[BLOCKED] missing tools: uv` and aborts
+# even though uv is installed.
+export PATH="$HOME/.local/bin:$PATH"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec python3 "$ROOT/ops/atrium_cli.py" "$@"
