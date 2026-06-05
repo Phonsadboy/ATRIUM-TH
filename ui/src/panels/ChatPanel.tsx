@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { motion } from 'framer-motion'
 import { useSelector, client } from '../state/useCompany'
 import { useUI } from '../state/ui'
@@ -91,15 +91,99 @@ function isRuntimeDependencyMessage(m: ChatMessage): boolean {
   return m.error?.code === 'runtime_dependency' || (m.render?.notices ?? []).includes('runtime_dependency')
 }
 
-function workStatusTone(m: ChatMessage): string {
-  const event = String(m.flow?.refs?.event ?? '')
-  if (event.includes('blocked') || event.includes('rejected') || event.includes('revising') || event.includes('escalated')) {
-    return ACCENT_HEX.coral
+const WORK_STATUS_NEUTRAL = '#aba090'
+
+/** Per-event category: a short Thai tag + a distinct color so the status feed
+ *  can be scanned by meaning at a glance. Color is keyed to intent — problem =
+ *  coral, done = teal, needs-review = amber, periodic reminder = honey, progress
+ *  = sky, handoff = lavender, routine start/reply = neutral. */
+const WORK_STATUS_META: Record<string, { label: string; hex: string }> = {
+  task_assigned: { label: 'มอบหมาย', hex: WORK_STATUS_NEUTRAL },
+  task_started: { label: 'เริ่มงาน', hex: WORK_STATUS_NEUTRAL },
+  task_autonomous: { label: 'เริ่มเอง', hex: WORK_STATUS_NEUTRAL },
+  agent_reply_finished: { label: 'ตอบกลับ', hex: WORK_STATUS_NEUTRAL },
+  department_reply: { label: 'ตอบกลับ', hex: WORK_STATUS_NEUTRAL },
+  task_progress: { label: 'คืบหน้า', hex: ACCENT_HEX.sky },
+  task_review_reminder: { label: 'ถึงรอบตรวจ', hex: ACCENT_HEX.honey },
+  task_review: { label: 'รอตรวจ', hex: ACCENT_HEX.amber },
+  task_close_requested: { label: 'ขอปิดงาน', hex: ACCENT_HEX.amber },
+  task_close_approved: { label: 'อนุมัติปิด', hex: ACCENT_HEX.teal },
+  task_done: { label: 'เสร็จงาน', hex: ACCENT_HEX.teal },
+  handoff_delivered: { label: 'ส่งงานกลับ', hex: ACCENT_HEX.teal },
+  handoff_returned: { label: 'คืนงาน', hex: ACCENT_HEX.teal },
+  task_blocked: { label: 'ติดปัญหา', hex: ACCENT_HEX.coral },
+  task_revising: { label: 'ต้องแก้', hex: ACCENT_HEX.coral },
+  task_close_rejected: { label: 'ตีกลับ', hex: ACCENT_HEX.coral },
+  handoff_rejected: { label: 'ปฏิเสธ', hex: ACCENT_HEX.coral },
+  handoff_clarify: { label: 'ขอข้อมูล', hex: ACCENT_HEX.coral },
+  handoff_escalated: { label: 'ส่งผู้บริหาร', hex: ACCENT_HEX.coral },
+  executive_decision: { label: 'ผู้บริหารชี้ขาด', hex: ACCENT_HEX.coral },
+  handoff: { label: 'ส่งต่อ', hex: ACCENT_HEX.lavender },
+  handoff_requested: { label: 'ส่งต่อ', hex: ACCENT_HEX.lavender },
+  handoff_accepted: { label: 'รับงาน', hex: ACCENT_HEX.lavender },
+  handoff_reply: { label: 'ตอบส่งต่อ', hex: ACCENT_HEX.lavender },
+}
+
+/** The event that drives a work-status line's category. Backend carries it as
+ *  the step `kind` (e.g. "task_progress"); some flows also tag `refs.event`. */
+function workStatusEvent(m: ChatMessage): string {
+  const fromRefs = m.flow?.refs?.event
+  if (typeof fromRefs === 'string' && fromRefs) return fromRefs
+  const steps = m.flow?.steps ?? []
+  for (const s of steps) if (s.kind && WORK_STATUS_META[s.kind]) return s.kind
+  return steps[0]?.kind ?? ''
+}
+
+function workStatusMeta(m: ChatMessage): { label: string; hex: string } {
+  const event = workStatusEvent(m)
+  const exact = WORK_STATUS_META[event]
+  if (exact) return exact
+  // Fallback by substring so any unlisted/new event still lands in a sane bucket.
+  if (/blocked|rejected|revising|escalated|clarify/.test(event)) return { label: 'ติดปัญหา', hex: ACCENT_HEX.coral }
+  if (/approved|delivered|done|returned/.test(event)) return { label: 'เสร็จงาน', hex: ACCENT_HEX.teal }
+  if (event.includes('review')) return { label: 'รอตรวจ', hex: ACCENT_HEX.amber }
+  if (event.includes('progress')) return { label: 'คืบหน้า', hex: ACCENT_HEX.sky }
+  if (m.flow?.kind === 'handoff' || event.startsWith('handoff')) return { label: 'ส่งต่อ', hex: ACCENT_HEX.lavender }
+  if (/started|assigned|autonomous/.test(event)) return { label: 'เริ่มงาน', hex: WORK_STATUS_NEUTRAL }
+  return { label: 'อัปเดต', hex: WORK_STATUS_NEUTRAL }
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/** Memoized dept-name matcher: the alternation regex is rebuilt only when the
+ *  department list changes, not for every status line on every render. */
+let deptMatcherCache: { key: string; re: RegExp | null; set: Set<string> } = {
+  key: '\0uninit',
+  re: null,
+  set: new Set(),
+}
+function deptMatcher(deptNames: string[]): { re: RegExp | null; set: Set<string> } {
+  const names = deptNames.filter((n) => n && n.length >= 2).sort((a, b) => b.length - a.length)
+  const key = names.join('\0')
+  if (key !== deptMatcherCache.key) {
+    deptMatcherCache = {
+      key,
+      re: names.length ? new RegExp(`(${names.map(escapeRegExp).join('|')})`, 'g') : null,
+      set: new Set(names),
+    }
   }
-  if (event.includes('approved') || event.includes('started') || event.includes('delivered') || event.includes('review')) {
-    return ACCENT_HEX.teal
-  }
-  return m.flow?.kind === 'handoff' ? ACCENT_HEX.lavender : ACCENT_HEX.sky
+  return deptMatcherCache
+}
+
+/** Bold every department name found in a status line so you can see which team
+ *  it concerns at a glance. Returns the text unchanged when nothing matches. */
+function highlightDepartments(text: string, deptNames: string[]): ReactNode {
+  const { re, set } = deptMatcher(deptNames)
+  if (!re) return text
+  const parts = text.split(re)
+  if (parts.length <= 1) return text
+  return parts.map((part, i) =>
+    set.has(part)
+      ? <span key={i} className="font-semibold text-[var(--color-cream)]">{part}</span>
+      : <span key={i}>{part}</span>,
+  )
 }
 
 function groupToolActivityMessages(messages: ChatMessage[]): ChatListItem[] {
@@ -679,33 +763,42 @@ function MessageRow({
 
   if (m.role === 'system') {
     if (isWorkStatusLine(m)) {
-      const tone = workStatusTone(m)
+      const { label: catLabel, hex } = workStatusMeta(m)
       const steps = m.flow?.steps ?? []
-      const kindLabel = m.flow?.kind === 'handoff' ? 'ส่งต่องาน' : 'สถานะงาน'
-      // Collapsed to a single muted line so the conversation (user + AI) stays
-      // in focus; the chevron reveals the full text + step trail on demand.
+      const deptNames = [...deptNameById.values()]
+      // A compact, category-colored one-liner so the status feed is scannable by
+      // meaning yet recedes behind the conversation; the chevron reveals the full
+      // text + step trail. The faint tint + accent rail aid readability.
       return (
-        <div id={`msg-${m.id}`} className="my-0.5 flex flex-col items-center">
-          <details className="group min-w-0 max-w-[94%]">
+        <div id={`msg-${m.id}`} className="my-0.5">
+          <details className="group min-w-0">
             <summary
-              className="flex min-w-0 cursor-pointer list-none items-center gap-1.5 rounded-full px-2 py-0.5 text-[11px] text-[var(--color-cream-faint)] transition-colors hover:bg-[var(--color-surface)]"
+              className="flex min-w-0 cursor-pointer list-none items-center gap-2 rounded-md py-1 pl-2 pr-2.5 text-[11px] transition-colors hover:brightness-110"
+              style={{ background: withAlpha(hex, 0.07), borderLeft: `2px solid ${withAlpha(hex, 0.5)}` }}
             >
-              <span className="h-1.5 w-1.5 shrink-0 rounded-full" style={{ background: tone }} />
-              <span className="shrink-0 font-medium" style={{ color: withAlpha(tone, 0.92) }}>{kindLabel}</span>
-              <span className="min-w-0 flex-1 truncate group-open:hidden">{m.text}</span>
-              <span className="shrink-0 opacity-60">{timeLabel(m.ts)}</span>
-              <span className="shrink-0 opacity-60 transition-transform group-open:rotate-90">▸</span>
+              <span
+                className="shrink-0 rounded px-1.5 py-0.5 text-[10px] font-semibold"
+                style={{ background: withAlpha(hex, 0.16), color: hex }}
+              >
+                {catLabel}
+              </span>
+              <span className="min-w-0 flex-1 truncate text-[var(--color-cream-dim)] group-open:hidden">
+                {highlightDepartments(m.text, deptNames)}
+              </span>
+              <span className="shrink-0 text-[var(--color-cream-faint)]">{timeLabel(m.ts)}</span>
+              <span className="shrink-0 text-[var(--color-cream-faint)] transition-transform group-open:rotate-90">▸</span>
             </summary>
-            <div className="mt-1 space-y-1.5 px-2 pb-1">
+            <div
+              className="mt-0.5 space-y-1.5 rounded-md py-2 pl-3 pr-2.5"
+              style={{ background: withAlpha(hex, 0.05), borderLeft: `2px solid ${withAlpha(hex, 0.3)}` }}
+            >
               <p className="min-w-0 whitespace-pre-wrap break-words text-[12px] leading-relaxed text-[var(--color-cream-dim)]">
-                {m.text}
+                {highlightDepartments(m.text, deptNames)}
               </p>
-              <StepTrail steps={steps} color={tone} />
+              <StepTrail steps={steps} color={hex} />
             </div>
           </details>
-          <div className="w-full max-w-[94%]">
-            <NoticeCards m={m} onResolveApproval={(id, d) => client.resolveApproval(id, d)} onOpenCitation={onOpenCitation} />
-          </div>
+          <NoticeCards m={m} onResolveApproval={(id, d) => client.resolveApproval(id, d)} onOpenCitation={onOpenCitation} />
         </div>
       )
     }

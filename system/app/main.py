@@ -126,7 +126,7 @@ from .clock import day_key, now_ms
 from .config import get_settings
 from .context_budget import estimate_llm_context_tokens, model_auto_compact_context_tokens
 from .db.base import commit_and_release, dispose_db, init_db, session_scope
-from .db.repo import Repo, TOOL_CATALOG, full_autonomy_status
+from .db.repo import Repo, TOOL_CATALOG, full_autonomy_status, office_layout_context
 from .events import hub
 from .file_intake import (
     FilePreview,
@@ -159,6 +159,7 @@ from .handoffs import (
 )
 from .host_bridge_proof import host_bridge_parity_proof_id, host_bridge_source_provenance
 from .engine import (
+    PAUSED_BY_USER_REASON,
     approve_task_close_request,
     engine_runtime_snapshot,
     reject_task_close_request,
@@ -168,6 +169,7 @@ from .engine import (
     run_engine_tick,
     run_image_generation_loop,
     run_trigger_scheduler_loop,
+    _is_user_paused,
 )
 from .ids import uid
 from .memory.debt import compute_department_knowledge_debt
@@ -286,6 +288,7 @@ from .schema import (
     NotificationReadInput,
     OrgPlan,
     OrgPlanDepartment,
+    OfficeLayout,
     OwnerProfile,
     PeekDepartmentResponse,
     PermissionPolicy,
@@ -308,6 +311,8 @@ from .schema import (
     SlashCommandResult,
     SlashCommandSpec,
     SuggestedFollowUp,
+    TaskControlInput,
+    TaskControlResponse,
     ThinkingEffort,
     ThreadCostSummary,
     ToggleInput,
@@ -321,6 +326,7 @@ from .schema import (
     UpdateMeetingInput,
     UpdateNotificationPreferencesInput,
     UpdateObjectiveInput,
+    UpdateOfficeLayoutInput,
     UpdateOrgPlanInput,
     UpdatePlaybookInput,
     UpdatePreferenceInput,
@@ -6955,6 +6961,18 @@ async def _snapshot() -> dict[str, Any]:
         return await Repo(s).snapshot()
 
 
+async def _append_executive_office_layout_context(
+    repo: Repo,
+    dept: dict[str, Any],
+    departments: list[dict[str, Any]],
+    memory_context: str,
+) -> str:
+    if not is_exec(str(dept.get("id") or "")):
+        return memory_context
+    layout_context = office_layout_context(await repo.get_office_layout(), departments)
+    return (memory_context + "\n\n" if memory_context else "") + layout_context
+
+
 async def _refresh_memory_stats(repo: Repo, dept_id: str) -> None:
     await repo.refresh_department_memory_stats(dept_id)
 
@@ -9359,6 +9377,21 @@ async def get_state() -> JSONResponse:
     return JSONResponse(content=await _snapshot())
 
 
+@app.get("/api/office-layout", response_model=OfficeLayout)
+async def get_office_layout() -> dict[str, Any]:
+    async with session_scope() as s:
+        return await Repo(s).get_office_layout()
+
+
+@app.patch("/api/office-layout", response_model=OfficeLayout)
+async def update_office_layout(input: UpdateOfficeLayoutInput) -> dict[str, Any]:
+    patch = input.model_dump(by_alias=True, exclude_unset=True)
+    async with session_scope() as s:
+        layout = await Repo(s).update_office_layout(patch)
+    hub.mark_dirty()
+    return layout
+
+
 @app.get("/api/departments", response_model=list[Department])
 async def list_departments(
     q: str | None = Query(default=None),
@@ -10590,6 +10623,252 @@ async def reassign_task(task_id: str, input: ReassignTaskInput) -> dict[str, Any
     return task
 
 
+def _clear_blocked_guard_fields(task: dict[str, Any]) -> None:
+    """Drop auto-block bookkeeping so a paused/cancelled task isn't treated as a real block."""
+    for key in ("blockedRetryGuard", "blockedRetryCount", "blockedLastReason"):
+        task.pop(key, None)
+
+
+def _release_task_department(dept: dict[str, Any] | None, task: dict[str, Any]) -> bool:
+    """Stop the owning department from working this task and let it go idle. True if dept changed."""
+    if dept and dept.get("currentTaskId") == task.get("id"):
+        dept["currentTaskId"] = None
+        if dept.get("state") != "offline":
+            dept["state"] = "idle"
+        return True
+    return False
+
+
+async def _cancel_task_jobs_for_user_control(repo: Repo, task: dict[str, Any], action: str, reason: str) -> int:
+    cancel_jobs = getattr(repo, "cancel_task_jobs", None)
+    if not callable(cancel_jobs):
+        return 0
+    label = reason or f"user task control: {action}"
+    return int(await cancel_jobs(str(task.get("id") or ""), label) or 0)
+
+
+async def _reject_pending_task_close_approvals_for_user_control(
+    repo: Repo,
+    task: dict[str, Any],
+    now: int,
+    reason: str,
+) -> int:
+    list_approvals = getattr(repo, "list_approvals", None)
+    save_approval = getattr(repo, "save_approval", None)
+    if not callable(list_approvals) or not callable(save_approval):
+        return 0
+    task_id = str(task.get("id") or "")
+    pending_id = str(task.get("pendingCloseApprovalId") or "")
+    resolved = 0
+    for approval in await list_approvals(status="pending"):
+        action = approval.get("action") if isinstance(approval.get("action"), dict) else {}
+        if action.get("action") != "close_task":
+            continue
+        if str(action.get("taskId") or "") != task_id and str(approval.get("id") or "") != pending_id:
+            continue
+        approval["status"] = "rejected"
+        approval["resolvedAt"] = now
+        approval["resolvedBy"] = "user"
+        approval["rejectionReason"] = reason or "user_task_control"
+        action["executedAt"] = now
+        action["rejectedBy"] = "user"
+        action["rejectedReason"] = reason or "user_task_control"
+        approval["action"] = action
+        await save_approval(approval)
+        await _upsert_approval_chat_message(repo, approval)
+        resolved += 1
+    return resolved
+
+
+async def apply_user_task_control(
+    repo: Repo,
+    task: dict[str, Any],
+    dept: dict[str, Any] | None,
+    input: TaskControlInput,
+    now: int,
+) -> dict[str, Any]:
+    """Apply a user-initiated control action to a task.
+
+    The actor is always the human user — never the AI executive. Saves the task (and the
+    owning department, when affected) inside the caller's session transaction and returns a
+    TaskControlResponse-shaped dict.
+    """
+    action = input.action
+    reason = (input.reason or "").strip()
+    status = str(task.get("status") or "")
+    title = task.get("title") or task.get("id")
+    dept_id = (dept or {}).get("id") or task.get("departmentId")
+
+    def _log(line: str) -> None:
+        task.setdefault("log", []).append(line)
+
+    async def _activity_line(text: str) -> None:
+        await repo.add_activity(_activity(text, type_="state_change", department_id=dept_id, severity="info", ts=now))
+
+    def _response(*, executed: bool, approval: Any = None, artifact: Any = None) -> dict[str, Any]:
+        return {"ok": True, "task": task, "executed": executed, "approval": approval, "artifact": artifact}
+
+    # resume: only meaningful for a task the user paused.
+    if action == "resume":
+        if not _is_user_paused(task):
+            raise HTTPException(status_code=409, detail="only a paused task can be resumed")
+        task["status"] = "assigned"
+        task["statusReason"] = None
+        task["waitingOn"] = None
+        _clear_blocked_guard_fields(task)
+        task["updatedAt"] = now
+        _log(f"ผู้ใช้สั่งทำงานต่อ: {reason}" if reason else "ผู้ใช้สั่งทำงานต่อ")
+        interval = normalize_review_interval_ms(task.get("reviewIntervalMs"))
+        if interval:
+            apply_task_review_schedule(task, interval, now)
+        await repo.save_task(task)
+        if interval:
+            await enqueue_task_review_reminder(repo, task, now=now)
+        await _activity_line(f"ผู้ใช้สั่งให้ทำงาน “{title}” ต่อ")
+        return _response(executed=True)
+
+    # Everything below rejects terminal tasks (with idempotent no-ops per the state table).
+    if status in {"done", "cancelled"}:
+        if (action == "cancel" and status == "cancelled") or (action == "close" and status == "done"):
+            return _response(executed=False)
+        raise HTTPException(status_code=409, detail=f"task is {status}; cannot {action}")
+
+    if action == "pause":
+        if _is_user_paused(task):
+            return _response(executed=False)
+        cancelled_jobs = await _cancel_task_jobs_for_user_control(repo, task, action, reason)
+        rejected_approvals = await _reject_pending_task_close_approvals_for_user_control(repo, task, now, reason)
+        task["status"] = "blocked"
+        task["statusReason"] = PAUSED_BY_USER_REASON
+        task["waitingOn"] = None
+        task.pop("pendingCloseApprovalId", None)
+        _clear_blocked_guard_fields(task)
+        # Stop review reminders but keep the interval so resume can restore them.
+        task["nextReviewAt"] = None
+        task["reviewScheduleToken"] = None
+        task["updatedAt"] = now
+        _log(f"ผู้ใช้หยุดงานชั่วคราว: {reason}" if reason else "ผู้ใช้หยุดงานชั่วคราว")
+        if cancelled_jobs:
+            _log(f"ยกเลิกคิวที่ผูกกับงาน {cancelled_jobs} รายการ")
+        if rejected_approvals:
+            _log(f"ปิดคำขอปิดงานที่ค้างอยู่ {rejected_approvals} รายการ")
+        dept_changed = _release_task_department(dept, task)
+        await repo.save_task(task)
+        if dept_changed:
+            await repo.save_department(dept)
+        await _activity_line(f"ผู้ใช้หยุดงาน “{title}” ไว้ชั่วคราว")
+        return _response(executed=True)
+
+    if action == "cancel":
+        cancelled_jobs = await _cancel_task_jobs_for_user_control(repo, task, action, reason)
+        rejected_approvals = await _reject_pending_task_close_approvals_for_user_control(repo, task, now, reason)
+        task["status"] = "cancelled"
+        task["statusReason"] = None
+        task["waitingOn"] = None
+        task.pop("pendingCloseApprovalId", None)
+        _clear_blocked_guard_fields(task)
+        apply_task_review_schedule(task, None, now)
+        task["updatedAt"] = now
+        _log(f"ผู้ใช้ยกเลิกงาน: {reason}" if reason else "ผู้ใช้ยกเลิกงาน")
+        if cancelled_jobs:
+            _log(f"ยกเลิกคิวที่ผูกกับงาน {cancelled_jobs} รายการ")
+        if rejected_approvals:
+            _log(f"ปิดคำขอปิดงานที่ค้างอยู่ {rejected_approvals} รายการ")
+        dept_changed = _release_task_department(dept, task)
+        await repo.save_task(task)
+        if dept_changed:
+            await repo.save_department(dept)
+        await _activity_line(f"ผู้ใช้ยกเลิกงาน “{title}”")
+        return _response(executed=True)
+
+    if action == "close":
+        cancelled_jobs = await _cancel_task_jobs_for_user_control(repo, task, action, reason)
+        rejected_approvals = await _reject_pending_task_close_approvals_for_user_control(repo, task, now, reason)
+        task["status"] = "done"
+        task["progress"] = 1
+        task["statusReason"] = None
+        task["waitingOn"] = None
+        task.pop("pendingCloseApprovalId", None)
+        _clear_blocked_guard_fields(task)
+        task["result"] = {
+            **(task.get("result") or {}),
+            "reviewStatus": "closed_by_user",
+            "completedAt": now,
+            "closedBy": "user",
+        }
+        apply_task_review_schedule(task, None, now)
+        task["updatedAt"] = now
+        _log(f"ผู้ใช้ปิดงานทันที: {reason}" if reason else "ผู้ใช้ปิดงานทันที")
+        if cancelled_jobs:
+            _log(f"ยกเลิกคิวที่ผูกกับงาน {cancelled_jobs} รายการ")
+        if rejected_approvals:
+            _log(f"ปิดคำขอปิดงานที่ค้างอยู่ {rejected_approvals} รายการ")
+        dept_changed = _release_task_department(dept, task)
+        await repo.save_task(task)
+        if dept_changed:
+            await repo.save_department(dept)
+        await _activity_line(f"ผู้ใช้ปิดงาน “{title}”")
+        return _response(executed=True)
+
+    if action == "submit_partial":
+        if not dept:
+            raise HTTPException(status_code=400, detail="task has no department to submit to")
+        content = (
+            task.get("draftDeliverableMarkdown")
+            or (task.get("result") or {}).get("summary")
+            or "\n".join(str(line) for line in task.get("log", [])[-8:])
+        )
+        if not str(content or "").strip():
+            raise HTTPException(status_code=400, detail="ยังไม่มีผลลัพธ์พอให้ส่ง")
+        approval = await request_task_close_approval(
+            repo,
+            dept,
+            task,
+            now,
+            content=str(content),
+            decision={
+                "rationale": reason or "ผู้ใช้ส่งผลลัพธ์เท่าที่มีให้ผู้บริหาร AI ตรวจ",
+                "impact": f"requestedBy=user; source=user_submit_partial; task={task['id']}",
+            },
+            source="user_submit_partial",
+        )
+        # request_task_close_approval already saved task + department, pulsed, and logged its own activity.
+        action_meta = (approval or {}).get("action") if isinstance(approval, dict) else None
+        if isinstance(action_meta, dict):
+            action_meta["requestedBy"] = "user"
+            action_meta["source"] = "user_submit_partial"
+            approval["action"] = action_meta
+            save_approval = getattr(repo, "save_approval", None)
+            if callable(save_approval):
+                await save_approval(approval)
+        artifact_id = (action_meta or {}).get("artifactId")
+        artifact = await repo.get_entity("artifact", artifact_id) if artifact_id else None
+        cancelled_jobs = await _cancel_task_jobs_for_user_control(repo, task, action, reason)
+        if cancelled_jobs:
+            _log(f"ยกเลิกคิวที่ผูกกับงาน {cancelled_jobs} รายการ")
+            task["updatedAt"] = now
+            await repo.save_task(task)
+        await _activity_line(f"ผู้ใช้ส่งผลลัพธ์เท่าที่มีของงาน “{title}” ให้ผู้บริหาร AI ตรวจ")
+        return _response(executed=True, approval=approval, artifact=artifact)
+
+    raise HTTPException(status_code=400, detail=f"unknown task control action: {action}")
+
+
+@app.post("/api/tasks/{task_id}/control", response_model=TaskControlResponse)
+async def control_task(task_id: str, input: TaskControlInput) -> dict[str, Any]:
+    now = now_ms()
+    async with session_scope() as s:
+        repo = Repo(s)
+        task = await repo.get_task(task_id)
+        if not task:
+            raise HTTPException(status_code=404, detail="task not found")
+        dept = await repo.get_department(task.get("departmentId")) if task.get("departmentId") else None
+        result = await apply_user_task_control(repo, task, dept, input, now)
+    hub.pulse({"kind": "state", "departmentId": task.get("departmentId"), "taskId": task["id"]})
+    hub.mark_dirty()
+    return result
+
+
 @app.post("/api/messages/{thread_id}/stop", response_model=StopGenerationResponse)
 async def stop_generation(
     thread_id: str,
@@ -11032,6 +11311,7 @@ async def send_message(thread_id: str, input: SendMessageInput, request: Request
         attached_context = await attachment_context(repo, attachments)
         if attached_context:
             memory_context = (memory_context + "\n\n" if memory_context else "") + "Attached user context:\n" + attached_context
+        memory_context = await _append_executive_office_layout_context(repo, dept, departments, memory_context)
         context_tokens, context_token_source = await _context_tokens_for_turn(
             dept,
             history,

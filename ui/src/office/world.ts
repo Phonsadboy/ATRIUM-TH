@@ -250,6 +250,7 @@ function bucket(
 
 export interface BuildOpts {
   departmentRooms: Record<string, number>
+  roomNames: Record<string, string>
   roomOverrides: Record<string, { x: number; y: number }>
   roomBackgrounds: Record<string, OfficeBackgroundId>
   /** user-dragged room origins, keyed by room index */
@@ -259,7 +260,7 @@ export interface BuildOpts {
 }
 
 export function buildWorld(departments: Department[], tasks: Task[], opts: BuildOpts): WorldModel {
-  const { departmentRooms, roomOverrides, roomBackgrounds, roomPositions, minRooms } = opts
+  const { departmentRooms, roomNames, roomOverrides, roomBackgrounds, roomPositions, minRooms } = opts
   const { rooms: buckets, roomByDept } = bucket(departments, departmentRooms)
   // pad with empty rooms so a freshly-added room is visible before anyone moves in
   while (buckets.length < Math.max(1, minRooms)) buckets.push([])
@@ -319,7 +320,7 @@ export function buildWorld(departments: Department[], tasks: Task[], opts: Build
 
     return {
       index,
-      title: hasExec ? 'ห้องผู้บริหาร' : `ห้อง ${index + 1}`,
+      title: String(roomNames[String(index)] || '').trim() || (hasExec ? 'ห้องผู้บริหาร' : `ห้อง ${index + 1}`),
       accent,
       backgroundId,
       isExec: hasExec,

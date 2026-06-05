@@ -189,6 +189,13 @@ class RoomRect(Schema):
     h: float
 
 
+class OfficeLayout(Schema):
+    room_count: int = 1
+    room_names: dict[str, str] = Field(default_factory=dict)
+    department_rooms: dict[str, int] = Field(default_factory=dict)
+    updated_at: int = 0
+
+
 class MemoryStats(Schema):
     archive_chunks: int = 0
     rag_entries: int = 0
@@ -351,6 +358,8 @@ class Task(Schema):
     waiting_on: Optional[dict[str, Any]] = None  # {dept, handoffId}
     blocked_retry_count: Optional[int] = None
     blocked_retry_guard: Optional[dict[str, Any]] = None
+    blocked_last_reason: Optional[str] = None
+    status_reason: Optional[str] = None  # e.g. "paused_by_user" when the user pauses via the task control modal
     last_unblock_attempt_at: Optional[int] = None
     handoff_chain_id: Optional[str] = None
     context_paging: Optional[dict[str, Any]] = None
@@ -884,6 +893,7 @@ class CompanyState(Schema):
     approvals: list[Approval]
     objectives: list[ScheduledObjective]
     executive_queue: list[ExecutiveQueueItem] = Field(default_factory=list)
+    office_layout: OfficeLayout = Field(default_factory=OfficeLayout)
     budget: Budget
     permission_policy: PermissionPolicy
 
@@ -967,6 +977,31 @@ class RequestTaskClosureInput(Schema):
     requested_by: str = "department"
     summary: Optional[str] = None
     detail: Optional[str] = None
+
+
+class UpdateOfficeLayoutInput(Schema):
+    room_count: Optional[int] = None
+    room_names: Optional[dict[str, str]] = None
+    department_rooms: Optional[dict[str, int]] = None
+
+
+TaskControlAction = Literal["cancel", "pause", "resume", "submit_partial", "close"]
+
+
+class TaskControlInput(Schema):
+    action: TaskControlAction
+    reason: Optional[str] = None
+    # The modal is always driven by the human user; it must never claim the AI executive pressed the button.
+    requested_by: Literal["user"] = "user"
+
+
+class TaskControlResponse(Schema):
+    ok: bool
+    task: Task
+    executed: bool
+    # Wire dicts, mirroring how /request-close returns an approval and how artifacts are stored.
+    approval: Optional[dict[str, Any]] = None
+    artifact: Optional[dict[str, Any]] = None
 
 
 class SendMessageInput(Schema):

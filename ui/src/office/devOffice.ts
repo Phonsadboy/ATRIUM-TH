@@ -113,6 +113,7 @@ function buildSeed(): CompanyState {
     approvals: [],
     objectives: [],
     executiveQueue: [],
+    officeLayout: { roomCount: 1, roomNames: {}, departmentRooms: {}, updatedAt: 0 },
     budget: { dailyCapUsd: 500, spentTodayUsd: 12.4 },
   }
 }

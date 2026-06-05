@@ -30,6 +30,8 @@ import type {
   VideoJobRecord,
   CompanyState,
   Connector,
+  ControlTaskInput,
+  TaskControlResponse,
   CostCategory,
   CostReport,
   CostReportScope,
@@ -131,10 +133,12 @@ import type {
   InputEstimate,
   InputEstimateInput,
   MessageMentionTarget,
+  OfficeLayout,
   PromptStarter,
   ThreadSearchResponse,
   ThreadStatsResponse,
   ThreadCostSummary,
+  UpdateOfficeLayoutInput,
   VersionUpdateInput,
   VersionUpdateResponse,
   VersionStatusResponse,
@@ -152,6 +156,12 @@ import { isExec, deptIdFromThread } from '../lib/threads'
 const ACCENTS: Department['accent'][] = ['amber', 'teal', 'coral', 'lavender', 'sky', 'honey']
 const DAY_MS = 86_400_000
 const COST_CATEGORIES: CostCategory[] = ['work', 'chat', 'meeting', 'autonomous', 'memory', 'tool']
+const DEFAULT_OFFICE_LAYOUT: OfficeLayout = {
+  roomCount: 1,
+  roomNames: {},
+  departmentRooms: {},
+  updatedAt: 0,
+}
 
 const EMPTY_STATE: CompanyState = {
   companyName: 'ATRIUM',
@@ -164,6 +174,7 @@ const EMPTY_STATE: CompanyState = {
   approvals: [],
   objectives: [],
   executiveQueue: [],
+  officeLayout: DEFAULT_OFFICE_LAYOUT,
   budget: { dailyCapUsd: 500, spentTodayUsd: 0 },
 }
 
@@ -176,8 +187,49 @@ type ThreadMessagesOptions = {
   afterId?: string
 }
 
+/** After a background getter's fetch fails (e.g. backend briefly down), wait this
+ *  long before another attempt — long enough to avoid retry/log spam, short
+ *  enough that the panel self-heals once the backend is back. */
+const BACKGROUND_RETRY_COOLDOWN_MS = 10_000
+
 function emptyMemory(departmentId: string): DepartmentMemory {
   return { departmentId, archive: [], knowledge: [], graph: { nodes: [], edges: [] } }
+}
+
+function sanitizeRoomIndex(value: unknown): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return 0
+  return Math.max(0, Math.floor(value))
+}
+
+function sanitizeOfficeLayout(layout: Partial<OfficeLayout> | null | undefined): OfficeLayout {
+  const roomNames: Record<string, string> = {}
+  for (const [key, value] of Object.entries(layout?.roomNames ?? {})) {
+    const name = String(value ?? '').trim()
+    if (name) roomNames[String(sanitizeRoomIndex(Number(key)))] = name.slice(0, 64)
+  }
+  const departmentRooms: Record<string, number> = {}
+  for (const [deptId, roomIndex] of Object.entries(layout?.departmentRooms ?? {})) {
+    const id = String(deptId ?? '').trim()
+    if (id) departmentRooms[id] = sanitizeRoomIndex(roomIndex)
+  }
+  const maxNamed = Object.keys(roomNames).reduce((max, key) => Math.max(max, sanitizeRoomIndex(Number(key)) + 1), 0)
+  const maxAssigned = Object.values(departmentRooms).reduce((max, roomIndex) => Math.max(max, roomIndex + 1), 0)
+  return {
+    roomCount: Math.max(1, sanitizeRoomIndex(layout?.roomCount), maxNamed, maxAssigned),
+    roomNames,
+    departmentRooms,
+    updatedAt: sanitizeRoomIndex(layout?.updatedAt),
+  }
+}
+
+function mergeOfficeLayout(current: OfficeLayout, patch: UpdateOfficeLayoutInput): OfficeLayout {
+  return sanitizeOfficeLayout({
+    ...current,
+    roomCount: patch.roomCount ?? current.roomCount,
+    roomNames: patch.roomNames ?? current.roomNames,
+    departmentRooms: patch.departmentRooms ?? current.departmentRooms,
+    updatedAt: Date.now(),
+  })
 }
 
 function emptyReport(scope: CostReportScope): CostReport {
@@ -230,6 +282,13 @@ export class ApiClient implements CompanyClient {
   private pulseListeners = new Set<(event: PulseEvent) => void>()
   private memory = new Map<string, DepartmentMemory>()
   private reports = new Map<string, CostReport>()
+  /** Background-getter coordination (cost reports + department memory): keys with
+   *  a fetch in flight, and the earliest time each key may retry after a failure.
+   *  Replaces the old "cache an empty placeholder forever" guard that never retried. */
+  private reportsInFlight = new Set<string>()
+  private reportsRetryAt = new Map<string, number>()
+  private memoryInFlight = new Set<string>()
+  private memoryRetryAt = new Map<string, number>()
   private notifications: Notification[] = []
   private decisions: Decision[] = []
   private decisionsLoaded = false
@@ -587,6 +646,35 @@ export class ApiClient implements CompanyClient {
   reassignTask = (taskId: string, input: ReassignTaskInput): Promise<Task> =>
     this.afterMutation(this.request(`/api/tasks/${encodeURIComponent(taskId)}/reassign`, 'POST', input))
 
+  controlTask = async (taskId: string, input: ControlTaskInput): Promise<TaskControlResponse> => {
+    const res = await this.request<TaskControlResponse>(
+      `/api/tasks/${encodeURIComponent(taskId)}/control`,
+      'POST',
+      input,
+    )
+    await this.refresh()
+    return res
+  }
+
+  updateOfficeLayout = async (input: UpdateOfficeLayoutInput): Promise<OfficeLayout> => {
+    const previous = this.state.officeLayout ?? DEFAULT_OFFICE_LAYOUT
+    this.setState({
+      ...this.state,
+      now: Date.now(),
+      officeLayout: mergeOfficeLayout(previous, input),
+    })
+    try {
+      const layout = await this.request<OfficeLayout>('/api/office-layout', 'PATCH', input)
+      const clean = sanitizeOfficeLayout(layout)
+      this.setState({ ...this.state, now: Date.now(), officeLayout: clean })
+      void this.refresh().catch(() => undefined)
+      return clean
+    } catch (err) {
+      this.setState({ ...this.state, now: Date.now(), officeLayout: previous })
+      throw err
+    }
+  }
+
   setRunning = (running: boolean): void => {
     this.setState({ ...this.state, running, now: Date.now() })
     this.command(() => this.request('/api/running', 'POST', { running }))
@@ -696,34 +784,28 @@ export class ApiClient implements CompanyClient {
 
   getCostReport = (scope: CostReportScope, deptId?: string): CostReport => {
     const key = `${scope}:${deptId ?? ''}`
-    const cached = this.reports.get(key)
-    if (!cached) {
-      this.reports.set(key, emptyReport(scope))
-      const suffix = new URLSearchParams({ scope })
-      if (deptId) suffix.set('deptId', deptId)
-      this.command(
-        () => this.request<CostReport>(`/api/cost-report?${suffix.toString()}`, 'GET'),
-        (report) => {
-          this.reports.set(key, report)
-          this.setState({ ...this.state, now: Date.now() })
-        },
-      )
-    }
+    const suffix = new URLSearchParams({ scope })
+    if (deptId) suffix.set('deptId', deptId)
+    this.loadCached(
+      key,
+      this.reports,
+      this.reportsInFlight,
+      this.reportsRetryAt,
+      () => this.request<CostReport>(`/api/cost-report?${suffix.toString()}`, 'GET'),
+      () => this.setState({ ...this.state, now: Date.now() }),
+    )
     return this.reports.get(key) ?? emptyReport(scope)
   }
 
   getMemory = (departmentId: string): DepartmentMemory => {
-    const cached = this.memory.get(departmentId)
-    if (!cached) {
-      this.memory.set(departmentId, emptyMemory(departmentId))
-      this.command(
-        () => this.request<DepartmentMemory>(`/api/departments/${departmentId}/memory`, 'GET'),
-        (memory) => {
-          this.memory.set(departmentId, memory)
-          this.updateMemoryStats(departmentId, memory)
-        },
-      )
-    }
+    this.loadCached(
+      departmentId,
+      this.memory,
+      this.memoryInFlight,
+      this.memoryRetryAt,
+      () => this.request<DepartmentMemory>(`/api/departments/${departmentId}/memory`, 'GET'),
+      (memory) => this.updateMemoryStats(departmentId, memory),
+    )
     return this.memory.get(departmentId) ?? emptyMemory(departmentId)
   }
 
@@ -1242,7 +1324,13 @@ export class ApiClient implements CompanyClient {
       return !arr.some((x) => !!m.clientMessageId && x.clientMessageId === m.clientMessageId)
     })
     const activity = this.mergeActivity(server.activity ?? [], this.state.activity)
-    this.setState({ ...server, activity, executiveQueue: server.executiveQueue ?? [], threads: this.mergedThreads() })
+    this.setState({
+      ...server,
+      activity,
+      executiveQueue: server.executiveQueue ?? [],
+      officeLayout: sanitizeOfficeLayout(server.officeLayout ?? DEFAULT_OFFICE_LAYOUT),
+      threads: this.mergedThreads(),
+    })
     if (replayAfterId) void this.replayActivitySince(replayAfterId)
   }
 
@@ -1318,6 +1406,35 @@ export class ApiClient implements CompanyClient {
     this.applyServerState(state)
     // mutations (new dept, closed task, …) can mint decisions — keep the log fresh
     if (this.decisionsLoaded) void this.refreshDecisions()
+  }
+
+  /** Fire a one-shot background GET that fills `cache[key]`, with in-flight dedupe
+   *  and a retry cooldown. Unlike caching an empty placeholder up front, a failed
+   *  fetch leaves the key uncached so a later call retries (after the cooldown),
+   *  instead of showing emptiness forever or hammering a downed backend. No-op
+   *  when the value is already cached, a fetch is in flight, or still cooling down. */
+  private loadCached<T>(
+    key: string,
+    cache: Map<string, T>,
+    inFlight: Set<string>,
+    retryAt: Map<string, number>,
+    fetcher: () => Promise<T>,
+    onLoaded?: (value: T) => void,
+  ): void {
+    if (cache.has(key) || inFlight.has(key) || (retryAt.get(key) ?? 0) > Date.now()) return
+    inFlight.add(key)
+    void fetcher()
+      .then((value) => {
+        inFlight.delete(key)
+        retryAt.delete(key)
+        cache.set(key, value)
+        onLoaded?.(value)
+      })
+      .catch((err) => {
+        inFlight.delete(key)
+        retryAt.set(key, Date.now() + BACKGROUND_RETRY_COOLDOWN_MS)
+        console.error('[ATRIUM API]', err)
+      })
   }
 
   private command<T>(run: () => Promise<T>, then?: (value: T) => void): void {

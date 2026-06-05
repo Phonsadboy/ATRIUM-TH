@@ -50,6 +50,19 @@ export interface RoomRect {
   h: number
 }
 
+export interface OfficeLayout {
+  roomCount: number
+  roomNames: Record<string, string>
+  departmentRooms: Record<ID, number>
+  updatedAt: number
+}
+
+export interface UpdateOfficeLayoutInput {
+  roomCount?: number | null
+  roomNames?: Record<string, string> | null
+  departmentRooms?: Record<ID, number> | null
+}
+
 export interface MemoryStats {
   archiveChunks: number
   ragEntries: number
@@ -246,6 +259,8 @@ export interface Task {
   /** v0.4: optional project grouping and durable outputs. */
   projectId?: ID | null
   deliverables?: ID[]
+  /** Latest in-progress draft the department produced, used as the "submit what exists" source. */
+  draftDeliverableMarkdown?: string | null
   watchers?: ID[]
   parentTaskId?: ID | null
   subTaskIds?: ID[]
@@ -256,6 +271,24 @@ export interface Task {
   lastReviewReminderAt?: number | null
   reviewReminderCount?: number
   reviewScheduleToken?: string | null
+}
+
+/** User-initiated controls available from the task control modal. */
+export type TaskControlAction = 'cancel' | 'pause' | 'resume' | 'submit_partial' | 'close'
+
+export interface ControlTaskInput {
+  action: TaskControlAction
+  reason?: string
+  /** Always the human user; the modal must never claim the AI executive pressed the button. */
+  requestedBy: 'user'
+}
+
+export interface TaskControlResponse {
+  ok: boolean
+  task: Task
+  executed: boolean
+  approval?: Record<string, unknown> | null
+  artifact?: Record<string, unknown> | null
 }
 
 /* ---------- Chat ---------- */
@@ -1165,6 +1198,7 @@ export interface CompanyState {
   approvals: Approval[]
   objectives: ScheduledObjective[]
   executiveQueue: ExecutiveQueueItem[]
+  officeLayout: OfficeLayout
   budget: Budget
   /** Owner Mode guardrail policy (present from the FastAPI backend). */
   permissionPolicy?: PermissionPolicy

@@ -2,10 +2,11 @@
 // budgetColor is a shared helper exported alongside the TopBar component;
 // RightDock + LeftRail import it, so it must live here (disables the
 // react-refresh single-export rule for this file).
+import { useEffect, useRef, useState } from 'react'
 import { useSelector, client } from '../state/useCompany'
 import { useUI } from '../state/ui'
 import { Dot, withAlpha } from '../components/primitives'
-import { Logo, Icon } from '../components/Icon'
+import { Logo, Icon, type IconName } from '../components/Icon'
 import { ModeSwitch } from './ModeSwitch'
 import { VersionStatusControl } from './VersionStatusControl'
 import { clockSeconds, money } from '../lib/format'
@@ -19,15 +20,80 @@ function budgetColor(ratio: number): string {
   return ACCENT_HEX.teal
 }
 
+/** Thin vertical separator that visually groups the toolbar clusters. */
+function Divider() {
+  return <span className="h-5 w-px shrink-0" style={{ background: 'var(--color-line-soft)' }} />
+}
+
+/** Icon-only button with a corner count badge — used for the alert cluster. */
+function AlertBtn({
+  iconName,
+  title,
+  count,
+  accent,
+  onClick,
+}: {
+  iconName: IconName
+  title: string
+  count: number
+  accent: string
+  onClick: () => void
+}) {
+  const active = count > 0
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      title={active ? `${title} (${count})` : title}
+      aria-label={active ? `${title} (${count})` : title}
+      className="relative inline-flex h-8 w-8 items-center justify-center rounded-lg transition-colors hover:text-[var(--color-cream)]"
+      style={{
+        color: active ? accent : 'var(--color-cream-dim)',
+        background: active ? withAlpha(accent, 0.12) : 'transparent',
+      }}
+    >
+      <Icon name={iconName} size={15} />
+      {active && (
+        <span
+          className="absolute -top-1 -right-1 inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-bold text-black"
+          style={{ background: accent }}
+        >
+          {count}
+        </span>
+      )}
+    </button>
+  )
+}
+
+/** Row inside the ⋯ More dropdown. */
+function MenuItem({
+  iconName,
+  label,
+  onClick,
+}: {
+  iconName: IconName
+  label: string
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      role="menuitem"
+      onClick={onClick}
+      className="flex w-full items-center gap-2.5 rounded-lg px-2.5 py-2 text-left text-xs font-medium text-[var(--color-cream-dim)] transition-colors hover:bg-[var(--color-surface-4)] hover:text-[var(--color-cream)]"
+    >
+      <Icon name={iconName} size={15} />
+      {label}
+    </button>
+  )
+}
+
 export function TopBar() {
   const now = useSelector((s) => s.now)
   const running = useSelector((s) => s.running)
   const budget = useSelector((s) => s.budget)
   const pending = useSelector(
     (s) => s.approvals.filter((a) => a.status === 'pending' && isHumanApproval(a)).length,
-  )
-  const queueCount = useSelector(
-    (s) => s.executiveQueue.filter((item) => item.status === 'queued' || item.status === 'running').length,
   )
   // exclude the executive so this matches LeftRail's แผนก ({rest.length}) count
   const deptCount = useSelector(
@@ -39,8 +105,6 @@ export function TopBar() {
   const toggleTaskBoard = useUI((s) => s.toggleTaskBoard)
   const openFinance = useUI((s) => s.openFinance)
   const openConsole = useUI((s) => s.openConsole)
-  const select = useUI((s) => s.select)
-  const setRightTab = useUI((s) => s.setRightTab)
 
   // the `now` selector above re-renders TopBar on every client bump, so this
   // plain getter read stays in sync with the notification inbox
@@ -49,12 +113,31 @@ export function TopBar() {
   const ratio = budget.dailyCapUsd ? budget.spentTodayUsd / budget.dailyCapUsd : 0
   const bcol = budgetColor(ratio)
 
+  // ⋯ More dropdown holds the lower-traffic panels (task board / finance / log)
+  const [moreOpen, setMoreOpen] = useState(false)
+  const moreRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!moreOpen) return
+    const onDown = (e: MouseEvent) => {
+      if (moreRef.current && !moreRef.current.contains(e.target as Node)) setMoreOpen(false)
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMoreOpen(false)
+    }
+    window.addEventListener('mousedown', onDown)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('mousedown', onDown)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [moreOpen])
+
   return (
     <header
-      className="flex items-center gap-3 px-5 py-2"
+      className="flex items-center gap-2.5 px-5 py-2"
       style={{ borderBottom: '1px solid var(--color-line-soft)' }}
     >
-      {/* brand */}
+      {/* brand + system status */}
       <div className="flex items-center gap-3">
         <Logo height={28} />
         <div className="leading-tight">
@@ -64,8 +147,9 @@ export function TopBar() {
         </div>
       </div>
 
-      {/* live clock */}
-      <div className="ml-2 flex items-center gap-2">
+      <Divider />
+
+      <div className="flex items-center gap-2">
         <Dot color={running ? ACCENT_HEX.teal : ACCENT_HEX.coral} pulse={running} />
         <span
           className="text-sm tabular-nums"
@@ -73,7 +157,7 @@ export function TopBar() {
         >
           {clockSeconds(now)}
         </span>
-        <span className="text-[10px] tracking-widest text-[var(--color-cream-faint)]">
+        <span className="hidden text-[10px] tracking-widest text-[var(--color-cream-faint)] lg:inline">
           {running ? 'กำลังเดินระบบ' : 'หยุดชั่วคราว'}
         </span>
         <VersionStatusControl />
@@ -81,7 +165,7 @@ export function TopBar() {
 
       <div className="flex-1" />
 
-      {/* budget meter */}
+      {/* budget meter — stays in place per the agreed layout */}
       <div className="hidden w-52 md:block">
         <div className="mb-1 flex items-baseline justify-between text-[11px]">
           <span className="text-[var(--color-cream-faint)]">งบวันนี้</span>
@@ -104,131 +188,102 @@ export function TopBar() {
         </div>
       </div>
 
-      {/* operations console */}
+      <Divider />
+
+      {/* primary workspace */}
       <button
         type="button"
         onClick={() => openConsole()}
-        className="flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-medium text-[var(--color-cream-dim)] transition-colors hover:text-[var(--color-cream)]"
+        className="flex h-8 items-center gap-1.5 rounded-xl border px-3 text-xs font-medium text-[var(--color-cream-dim)] transition-colors hover:text-[var(--color-cream)]"
         style={{ borderColor: 'var(--color-line-soft)' }}
       >
         <Icon name="model" size={14} /> ศูนย์ปฏิบัติการ
       </button>
 
-      {/* task board */}
+      {/* task board — labeled button (sits beside the workspace) */}
       <button
         type="button"
         onClick={() => toggleTaskBoard(true)}
-        className="flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-medium text-[var(--color-cream-dim)] transition-colors hover:text-[var(--color-cream)]"
+        className="flex h-8 items-center gap-1.5 rounded-xl border px-3 text-xs font-medium text-[var(--color-cream-dim)] transition-colors hover:text-[var(--color-cream)]"
         style={{ borderColor: 'var(--color-line-soft)' }}
       >
         <Icon name="tasks" size={14} /> บอร์ดงาน
       </button>
 
-      {/* finance */}
-      <button
-        type="button"
-        onClick={() => openFinance()}
-        className="flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-medium text-[var(--color-cream-dim)] transition-colors hover:text-[var(--color-cream)]"
+      {/* alert cluster — notifications · approvals, one icon+badge group */}
+      <div
+        className="flex items-center gap-0.5 rounded-xl border p-0.5"
         style={{ borderColor: 'var(--color-line-soft)' }}
       >
-        <Icon name="budget" size={14} /> การเงิน
-      </button>
+        <AlertBtn
+          iconName="alert"
+          title="แจ้งเตือน"
+          count={unreadNotifs}
+          accent={ACCENT_HEX.amber}
+          onClick={() => toggleNotifications(true)}
+        />
+        <AlertBtn
+          iconName="approve"
+          title="อนุมัติ"
+          count={pending}
+          accent={ACCENT_HEX.coral}
+          onClick={() => toggleApprovals(true)}
+        />
+      </div>
 
-      {/* decision log */}
-      <button
-        type="button"
-        onClick={() => toggleDecisions(true)}
-        title="บันทึกการตัดสินใจ"
-        className="flex items-center justify-center rounded-xl border px-2.5 py-1.5 text-xs font-medium text-[var(--color-cream-dim)] transition-colors hover:text-[var(--color-cream)]"
-        style={{ borderColor: 'var(--color-line-soft)' }}
-      >
-        <Icon name="archive" size={14} />
-      </button>
-
-      {/* executive queue */}
-      <button
-        type="button"
-        onClick={() => {
-          select(EXEC_ID)
-          setRightTab('watch')
-        }}
-        className="relative flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-medium transition-colors"
-        style={{
-          borderColor: queueCount
-            ? withAlpha(ACCENT_HEX.lavender, 0.45)
-            : 'var(--color-line-soft)',
-          color: queueCount ? ACCENT_HEX.lavender : 'var(--color-cream-dim)',
-          background: queueCount ? withAlpha(ACCENT_HEX.lavender, 0.1) : 'transparent',
-        }}
-      >
-        <Icon name="tasks" size={14} /> คิว
-        {queueCount > 0 && (
-          <span
-            className="ml-1.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-bold text-black"
-            style={{ background: ACCENT_HEX.lavender }}
+      {/* ⋯ More — task board / finance / decision log */}
+      <div className="relative" ref={moreRef}>
+        <button
+          type="button"
+          onClick={() => setMoreOpen((v) => !v)}
+          aria-haspopup="menu"
+          aria-expanded={moreOpen}
+          title="เพิ่มเติม"
+          className="flex h-8 w-9 items-center justify-center rounded-xl border text-base leading-none text-[var(--color-cream-dim)] transition-colors hover:text-[var(--color-cream)]"
+          style={{
+            borderColor: moreOpen ? withAlpha(ACCENT_HEX.amber, 0.4) : 'var(--color-line-soft)',
+            background: moreOpen ? withAlpha(ACCENT_HEX.amber, 0.1) : 'transparent',
+            color: moreOpen ? ACCENT_HEX.amber : undefined,
+          }}
+        >
+          ⋯
+        </button>
+        {moreOpen && (
+          <div
+            role="menu"
+            className="panel absolute right-0 z-50 w-52 p-1.5"
+            style={{ top: 'calc(100% + 8px)', borderRadius: 14 }}
           >
-            {queueCount}
-          </span>
+            <MenuItem
+              iconName="budget"
+              label="การเงิน"
+              onClick={() => {
+                openFinance()
+                setMoreOpen(false)
+              }}
+            />
+            <MenuItem
+              iconName="archive"
+              label="บันทึกการตัดสินใจ"
+              onClick={() => {
+                toggleDecisions(true)
+                setMoreOpen(false)
+              }}
+            />
+          </div>
         )}
-      </button>
+      </div>
 
-      {/* notifications */}
-      <button
-        type="button"
-        onClick={() => toggleNotifications(true)}
-        title="แจ้งเตือน"
-        className="relative flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-medium transition-colors"
-        style={{
-          borderColor: unreadNotifs
-            ? withAlpha(ACCENT_HEX.amber, 0.45)
-            : 'var(--color-line-soft)',
-          color: unreadNotifs ? ACCENT_HEX.amber : 'var(--color-cream-dim)',
-          background: unreadNotifs ? withAlpha(ACCENT_HEX.amber, 0.1) : 'transparent',
-        }}
-      >
-        <Icon name="alert" size={14} />
-        {unreadNotifs > 0 && (
-          <span
-            className="absolute -top-1.5 -right-1.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-bold text-black"
-            style={{ background: ACCENT_HEX.amber }}
-          >
-            {unreadNotifs}
-          </span>
-        )}
-      </button>
+      <Divider />
 
-      {/* approvals */}
-      <button
-        type="button"
-        onClick={() => toggleApprovals(true)}
-        className="relative flex items-center gap-1.5 rounded-xl border px-3 py-1.5 text-xs font-medium transition-colors"
-        style={{
-          borderColor: pending
-            ? withAlpha(ACCENT_HEX.coral, 0.45)
-            : 'var(--color-line-soft)',
-          color: pending ? ACCENT_HEX.coral : 'var(--color-cream-dim)',
-          background: pending ? withAlpha(ACCENT_HEX.coral, 0.1) : 'transparent',
-        }}
-      >
-        <Icon name="approve" size={14} /> อนุมัติ
-        {pending > 0 && (
-          <span
-            className="ml-1.5 inline-flex h-4 min-w-4 items-center justify-center rounded-full px-1 text-[10px] font-bold text-black"
-            style={{ background: ACCENT_HEX.coral }}
-          >
-            {pending}
-          </span>
-        )}
-      </button>
-
-      {/* AI permission mode — how often the company pauses for your approval */}
+      {/* AI permission mode (compact) */}
       <ModeSwitch />
 
       {/* kill switch */}
       <button
         type="button"
         onClick={() => client.setRunning(!running)}
-        className="flex items-center gap-2 rounded-xl px-3 py-1.5 text-xs font-semibold transition-colors"
+        className="flex h-8 items-center gap-2 rounded-xl px-3 text-xs font-semibold transition-colors"
         style={{
           background: running ? withAlpha(ACCENT_HEX.coral, 0.14) : withAlpha(ACCENT_HEX.teal, 0.16),
           color: running ? ACCENT_HEX.coral : ACCENT_HEX.teal,

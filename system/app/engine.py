@@ -80,7 +80,7 @@ from .clock import DAY_MS, day_key, now_ms
 from .config import Settings, get_settings
 from .context_budget import estimate_llm_context_tokens, model_auto_compact_context_tokens
 from .db.base import commit_and_release, session_scope
-from .db.repo import Repo
+from .db.repo import Repo, office_layout_context
 from .events import hub
 from .file_intake import attachments_from_tool_runs, extract_text_from_uri, safe_filename
 from .handoffs import (
@@ -134,7 +134,16 @@ ENGINE_ERROR_NOTIFY_INTERVAL_MS = 5 * 60_000
 KNOWLEDGE_DEBT_NOTIFY_MIN_DEBT = 5
 DAILY_DIGEST_SAMPLE_LIMIT = 5
 NOTIFICATION_PREFS_ID = "global"
+# Marker stored in task["statusReason"] when the human user pauses a task from the control modal.
+# We reuse status="blocked" as the carrier, so this marker is what distinguishes a deliberate
+# user pause from a real auto-block (which the engine retries/escalates).
+PAUSED_BY_USER_REASON = "paused_by_user"
 _MISSING = object()
+
+
+def _is_user_paused(task: dict[str, Any] | None) -> bool:
+    """True for a task the user paused via the control modal (blocked + statusReason marker)."""
+    return bool(task) and str(task.get("status") or "") == "blocked" and task.get("statusReason") == PAUSED_BY_USER_REASON
 
 
 def _merge_task_log_for_engine_save(base: dict[str, Any], proposed: dict[str, Any], current: dict[str, Any]) -> list[Any]:
@@ -190,7 +199,13 @@ def _merge_engine_task_update(base: dict[str, Any], proposed: dict[str, Any], cu
             merged[key] = _merge_handoff_list_for_engine_save(base, proposed, current)
         elif key in {"deliverables", "subTaskIds", "watchers", "activeSkillIds"}:
             merged[key] = _merge_task_list_field(base, proposed, current, key)
-        elif key == "status" and str(current.get("status") or "") in TASK_TERMINAL_STATUSES and current.get("status") != before:
+        elif (
+            key == "status"
+            and current.get("status") != before
+            and (str(current.get("status") or "") in TASK_TERMINAL_STATUSES or _is_user_paused(current))
+        ):
+            # A user action (cancel/close → terminal, or pause → blocked+marker) landed mid-step.
+            # Don't let this stale engine update overwrite it.
             continue
         elif key == "progress" and current.get("progress") != before:
             try:
@@ -694,6 +709,18 @@ async def _task_memory_context(repo: Repo, dept: dict[str, Any], task: dict[str,
     if not knowledge:
         knowledge = await repo.list_knowledge(dept["id"], limit=min(get_settings().rag_top_k, 5))
     return _engine_memory_context(knowledge, await repo.graph(dept["id"]), _working_memory_context(dept))
+
+
+async def _append_executive_office_layout_context(
+    repo: Repo,
+    dept: dict[str, Any],
+    departments: list[dict[str, Any]],
+    memory_context: str,
+) -> str:
+    if not is_exec(str(dept.get("id") or "")):
+        return memory_context
+    layout_context = office_layout_context(await repo.get_office_layout(), departments)
+    return (memory_context + "\n\n" if memory_context else "") + layout_context
 
 
 def _department_system(dept: dict[str, Any], purpose: str, memory_context: str = "") -> str:
@@ -2105,6 +2132,7 @@ async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int)
     attached_context = await attachment_context(repo, user_msg.get("attachments") or payload.get("attachments") or [])
     if attached_context:
         memory_context = (memory_context + "\n\n" if memory_context else "") + "Attached user context:\n" + attached_context
+    memory_context = await _append_executive_office_layout_context(repo, dept, departments, memory_context)
     system = _chat_system_prompt(dept, memory_context)
     if war_room:
         system = f"{system}\n\n{war_room_context(war_room, war_participants)}"
@@ -6158,6 +6186,15 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
     changed = False
     state = dept.get("state")
     task = _task_by_id(tasks, dept.get("currentTaskId"))
+    if _is_user_paused(task):
+        # The user paused this task from the control modal; never auto-resume or step it.
+        # Release the department so it goes idle (and can pick up other work next tick).
+        dept["currentTaskId"] = None
+        if dept.get("state") != "offline":
+            dept["state"] = "idle"
+        await repo.save_department(dept)
+        hub.pulse({"kind": "state", "departmentId": dept["id"]})
+        return True
     base_task = copy.deepcopy(task) if task else None
     reset_autonomy_schedule = _reset_autonomy_schedule_for_work(dept, now) if task else False
     if reset_autonomy_schedule:
@@ -6779,6 +6816,7 @@ async def _executive_cadence(repo: Repo, departments: list[dict[str, Any]], now:
     tasks = await repo.list_tasks(limit=500, newest_first=True)
     approvals = await repo.list_approvals(limit=200)
     budget = await repo.get_budget()
+    office_layout = await repo.get_office_layout()
     system = _department_system(
         exec_dept,
         (
@@ -6796,6 +6834,8 @@ async def _executive_cadence(repo: Repo, departments: list[dict[str, Any]], now:
                 {"id": d["id"], "name": d.get("name"), "state": d.get("state"), "currentTaskId": d.get("currentTaskId")}
                 for d in departments
             ],
+            "officeLayout": office_layout,
+            "officeRooms": office_layout_context(office_layout, departments),
             "openTasks": [
                 {"id": t["id"], "title": t.get("title"), "status": t.get("status"), "departmentId": t.get("departmentId"), "progress": t.get("progress")}
                 for t in tasks

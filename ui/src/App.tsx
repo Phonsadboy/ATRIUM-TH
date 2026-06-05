@@ -12,6 +12,7 @@ import { CreateDeptModal } from './panels/CreateDeptModal'
 import { AssignTaskModal } from './panels/AssignTaskModal'
 import { FinancePanel } from './panels/FinancePanel'
 import { EditDeptModal } from './panels/EditDeptModal'
+import { TaskControlModal } from './components/TaskControlModal'
 import { useUI } from './state/ui'
 import type { MobileSection } from './state/ui'
 
@@ -122,6 +123,8 @@ export default function App() {
       <AssignTaskModal />
       <FinancePanel />
       <EditDeptModal />
+      {/* Mounted after TaskBoard so the task control modal stacks on top of the board. */}
+      <TaskControlModal />
       <Suspense fallback={null}>
         <Console />
       </Suspense>

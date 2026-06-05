@@ -20,7 +20,7 @@ export function TaskBoard() {
     <Modal
       open={open}
       onClose={() => toggle(false)}
-      width={1140}
+      width={1480}
       title={
         <span className="flex items-center gap-3">
           บอร์ดงานทั้งบริษัท
@@ -41,12 +41,17 @@ export function TaskBoard() {
         </span>
       }
     >
-      <div className="-mx-1 flex gap-3 overflow-x-auto px-1 pb-1" style={{ maxHeight: '68vh' }}>
+      <div className="mb-2 flex items-center gap-1.5 text-[11px] text-[var(--color-cream-faint)]">
+        เลื่อนซ้าย–ขวาเพื่อดูทุกคอลัมน์
+        <span aria-hidden="true" className="text-[var(--color-cream-dim)]">→</span>
+      </div>
+      <div className="relative">
+        <div className="-mx-1 flex gap-3 overflow-x-auto px-1 pb-1" style={{ maxHeight: '82vh' }}>
         {BOARD_COLUMNS.map((status) => {
           const items = byStatus(status)
           const col = STATUS_HEX[status]
           return (
-            <div key={status} className="flex w-[216px] shrink-0 flex-col">
+            <div key={status} className="flex w-[288px] shrink-0 flex-col">
               <div className="mb-2 flex items-center gap-2 px-1">
                 <span className="h-2 w-2 rounded-full" style={{ background: col }} />
                 <span className="text-[12px] font-medium text-[var(--color-cream)]">
@@ -69,14 +74,18 @@ export function TaskBoard() {
                   </div>
                 )}
                 {items.map((t: Task) => (
-                  <div key={t.id} onClickCapture={() => toggle(false)}>
-                    <TaskCard task={t} compact />
-                  </div>
+                  // Clicking a card opens the task control modal on top; keep the board open behind it.
+                  <TaskCard key={t.id} task={t} compact />
                 ))}
               </div>
             </div>
           )
         })}
+        </div>
+        <div
+          className="pointer-events-none absolute inset-y-0 right-0 w-12"
+          style={{ background: 'linear-gradient(to left, var(--color-surface-2), transparent)' }}
+        />
       </div>
     </Modal>
   )

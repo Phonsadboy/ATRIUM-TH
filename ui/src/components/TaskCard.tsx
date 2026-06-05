@@ -5,7 +5,7 @@ import { useUI } from '../state/ui'
 import { Progress, Pill, cx } from './primitives'
 import { ProblemDetails } from './ProblemDetails'
 import { PRIORITY_HEX, PRIORITY_LABEL, ACCENT_HEX } from '../lib/visuals'
-import { STATUS_HEX, originLabel, taskStatusLabel } from '../lib/tasks'
+import { STATUS_HEX, originLabel, taskStatusLabel, isUserPaused, PAUSED_HEX } from '../lib/tasks'
 import { relTime } from '../lib/format'
 import type { Task } from '../contract/types'
 
@@ -21,8 +21,7 @@ function lastLogLine(task: Task): string {
 export function TaskCard({ task, compact }: { task: Task; compact?: boolean }) {
   const departments = useSelector((s) => s.departments)
   const now = useSelector((s) => s.now)
-  const select = useUI((s) => s.select)
-  const setRightTab = useUI((s) => s.setRightTab)
+  const openTaskControl = useUI((s) => s.openTaskControl)
 
   const dept = departments.find((d) => d.id === task.departmentId)
   const getName = (id: string) => departments.find((d) => d.id === id)?.name ?? '—'
@@ -67,14 +66,18 @@ export function TaskCard({ task, compact }: { task: Task; compact?: boolean }) {
       layout
       initial={{ opacity: 0, y: 6 }}
       animate={{ opacity: cancelled ? 0.55 : 1, y: 0 }}
-      onClick={() => {
-        if (task.departmentId) {
-          select(task.departmentId)
-          setRightTab('tasks')
+      onClick={() => openTaskControl(task.id)}
+      onKeyDown={(event) => {
+        const target = event.target as HTMLElement | null
+        if (target?.closest('button,input,textarea,select,a')) return
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault()
+          openTaskControl(task.id)
         }
       }}
-      className="w-full rounded-2xl border p-3 text-left transition-colors hover:border-[var(--color-line)]"
-      style={{ borderColor: 'var(--color-line-soft)', background: 'var(--color-surface-2)' }}
+      className="w-full cursor-pointer rounded-2xl border border-[var(--color-line-soft)] bg-[var(--color-surface-2)] p-3 text-left transition-colors hover:border-[var(--color-line)] hover:bg-[var(--color-surface-3)]"
+      title="คลิกเพื่อดูและจัดการงาน"
+      aria-label={`จัดการงาน ${task.title}`}
     >
       <div className="flex items-start gap-2">
         <span
@@ -106,7 +109,7 @@ export function TaskCard({ task, compact }: { task: Task; compact?: boolean }) {
       )}
 
       <div className="mt-2 flex flex-wrap items-center gap-1.5">
-        <Pill color={STATUS_HEX[task.status]}>{statusText}</Pill>
+        <Pill color={isUserPaused(task) ? PAUSED_HEX : STATUS_HEX[task.status]}>{statusText}</Pill>
         {dept && (
           <span className="text-[11px] text-[var(--color-cream-dim)]">
             {dept.emoji} {dept.name}
@@ -162,7 +165,7 @@ export function TaskCard({ task, compact }: { task: Task; compact?: boolean }) {
         </div>
       )}
 
-      {task.status === 'blocked' && (
+      {task.status === 'blocked' && !isUserPaused(task) && (
         <div
           className="mt-2 rounded-md border px-2 py-1.5 text-[10px] leading-relaxed text-[var(--color-cream-dim)]"
           style={{
@@ -188,6 +191,15 @@ export function TaskCard({ task, compact }: { task: Task; compact?: boolean }) {
               { label: 'ล่าสุด', value: task.lastUnblockAttemptAt ? relTime(task.lastUnblockAttemptAt, now) : '' },
             ]}
           />
+        </div>
+      )}
+
+      {isUserPaused(task) && (
+        <div
+          className="mt-2 rounded-md border px-2 py-1.5 text-[10px] leading-relaxed text-[var(--color-cream-dim)]"
+          style={{ borderColor: `${PAUSED_HEX}55`, background: `${PAUSED_HEX}14` }}
+        >
+          ผู้ใช้หยุดงานนี้ไว้ชั่วคราว · กดที่การ์ดเพื่อสั่งทำต่อหรือจัดการงาน
         </div>
       )}
 

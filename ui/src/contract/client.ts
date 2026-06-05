@@ -16,8 +16,12 @@ import type {
   Notification,
   PolicyMode,
   Decision,
+  OfficeLayout,
   SendMessageOptions,
   SendMessageResponse,
+  ControlTaskInput,
+  TaskControlResponse,
+  UpdateOfficeLayoutInput,
 } from './types'
 
 export type Unsubscribe = () => void
@@ -108,6 +112,8 @@ export interface CompanyClient {
   assignTask(input: AssignTaskInput): Promise<Task>
   reassignTask(taskId: ID, input: ReassignTaskInput): Promise<Task>
   updateTaskReviewSchedule(taskId: ID, reviewIntervalMs: number | null): Promise<Task>
+  controlTask(taskId: ID, input: ControlTaskInput): Promise<TaskControlResponse>
+  updateOfficeLayout(input: UpdateOfficeLayoutInput): Promise<OfficeLayout>
 
   setRunning(running: boolean): void
   setDepartmentProvider(departmentId: ID, providerId: AiProviderId): void

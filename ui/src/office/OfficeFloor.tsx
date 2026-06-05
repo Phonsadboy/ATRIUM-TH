@@ -8,7 +8,7 @@
    the only thing reused from the previous build is the pixel art.
    ============================================================ */
 
-import { useEffect, useMemo, useRef } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useSelector, client } from '../state/useCompany'
 import { useUI } from '../state/ui'
 import type { OfficeLayoutPlan } from '../state/ui'
@@ -23,7 +23,7 @@ import { drawWorld, drawFx, timeTint, type Camera, type FrameState, type Fx, typ
 import { Actors } from './actors'
 import { installDevOffice } from './devOffice'
 import { deptIdFromThread } from '../lib/threads'
-import type { ThreadId } from '../contract/types'
+import type { OfficeLayout, ThreadId, UpdateOfficeLayoutInput } from '../contract/types'
 import { Icon } from '../components/Icon'
 
 const MIN_ZOOM = 0.18
@@ -41,12 +41,43 @@ declare global {
   }
 }
 
+type ControlRoom = {
+  index: number
+  title: string
+  count: number
+  isExec: boolean
+  depts: { id: string; name: string; isExec: boolean; taskCount: number }[]
+}
+
+function cleanRoomIndex(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0
+}
+
+function layoutIsEmpty(layout: OfficeLayout): boolean {
+  return (
+    layout.updatedAt === 0 &&
+    Object.keys(layout.departmentRooms).length === 0 &&
+    Object.keys(layout.roomNames).length === 0
+  )
+}
+
+function shiftRoomNames(roomNames: Record<string, string>, removedRoomIndex: number): Record<string, string> {
+  const next: Record<string, string> = {}
+  for (const [rawKey, name] of Object.entries(roomNames)) {
+    const roomIndex = cleanRoomIndex(Number(rawKey))
+    if (roomIndex === removedRoomIndex) continue
+    next[String(roomIndex > removedRoomIndex ? roomIndex - 1 : roomIndex)] = name
+  }
+  return next
+}
+
 export function OfficeFloor() {
   const hostRef = useRef<HTMLDivElement | null>(null)
   const canvasRef = useRef<HTMLCanvasElement | null>(null)
 
   const departments = useSelector((s) => s.departments)
   const tasks = useSelector((s) => s.tasks)
+  const officeLayout = useSelector((s) => s.officeLayout)
   const selectedDeptId = useUI((s) => s.selectedDeptId)
   const select = useUI((s) => s.select)
   const setRightTab = useUI((s) => s.setRightTab)
@@ -54,29 +85,45 @@ export function OfficeFloor() {
   const toggleArrange = useUI((s) => s.toggleArrange)
   const officeRoomIndex = useUI((s) => s.officeRoomIndex)
   const setOfficeRoom = useUI((s) => s.setOfficeRoom)
-  const departmentRooms = useUI((s) => s.departmentRooms)
-  const moveDepartmentToOfficeRoom = useUI((s) => s.moveDepartmentToOfficeRoom)
+  const localDepartmentRooms = useUI((s) => s.departmentRooms)
+  const moveDepartmentToOfficeRoomLocal = useUI((s) => s.moveDepartmentToOfficeRoom)
   const roomOverrides = useUI((s) => s.roomOverrides)
   const setRoomOverride = useUI((s) => s.setRoomOverride)
   const roomPositions = useUI((s) => s.roomPositions)
   const setRoomPosition = useUI((s) => s.setRoomPosition)
-  const officeRoomCount = useUI((s) => s.officeRoomCount)
-  const addOfficeRoom = useUI((s) => s.addOfficeRoom)
-  const removeOfficeRoom = useUI((s) => s.removeOfficeRoom)
+  const localOfficeRoomCount = useUI((s) => s.officeRoomCount)
+  const addOfficeRoomLocal = useUI((s) => s.addOfficeRoom)
+  const removeOfficeRoomLocal = useUI((s) => s.removeOfficeRoom)
   const officeRoomBackgrounds = useUI((s) => s.officeRoomBackgrounds)
   const setOfficeRoomBackground = useUI((s) => s.setOfficeRoomBackground)
   const applyOfficePlan = useUI((s) => s.applyOfficePlan)
+
+  const backendLayoutEmpty = layoutIsEmpty(officeLayout)
+  const departmentRooms =
+    backendLayoutEmpty && Object.keys(localDepartmentRooms).length > 0
+      ? localDepartmentRooms
+      : officeLayout.departmentRooms
+  const officeRoomCount =
+    backendLayoutEmpty
+      ? Math.max(1, officeLayout.roomCount, localOfficeRoomCount)
+      : officeLayout.roomCount
+  const roomNames = officeLayout.roomNames
+
+  const patchOfficeLayout = (patch: UpdateOfficeLayoutInput) => {
+    void client.updateOfficeLayout(patch).catch((err) => console.error('[ATRIUM office layout]', err))
+  }
 
   const world = useMemo<WorldModel>(
     () =>
       buildWorld(departments, tasks, {
         departmentRooms,
+        roomNames,
         roomOverrides,
         roomBackgrounds: officeRoomBackgrounds,
         roomPositions,
         minRooms: officeRoomCount,
       }),
-    [departments, tasks, departmentRooms, roomOverrides, officeRoomBackgrounds, roomPositions, officeRoomCount],
+    [departments, tasks, departmentRooms, roomNames, roomOverrides, officeRoomBackgrounds, roomPositions, officeRoomCount],
   )
 
   // ---- mutable render state (kept out of React so the rAF loop never restarts) ----
@@ -85,6 +132,8 @@ export function OfficeFloor() {
   const camRef = useRef<Camera>({ x: 0, y: 0, zoom: 0.6 })
   const camTargetRef = useRef<Camera | null>(null)
   const userAdjustedRef = useRef(false)
+  const officeLayoutMigrationRef = useRef(false)
+  const officeLayoutRef = useRef({ departmentRooms, roomNames, roomCount: officeRoomCount })
   const fxRef = useRef<Fx[]>([])
   const actorsRef = useRef(new Actors())
   const frameRef = useRef<FrameState>({
@@ -105,11 +154,85 @@ export function OfficeFloor() {
   // mirror the latest React state into the refs the rAF loop reads
   useEffect(() => {
     worldRef.current = world
+    officeLayoutRef.current = { departmentRooms, roomNames, roomCount: officeRoomCount }
     frameRef.current.selectedId = selectedDeptId
     frameRef.current.arrange = arrangeMode
     actorsRef.current.sync(world)
     actorsRef.current.setArrange(arrangeMode)
-  }, [world, selectedDeptId, arrangeMode])
+  }, [world, selectedDeptId, arrangeMode, departmentRooms, roomNames, officeRoomCount])
+
+  useEffect(() => {
+    if (officeLayoutMigrationRef.current || !backendLayoutEmpty) return
+    const hasLocalRooms = Object.keys(localDepartmentRooms).length > 0
+    const hasLocalRoomCount = localOfficeRoomCount > 1
+    if (!hasLocalRooms && !hasLocalRoomCount) return
+    officeLayoutMigrationRef.current = true
+    void client.updateOfficeLayout({
+      departmentRooms: hasLocalRooms ? localDepartmentRooms : undefined,
+      roomCount: Math.max(1, localOfficeRoomCount),
+    }).catch((err) => console.error('[ATRIUM office layout migration]', err))
+  }, [backendLayoutEmpty, localDepartmentRooms, localOfficeRoomCount])
+
+  const moveDepartmentToOfficeRoom = (deptId: string, roomIndex: number) => {
+    const nextRoomIndex = cleanRoomIndex(roomIndex)
+    moveDepartmentToOfficeRoomLocal(deptId, nextRoomIndex)
+    const layout = officeLayoutRef.current
+    patchOfficeLayout({
+      departmentRooms: { ...layout.departmentRooms, [deptId]: nextRoomIndex },
+      roomCount: Math.max(layout.roomCount, nextRoomIndex + 1),
+    })
+  }
+
+  const addOfficeRoom = (currentRoomCount?: number) => {
+    const layout = officeLayoutRef.current
+    const nextRoomCount = Math.max(layout.roomCount, currentRoomCount ?? 0, 1) + 1
+    addOfficeRoomLocal(currentRoomCount)
+    setOfficeRoom(nextRoomCount - 1)
+    patchOfficeLayout({ roomCount: nextRoomCount })
+  }
+
+  const removeOfficeRoom = (roomIndex: number, currentRoomCount?: number) => {
+    const removedRoomIndex = cleanRoomIndex(roomIndex)
+    const focused = worldRef.current.rooms[removedRoomIndex]
+    const existing = Math.max(officeLayoutRef.current.roomCount, currentRoomCount ?? 0, worldRef.current.rooms.length)
+    if (!focused || focused.isExec || focused.count > 0 || existing <= 1) return
+
+    const nextDepartmentRooms: Record<string, number> = {}
+    for (const [deptId, rawRoomIndex] of Object.entries(officeLayoutRef.current.departmentRooms)) {
+      const deptRoomIndex = cleanRoomIndex(rawRoomIndex)
+      if (deptRoomIndex === removedRoomIndex) continue
+      nextDepartmentRooms[deptId] = deptRoomIndex > removedRoomIndex ? deptRoomIndex - 1 : deptRoomIndex
+    }
+    const nextRoomCount = Math.max(1, existing - 1)
+    removeOfficeRoomLocal(removedRoomIndex, currentRoomCount)
+    patchOfficeLayout({
+      departmentRooms: nextDepartmentRooms,
+      roomNames: shiftRoomNames(officeLayoutRef.current.roomNames, removedRoomIndex),
+      roomCount: nextRoomCount,
+    })
+  }
+
+  const setOfficeRoomName = (roomIndex: number, name: string) => {
+    const key = String(cleanRoomIndex(roomIndex))
+    const nextNames = { ...officeLayoutRef.current.roomNames }
+    const clean = name.trim()
+    if (clean) nextNames[key] = clean
+    else delete nextNames[key]
+    patchOfficeLayout({ roomNames: nextNames, roomCount: Math.max(officeLayoutRef.current.roomCount, Number(key) + 1) })
+  }
+
+  const applyOfficePlanToBackend = (plan: OfficeLayoutPlan) => {
+    applyOfficePlan(plan)
+    const patch: UpdateOfficeLayoutInput = {}
+    if (plan.departmentRooms) {
+      const nextRooms = { ...officeLayoutRef.current.departmentRooms }
+      for (const [deptId, roomIndex] of Object.entries(plan.departmentRooms)) nextRooms[deptId] = cleanRoomIndex(roomIndex)
+      patch.departmentRooms = nextRooms
+    }
+    if (plan.roomNames) patch.roomNames = plan.roomNames
+    if (plan.roomCount !== undefined) patch.roomCount = Math.max(1, Math.floor(plan.roomCount))
+    if (patch.departmentRooms || patch.roomNames || patch.roomCount !== undefined) patchOfficeLayout(patch)
+  }
 
   /* ---------- camera helpers ---------- */
 
@@ -557,14 +680,14 @@ export function OfficeFloor() {
   useEffect(() => {
     const api = {
       backgrounds: OFFICE_BACKGROUNDS,
-      applyPlan: applyOfficePlan,
+      applyPlan: applyOfficePlanToBackend,
       moveDepartmentToRoom: moveDepartmentToOfficeRoom,
       setDepartmentPosition: setRoomOverride,
       setRoomBackground: setOfficeRoomBackground,
     }
     const onPlan = (ev: Event) => {
       const d = (ev as CustomEvent<OfficeLayoutPlan>).detail
-      if (d && typeof d === 'object') applyOfficePlan(d)
+      if (d && typeof d === 'object') applyOfficePlanToBackend(d)
     }
     const onRoom = (ev: Event) => {
       const d = (ev as CustomEvent<{ deptId?: string; roomIndex?: number }>).detail
@@ -594,7 +717,7 @@ export function OfficeFloor() {
       delete document.documentElement.dataset.atriumOfficeLayout
       delete document.documentElement.dataset.atriumOfficeBackgrounds
     }
-  }, [applyOfficePlan, moveDepartmentToOfficeRoom, setOfficeRoomBackground, setRoomOverride])
+  }, [applyOfficePlanToBackend, moveDepartmentToOfficeRoom, setOfficeRoomBackground, setRoomOverride])
 
   const focusedBg = officeRoomBackgrounds[String(officeRoomIndex)] ?? world.rooms[officeRoomIndex]?.backgroundId
 
@@ -604,12 +727,19 @@ export function OfficeFloor() {
         <canvas ref={canvasRef} className="block touch-none select-none" />
       </div>
       <OfficeControls
-        rooms={world.rooms.map((r) => ({ index: r.index, count: r.count, isExec: r.isExec }))}
+        rooms={world.rooms.map((r) => ({
+          index: r.index,
+          title: r.title,
+          count: r.count,
+          isExec: r.isExec,
+          depts: r.depts.map((d) => ({ id: d.id, name: d.name, isExec: d.isExec, taskCount: d.taskCount })),
+        }))}
         focusedRoom={officeRoomIndex}
         focusedBg={focusedBg}
         onFocusRoom={setOfficeRoom}
         onAddRoom={() => addOfficeRoom(world.rooms.length)}
         onRemoveRoom={() => removeOfficeRoom(officeRoomIndex, world.rooms.length)}
+        onSetRoomName={setOfficeRoomName}
         onSetBackground={(bg) => setOfficeRoomBackground(officeRoomIndex, bg)}
         arrange={arrangeMode}
         onToggleArrange={() => toggleArrange()}
@@ -643,17 +773,19 @@ function OfficeControls({
   onFocusRoom,
   onAddRoom,
   onRemoveRoom,
+  onSetRoomName,
   onSetBackground,
   arrange,
   onToggleArrange,
   onZoom,
 }: {
-  rooms: { index: number; count: number; isExec: boolean }[]
+  rooms: ControlRoom[]
   focusedRoom: number
   focusedBg: OfficeBackgroundId | undefined
   onFocusRoom: (index: number) => void
   onAddRoom: () => void
   onRemoveRoom: () => void
+  onSetRoomName: (index: number, name: string) => void
   onSetBackground: (bg: OfficeBackgroundId) => void
   arrange: boolean
   onToggleArrange: () => void
@@ -662,6 +794,11 @@ function OfficeControls({
   const chip =
     'rounded-lg border px-2.5 py-1 text-[11px] font-semibold transition-colors shrink-0'
   const focused = rooms.find((r) => r.index === focusedRoom)
+  const [editingName, setEditingName] = useState(false)
+  const [draftName, setDraftName] = useState(focused?.title ?? '')
+  useEffect(() => {
+    if (!editingName) setDraftName(focused?.title ?? '')
+  }, [editingName, focused?.title, focusedRoom])
   const canRemoveFocusedRoom = !!focused && !focused.isExec && focused.count === 0 && rooms.length > 1
   const removeTitle = !focused
     ? 'เลือกห้องก่อน'
@@ -677,6 +814,18 @@ function OfficeControls({
     borderColor: 'var(--color-line-soft)',
     color: 'var(--color-cream-dim)',
   }
+  const focusedMembers = focused?.depts.filter((d) => !d.isExec) ?? []
+  const roster = focusedMembers.map((d) => d.name).join(' · ')
+  const focusedSummary = focused
+    ? focusedMembers.length
+      ? `มี ${focusedMembers.length} แผนก: ${roster}`
+      : 'ห้องว่าง - ลากแผนกเข้ามาได้'
+    : 'เลือกห้องก่อน'
+  const saveName = () => {
+    if (!focused) return
+    onSetRoomName(focused.index, draftName)
+    setEditingName(false)
+  }
   return (
     <>
       {/* top-left: room navigator + background */}
@@ -686,16 +835,18 @@ function OfficeControls({
           <div className="flex max-w-[min(56vw,420px)] items-center gap-1.5 overflow-x-auto">
             {rooms.map((r) => {
               const active = r.index === focusedRoom
+              const members = r.depts.filter((d) => !d.isExec).map((d) => d.name)
+              const title = `${r.title}: ${members.length ? members.join(', ') : 'ไม่มีแผนก'}`
               return (
                 <button
                   key={r.index}
                   type="button"
                   onClick={() => onFocusRoom(r.index)}
-                  className={chip}
+                  className={`${chip} max-w-[160px]`}
                   style={active ? { background: '#f4a945', borderColor: '#f4a945', color: '#13100b' } : idle}
-                  title={`${r.isExec ? 'ห้องผู้บริหาร' : `ห้อง ${r.index + 1}`}: ${r.count}/10 แผนก`}
+                  title={`${title} (${r.count}/10 แผนก)`}
                 >
-                  {r.isExec ? 'ผู้บริหาร' : `ห้อง ${r.index + 1}`}
+                  <span className="inline-block max-w-[104px] truncate align-bottom">{r.title}</span>
                   <span className="ml-1 opacity-70">{r.count}/10</span>
                 </button>
               )
@@ -709,7 +860,7 @@ function OfficeControls({
             onClick={onAddRoom}
             className={`${chip} flex items-center gap-1`}
             style={{ background: 'rgba(244,169,69,0.16)', borderColor: 'rgba(244,169,69,0.4)', color: '#ffc879' }}
-            title="เพิ่มห้องใหม่ (ห้องว่าง — ลากแผนกเข้าไปได้)"
+            title="เพิ่มห้องใหม่ (ห้องว่าง - ลากแผนกเข้าไปได้)"
           >
             <Icon name="plus" size={12} />
             เพิ่มห้อง
@@ -730,6 +881,60 @@ function OfficeControls({
             <Icon name="close" size={12} />
             ลบห้อง
           </button>
+        </div>
+
+        <div className="flex max-w-[min(92vw,760px)] flex-wrap items-center gap-2 rounded-xl px-2.5 py-1.5" style={cluster}>
+          {editingName ? (
+            <form
+              className="flex min-w-[220px] items-center gap-1.5"
+              onSubmit={(e) => {
+                e.preventDefault()
+                saveName()
+              }}
+            >
+              <input
+                value={draftName}
+                onChange={(e) => setDraftName(e.target.value)}
+                className="h-7 w-[180px] rounded-lg border px-2 text-[11px] font-semibold outline-none"
+                style={{ background: 'rgba(19,16,9,0.62)', borderColor: 'var(--color-line-soft)', color: 'var(--color-cream)' }}
+                placeholder={focused?.isExec ? 'ห้องผู้บริหาร' : `ห้อง ${focusedRoom + 1}`}
+                autoFocus
+              />
+              <button
+                type="submit"
+                className="h-7 rounded-lg px-2 text-[11px] font-semibold"
+                style={{ background: '#f4a945', color: '#13100b' }}
+              >
+                บันทึก
+              </button>
+              <button
+                type="button"
+                onClick={() => setEditingName(false)}
+                className="h-7 rounded-lg px-2 text-[11px] font-medium text-[var(--color-cream-dim)] transition-colors hover:text-[var(--color-cream)]"
+              >
+                ยกเลิก
+              </button>
+            </form>
+          ) : (
+            <button
+              type="button"
+              onClick={() => {
+                setDraftName(focused?.title ?? '')
+                setEditingName(true)
+              }}
+              className="rounded-lg border px-2 py-1 text-[11px] font-semibold text-[var(--color-cream)] transition-colors hover:bg-[var(--color-surface-3)]"
+              style={{ borderColor: 'var(--color-line-soft)' }}
+              title="ตั้งชื่อห้อง"
+            >
+              {focused?.title ?? 'เลือกห้อง'} <span className="text-[var(--color-cream-faint)]">แก้ชื่อ</span>
+            </button>
+          )}
+          <div
+            className="min-w-0 flex-1 truncate text-[11px] text-[var(--color-cream-dim)]"
+            title={focusedSummary}
+          >
+            {focusedSummary}
+          </div>
         </div>
 
         <label className="flex items-center gap-2 rounded-xl px-2 py-1.5" style={cluster}>

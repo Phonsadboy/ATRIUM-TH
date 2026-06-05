@@ -36,6 +36,9 @@ MAX_ACTIVITY = 80
 MAX_MSGS = 60
 IMMUTABLE_ENTITY_TYPES = {"artifact_version", "conversation_ledger"}
 MAX_GRAPH_ID = 96
+OFFICE_LAYOUT_ENTITY_TYPE = "office_layout"
+OFFICE_LAYOUT_ENTITY_ID = "default"
+OFFICE_ROOM_CAPACITY = 10
 COST_CATEGORIES = ("work", "chat", "meeting", "autonomous", "memory", "tool")
 _COST_CATEGORY_ALIASES = {
     "agent": "work",
@@ -104,7 +107,7 @@ def _compact_task_for_snapshot(task: dict[str, Any]) -> dict[str, Any]:
         result = task["result"]
         out["result"] = {
             key: result.get(key)
-            for key in ("summary", "artifactId", "decisionId", "completedAt")
+            for key in ("summary", "artifactId", "decisionId", "completedAt", "reviewStatus", "closedBy")
             if key in result
         }
     return out
@@ -275,6 +278,142 @@ def _normalize_department_for_snapshot(dept: dict[str, Any]) -> dict[str, Any]:
             "artifacts": visibility.get("artifacts") or "company",
         }
     return data
+
+
+def _office_room_index(value: Any) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        number = int(float(value))
+    except (TypeError, ValueError):
+        return 0
+    return max(0, number)
+
+
+def _office_room_count_for_departments(departments: list[dict[str, Any]]) -> int:
+    non_exec = sum(1 for dept in departments if str(dept.get("id") or "") != EXEC_ID)
+    return max(1, math.ceil(non_exec / OFFICE_ROOM_CAPACITY))
+
+
+def sanitize_office_layout(raw: dict[str, Any] | None, departments: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return the canonical office layout stored in the backend.
+
+    Room names and department room assignment are durable company layout state.
+    Visual-only canvas details stay in the browser.
+    """
+    raw = raw if isinstance(raw, dict) else {}
+    valid_department_ids = {
+        str(dept.get("id") or "")
+        for dept in departments
+        if str(dept.get("id") or "") and str(dept.get("id") or "") != EXEC_ID
+    }
+
+    room_names: dict[str, str] = {}
+    raw_room_names = raw.get("roomNames") if isinstance(raw.get("roomNames"), dict) else {}
+    for key, value in raw_room_names.items():
+        name = str(value or "").strip()
+        if not name:
+            continue
+        room_names[str(_office_room_index(key))] = name[:64]
+
+    department_rooms: dict[str, int] = {}
+    raw_department_rooms = raw.get("departmentRooms") if isinstance(raw.get("departmentRooms"), dict) else {}
+    for dept_id, room_index in raw_department_rooms.items():
+        dept_id = str(dept_id or "").strip()
+        if dept_id not in valid_department_ids:
+            continue
+        department_rooms[dept_id] = _office_room_index(room_index)
+
+    max_index = -1
+    if room_names:
+        max_index = max(max_index, *(int(key) for key in room_names))
+    if department_rooms:
+        max_index = max(max_index, *department_rooms.values())
+    room_count = max(
+        1,
+        _office_room_index(raw.get("roomCount") or raw.get("room_count") or 1),
+        _office_room_count_for_departments(departments),
+        max_index + 1,
+    )
+    try:
+        updated_at = int(raw.get("updatedAt") or raw.get("updated_at") or 0)
+    except (TypeError, ValueError):
+        updated_at = 0
+    return {
+        "roomCount": room_count,
+        "roomNames": room_names,
+        "departmentRooms": department_rooms,
+        "updatedAt": max(0, updated_at),
+    }
+
+
+def office_layout_room_summaries(layout: dict[str, Any], departments: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Bucket departments the same way the office floor does, for AI context."""
+    layout = sanitize_office_layout(layout, departments)
+    rooms: list[list[dict[str, Any]]] = [[] for _ in range(max(1, int(layout.get("roomCount") or 1)))]
+    counts: list[int] = [0 for _ in rooms]
+
+    def ensure(index: int) -> None:
+        while len(rooms) <= index:
+            rooms.append([])
+            counts.append(0)
+
+    order = 0
+    department_rooms = layout.get("departmentRooms") if isinstance(layout.get("departmentRooms"), dict) else {}
+    for dept in departments:
+        dept_id = str(dept.get("id") or "")
+        if dept_id == EXEC_ID:
+            ensure(0)
+            rooms[0].append(dept)
+            continue
+        explicit = department_rooms.get(dept_id)
+        if explicit is None:
+            index = order // OFFICE_ROOM_CAPACITY
+            order += 1
+        else:
+            index = _office_room_index(explicit)
+            order += 1
+        ensure(index)
+        while counts[index] >= OFFICE_ROOM_CAPACITY:
+            index += 1
+            ensure(index)
+        rooms[index].append(dept)
+        counts[index] += 1
+
+    room_names = layout.get("roomNames") if isinstance(layout.get("roomNames"), dict) else {}
+    summaries: list[dict[str, Any]] = []
+    for index, members in enumerate(rooms):
+        has_exec = any(str(dept.get("id") or "") == EXEC_ID for dept in members)
+        title = str(room_names.get(str(index)) or "").strip() or ("ห้องผู้บริหาร" if has_exec else f"ห้อง {index + 1}")
+        summaries.append({
+            "index": index,
+            "title": title,
+            "isExec": has_exec,
+            "departments": [
+                {
+                    "id": dept.get("id"),
+                    "name": dept.get("name"),
+                    "agentName": dept.get("agentName"),
+                    "state": dept.get("state"),
+                }
+                for dept in members
+                if str(dept.get("id") or "") != EXEC_ID
+            ],
+        })
+    return summaries
+
+
+def office_layout_context(layout: dict[str, Any], departments: list[dict[str, Any]]) -> str:
+    summaries = office_layout_room_summaries(layout, departments)
+    lines = ["Office room layout for the AI executive:"]
+    for room in summaries:
+        names = [
+            str(dept.get("name") or dept.get("agentName") or dept.get("id") or "").strip()
+            for dept in room.get("departments", [])
+        ]
+        member_text = ", ".join(name for name in names if name) or "ไม่มีแผนก"
+        lines.append(f"- {room['title']}: {member_text}")
+    return "\n".join(lines)
 
 
 def _snapshot_task_sort_key(task: dict[str, Any]) -> tuple[int, int]:
@@ -648,6 +787,18 @@ def _job_payload_targets_department(payload: dict[str, Any], dept_id: str) -> bo
         return target in {dept_id, f"dept:{dept_id}", f"department:{dept_id}"}
     if isinstance(target, list):
         return any(item in {dept_id, f"dept:{dept_id}", f"department:{dept_id}"} for item in target)
+    return False
+
+
+def _job_payload_targets_task(payload: dict[str, Any], task_id: str) -> bool:
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return False
+    if str(payload.get("taskId") or "").strip() == task_id:
+        return True
+    task_ids = payload.get("taskIds")
+    if isinstance(task_ids, list):
+        return task_id in {str(item).strip() for item in task_ids}
     return False
 
 
@@ -2641,6 +2792,21 @@ class Repo:
             count += 1
         return count
 
+    async def cancel_task_jobs(self, task_id: str, reason: str) -> int:
+        rows = (
+            await self.s.execute(select(T.Job).where(T.Job.status.in_(("queued", "running"))))
+        ).scalars().all()
+        now = now_ms()
+        count = 0
+        for row in rows:
+            if not _job_payload_targets_task(dict(row.payload or {}), task_id):
+                continue
+            row.status = "cancelled"
+            row.updated_at = now
+            row.last_error = reason
+            count += 1
+        return count
+
     async def reset_stuck_jobs(self) -> None:
         """On boot, any job left 'running' (crash mid-flight) goes back to the queue."""
         now = now_ms()
@@ -2710,6 +2876,31 @@ class Repo:
     async def delete_entity(self, etype: str, eid: str) -> None:
         await self.s.execute(delete(T.Entity).where(T.Entity.type == etype, T.Entity.id == eid))
 
+    async def get_office_layout(self) -> dict[str, Any]:
+        departments = await self.list_departments()
+        raw = await self.get_entity(OFFICE_LAYOUT_ENTITY_TYPE, OFFICE_LAYOUT_ENTITY_ID)
+        return sanitize_office_layout(raw, departments)
+
+    async def update_office_layout(self, patch: dict[str, Any]) -> dict[str, Any]:
+        departments = await self.list_departments()
+        current = await self.get_entity(OFFICE_LAYOUT_ENTITY_TYPE, OFFICE_LAYOUT_ENTITY_ID) or {}
+        raw = dict(current)
+        if "roomCount" in patch:
+            raw["roomCount"] = patch.get("roomCount")
+        if "roomNames" in patch and patch.get("roomNames") is not None:
+            raw["roomNames"] = patch.get("roomNames")
+        if "departmentRooms" in patch and patch.get("departmentRooms") is not None:
+            raw["departmentRooms"] = patch.get("departmentRooms")
+        raw["updatedAt"] = now_ms()
+        layout = sanitize_office_layout(raw, departments)
+        await self.put_entity(
+            OFFICE_LAYOUT_ENTITY_TYPE,
+            {**layout, "id": OFFICE_LAYOUT_ENTITY_ID},
+            status="active",
+            ts=layout["updatedAt"],
+        )
+        return layout
+
     # ---------- snapshot ----------
 
     async def snapshot(self) -> dict:
@@ -2740,6 +2931,7 @@ class Repo:
             "approvals": await self.snapshot_approvals(settings.state_approval_count_limit),
             "objectives": await self.list_objectives(),
             "executiveQueue": await self.executive_queue(limit=30),
+            "officeLayout": await self.get_office_layout(),
             "budget": await self.get_budget(),
             "permissionPolicy": await self.get_permission_policy(),
         }

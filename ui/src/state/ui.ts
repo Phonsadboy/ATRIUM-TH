@@ -49,6 +49,8 @@ interface UIState {
   mobileSection: MobileSection
   /** id of the department being edited, or null when the edit modal is closed */
   editDeptId: string | null
+  /** id of the task open in the task control modal, or null when closed */
+  taskControlTaskId: string | null
   /** office "arrange" mode — rooms become draggable; off = plain click-to-select */
   arrangeMode: boolean
   /** active office room page on the canvas */
@@ -88,6 +90,8 @@ interface UIState {
   setConsoleSection: (section: ConsoleSection) => void
   openEditDept: (deptId: string) => void
   closeEditDept: () => void
+  openTaskControl: (taskId: string) => void
+  closeTaskControl: () => void
   setOfficeRoom: (roomIndex: number) => void
   setOfficeRoomBackground: (roomIndex: number, backgroundId: OfficeBackgroundId) => void
   moveDepartmentToOfficeRoom: (deptId: string, roomIndex: number) => void
@@ -117,6 +121,7 @@ const ROOM_COUNT_KEY = 'atrium.officeRoomCount'
 export interface OfficeLayoutPlan {
   activeRoomIndex?: number
   departmentRooms?: Record<string, number>
+  roomNames?: Record<string | number, string>
   roomOverrides?: Record<string, { x: number; y: number }>
   roomBackgrounds?: Record<string | number, OfficeBackgroundId | string>
   roomPositions?: Record<string | number, { x: number; y: number }>
@@ -318,6 +323,7 @@ export const useUI = create<UIState>((set, get) => ({
   consoleSection: 'overview',
   mobileSection: 'detail',
   editDeptId: null,
+  taskControlTaskId: null,
 
   select: (deptId) => set({ selectedDeptId: deptId, mobileSection: 'detail' }),
   setRightTab: (tab) => set({ rightTab: tab, mobileSection: 'detail' }),
@@ -342,6 +348,8 @@ export const useUI = create<UIState>((set, get) => ({
   setConsoleSection: (section) => set({ consoleSection: section }),
   openEditDept: (deptId) => set({ editDeptId: deptId }),
   closeEditDept: () => set({ editDeptId: null }),
+  openTaskControl: (taskId) => set({ taskControlTaskId: taskId }),
+  closeTaskControl: () => set({ taskControlTaskId: null }),
   setOfficeRoom: (roomIndex) => {
     const next = sanitizeRoomIndex(roomIndex)
     persistOfficeRoomIndex(next)
