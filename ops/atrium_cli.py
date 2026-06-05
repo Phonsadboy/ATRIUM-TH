@@ -511,8 +511,27 @@ def command_bootstrap(args: argparse.Namespace) -> int:
         assert_docker_ready()
     else:
         print("[DRY-RUN] docker info")
-    compose(["up", "-d", "postgres", "ollama"], dry_run=args.dry_run, timeout=600)
-    compose(["exec", "ollama", "ollama", "pull", "bge-m3"], dry_run=args.dry_run, timeout=1200)
+    # Detect external Ollama (e.g. host machine, separate VM). When
+    # `ATRIUM_OLLAMA_BASE_URL` resolves to something other than the in-stack
+    # container we skip both the `ollama` compose service and the
+    # `ollama pull bge-m3` step. This is the recommended path on Windows
+    # where the corporate certificate store can break in-container TLS to
+    # registry.ollama.ai (`x509: certificate signed by unknown authority`).
+    env_values = parse_env_file(SYSTEM_ENV)
+    ollama_url = (
+        os.environ.get("ATRIUM_OLLAMA_BASE_URL")
+        or env_values.get("ATRIUM_OLLAMA_BASE_URL")
+        or ""
+    ).strip()
+    external_ollama = bool(ollama_url) and not any(
+        marker in ollama_url for marker in ("://127.0.0.1", "://localhost", "://ollama:")
+    )
+    if external_ollama:
+        print(f"[INFO] Using external Ollama at {ollama_url} — skipping container + model pull.")
+        compose(["up", "-d", "postgres"], dry_run=args.dry_run, timeout=600)
+    else:
+        compose(["up", "-d", "postgres", "ollama"], dry_run=args.dry_run, timeout=600)
+        compose(["exec", "ollama", "ollama", "pull", "bge-m3"], dry_run=args.dry_run, timeout=1200)
 
     print_header("Database")
     run_or_plan(["uv", "run", "--extra", "postgres", "alembic", "-c", "alembic.ini", "upgrade", "head"], cwd=SYSTEM_DIR, dry_run=args.dry_run, timeout=600)
@@ -543,7 +562,17 @@ def command_start(args: argparse.Namespace) -> int:
     print_header("Start Docker")
     if command_path("docker") and docker_compose_cmd():
         if run(["docker", "info"], timeout=10).returncode == 0:
-            compose(["up", "-d", "postgres", "ollama"], timeout=300)
+            env_values = parse_env_file(SYSTEM_ENV)
+            ollama_url = (
+                os.environ.get("ATRIUM_OLLAMA_BASE_URL")
+                or env_values.get("ATRIUM_OLLAMA_BASE_URL")
+                or ""
+            ).strip()
+            external_ollama = bool(ollama_url) and not any(
+                marker in ollama_url for marker in ("://127.0.0.1", "://localhost", "://ollama:")
+            )
+            services = ["postgres"] if external_ollama else ["postgres", "ollama"]
+            compose(["up", "-d", *services], timeout=300)
         else:
             print_check(False, "Docker", "not running; open Docker Desktop if full stack services are missing")
 
