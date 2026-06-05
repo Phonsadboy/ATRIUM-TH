@@ -140,7 +140,12 @@ case "$INSTALL_PATH" in
     INSTALL_DIR="$HOME"
     ;;
   "~/"*)
-    INSTALL_DIR="$HOME/${INSTALL_PATH#~/}"
+    # `${INSTALL_PATH#~/}` triggers bash tilde expansion on the `~/` pattern
+    # (bash expands `~/` to `$HOME/` before doing the prefix removal), so the
+    # substitution silently fails and INSTALL_DIR ends up as
+    # `$HOME/~/Ailab/atrium` (with a literal `~` directory). Use substring
+    # extraction (`${VAR:2}` = skip 2 chars) to strip `~/` without expansion.
+    INSTALL_DIR="$HOME/${INSTALL_PATH:2}"
     ;;
   *)
     INSTALL_DIR="$INSTALL_PATH"
