@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useRef } from 'react'
 import { motion } from 'framer-motion'
 import { useSelector, client } from '../state/useCompany'
 import { useUI } from '../state/ui'
@@ -42,14 +42,10 @@ export function TaskCard({ task, compact }: { task: Task; compact?: boolean }) {
     task.status === 'revising'
   const cancelled = task.status === 'cancelled'
   const reviewMinutes = task.reviewIntervalMs ? Math.max(1, Math.round(task.reviewIntervalMs / 60_000)) : ''
-  const [reviewDraft, setReviewDraft] = useState(String(reviewMinutes))
-
-  useEffect(() => {
-    setReviewDraft(String(reviewMinutes))
-  }, [reviewMinutes])
+  const reviewInputRef = useRef<HTMLInputElement>(null)
 
   const saveReviewSchedule = () => {
-    const minutes = Number(reviewDraft)
+    const minutes = Number(reviewInputRef.current?.value ?? reviewMinutes)
     void client.updateTaskReviewSchedule(task.id, minutes > 0 ? Math.round(minutes) * 60_000 : null)
   }
 
@@ -162,11 +158,12 @@ export function TaskCard({ task, compact }: { task: Task; compact?: boolean }) {
         >
           <span>ปลุกตรวจทุก</span>
           <input
+            key={`${task.id}:${reviewMinutes}`}
+            ref={reviewInputRef}
             type="number"
             min={0}
             step={1}
-            value={reviewDraft}
-            onChange={(event) => setReviewDraft(event.target.value)}
+            defaultValue={String(reviewMinutes)}
             className="h-7 w-16 rounded-md border bg-transparent px-2 text-[11px] text-[var(--color-cream)] outline-none"
             style={{ borderColor: 'var(--color-line-soft)' }}
           />

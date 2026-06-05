@@ -121,12 +121,12 @@ class RuntimeJobStabilityTest(unittest.IsolatedAsyncioTestCase):
 
                 async def claim_once() -> list[str]:
                     async with sessionmaker() as session:
-                        with mock.patch.object(repo_module, "get_settings", return_value=SimpleNamespace(is_postgres=False)):
-                            claimed = await Repo(session).claim_due_jobs(1000, limit=1)
+                        claimed = await Repo(session).claim_due_jobs(1000, limit=1)
                         await session.commit()
                         return [job.id for job in claimed]
 
-                first, second = await asyncio.gather(claim_once(), claim_once())
+                with mock.patch.object(repo_module, "get_settings", return_value=SimpleNamespace(is_postgres=False)):
+                    first, second = await asyncio.gather(claim_once(), claim_once())
 
                 claimed_ids = first + second
                 self.assertEqual(claimed_ids.count("job_once"), 1)

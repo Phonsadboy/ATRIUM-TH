@@ -1,10 +1,16 @@
-from types import SimpleNamespace
 import io
 import json
 import os
+import sys
 import urllib.error
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
+
+ROOT_DIR = Path(__file__).resolve().parents[2]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
 
 from ops import provider_credentials_enablement as enablement
 

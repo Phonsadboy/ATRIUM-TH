@@ -8,6 +8,7 @@ class StateSnapshotDefaultsTest(unittest.TestCase):
         from app.db import repo as repo_module
 
         settings = Settings()
+        self.assertEqual(settings.state_task_detail_char_limit, 320)
         self.assertEqual(settings.state_task_deliverable_char_limit, 12_000)
 
         task = {
