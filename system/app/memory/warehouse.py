@@ -1,6 +1,7 @@
 """Knowledge warehouse — import with provenance and hybrid retrieval helpers."""
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -18,6 +19,61 @@ def _clip(value: Any, limit: int) -> str:
     return text if len(text) <= limit else text[: max(0, limit - 3)] + "..."
 
 
+def _warehouse_dedupe_key(*, department_id: str, source_kind: str, source_uri: str, text: str) -> str:
+    h = hashlib.sha256()
+    for part in (department_id, source_kind, source_uri, text):
+        h.update(str(part or "").strip().encode("utf-8", errors="ignore"))
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def _warehouse_source_text_match(
+    item: dict[str, Any],
+    *,
+    department_id: str,
+    source_kind: str,
+    source_uri: str,
+    text: str,
+) -> bool:
+    return (
+        str(item.get("departmentId") or "").strip() == str(department_id or "").strip()
+        and str(item.get("sourceKind") or "").strip() == str(source_kind or "").strip()
+        and str(item.get("sourceUri") or "").strip() == str(source_uri or "").strip()
+        and str(item.get("text") or "").strip() == str(text or "").strip()
+    )
+
+
+async def _existing_warehouse_entry(
+    repo: Any,
+    *,
+    department_id: str,
+    entry_id: str,
+    dedupe_key: str,
+    source_kind: str,
+    source_uri: str,
+    text: str,
+) -> dict[str, Any] | None:
+    get_entity = getattr(repo, "get_entity", None)
+    if callable(get_entity):
+        existing = await get_entity("knowledge_warehouse", entry_id)
+        if isinstance(existing, dict):
+            return existing
+    list_entities = getattr(repo, "list_entities", None)
+    if callable(list_entities):
+        for item in await list_entities("knowledge_warehouse", dept=department_id, limit=1000):
+            if not isinstance(item, dict):
+                continue
+            if item.get("dedupeKey") == dedupe_key or _warehouse_source_text_match(
+                item,
+                department_id=department_id,
+                source_kind=source_kind,
+                source_uri=source_uri,
+                text=text,
+            ):
+                return item
+    return None
+
+
 async def import_text_source(
     repo: Any,
     *,
@@ -30,7 +86,24 @@ async def import_text_source(
 ) -> dict[str, Any]:
     settings = get_settings()
     now = now_ms()
-    entry_id = uid("wh")
+    dedupe_key = _warehouse_dedupe_key(
+        department_id=department_id,
+        source_kind=source_kind,
+        source_uri=source_uri,
+        text=text,
+    )
+    entry_id = f"wh_{dedupe_key[:24]}"
+    existing = await _existing_warehouse_entry(
+        repo,
+        department_id=department_id,
+        entry_id=entry_id,
+        dedupe_key=dedupe_key,
+        source_kind=source_kind,
+        source_uri=source_uri,
+        text=text,
+    )
+    if existing:
+        return {**existing, "deduped": True, "duplicateOf": existing.get("id") or entry_id}
     warehouse = {
         "id": entry_id,
         "departmentId": department_id,
@@ -38,6 +111,8 @@ async def import_text_source(
         "text": text,
         "sourceUri": source_uri,
         "sourceKind": source_kind,
+        "dedupeKey": dedupe_key,
+        "textHash": hashlib.sha256(str(text or "").encode("utf-8", errors="ignore")).hexdigest(),
         "tags": tags or [source_kind, f"dept:{department_id}"],
         "importedAt": now,
         "validFrom": now,

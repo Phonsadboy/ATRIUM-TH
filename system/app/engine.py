@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import hashlib
 import json
 import random
@@ -90,16 +91,16 @@ from .handoffs import (
     make_handoff_message,
     normalize_handoff_status,
 )
-from .image_generation import RetryableImageGenerationError, mark_image_generation_job_failed, process_image_generation_job
+from .image_generation import RetryableImageGenerationError, handle_image_generation_worker_timeout, process_image_generation_job
 from .ids import uid
 from .memory.archive import attach_archive_audit
 from .memory.debt import compute_department_knowledge_debt
-from .memory.embeddings import embedding_metadata, resolve_embedder
+from .memory.embeddings import HashEmbedder, embedding_metadata, resolve_embedder
 from .memory.extraction import normalize_compaction_extraction
 from .memory.retrieval import build_retrieval_context
 from .provider.base import LLMMessage, LLMResult, LLMStreamEvent, LLMToolCall
 from .provider.registry import get_provider
-from .scheduling import cadence_interval_ms, repair_trigger_schedule
+from .scheduling import cadence_interval_ms, has_one_shot_at, repair_trigger_schedule
 from .seed import EXEC_ID
 from .task_review import (
     TASK_REVIEW_REMINDER_KIND,
@@ -113,8 +114,10 @@ from .work_visibility import emit_work_status_notice
 
 MAX_ACTIVITY = 80
 MAX_TRIGGER_CATCH_UP_RUNS = 8
+CATCH_UP_RUN_SPACING_MS = 60_000
+_OBJECTIVE_ENQUEUE_LOCK = asyncio.Lock()
 _TRIGGER_ENQUEUE_LOCK = asyncio.Lock()
-DEDICATED_WORKER_JOB_KINDS = {"image_generation", "trigger_run"}
+DEDICATED_WORKER_JOB_KINDS = {"chat_reply", "image_generation", "trigger_run"}
 CHAT_REPLY_DEFER_COLLISION_MS = 750
 BUDGET_NEAR_CAP_RATIO = 0.8
 EXECUTIVE_SUMMARY_INTERVAL_MS = 60 * 60_000
@@ -126,6 +129,93 @@ ENGINE_ERROR_NOTIFY_INTERVAL_MS = 5 * 60_000
 KNOWLEDGE_DEBT_NOTIFY_MIN_DEBT = 5
 DAILY_DIGEST_SAMPLE_LIMIT = 5
 NOTIFICATION_PREFS_ID = "global"
+_MISSING = object()
+
+
+def _merge_task_log_for_engine_save(base: dict[str, Any], proposed: dict[str, Any], current: dict[str, Any]) -> list[Any]:
+    base_log = list(base.get("log") or [])
+    proposed_log = list(proposed.get("log") or [])
+    current_log = list(current.get("log") or [])
+    appended = proposed_log[len(base_log):] if proposed_log[: len(base_log)] == base_log else proposed_log
+    merged = list(current_log)
+    for item in appended:
+        if item not in merged:
+            merged.append(item)
+    return merged
+
+
+def _merge_handoff_list_for_engine_save(base: dict[str, Any], proposed: dict[str, Any], current: dict[str, Any]) -> list[dict[str, Any]]:
+    base_ids = {str(item.get("id") or "") for item in list(base.get("handoffs") or []) if isinstance(item, dict)}
+    merged: list[dict[str, Any]] = [dict(item) for item in list(current.get("handoffs") or []) if isinstance(item, dict)]
+    merged_ids = {str(item.get("id") or "") for item in merged}
+    for item in list(proposed.get("handoffs") or []):
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("id") or "")
+        if item_id and item_id in merged_ids:
+            merged = [dict(item) if str(existing.get("id") or "") == item_id else existing for existing in merged]
+            continue
+        if item_id and item_id not in base_ids:
+            merged.append(dict(item))
+            merged_ids.add(item_id)
+    return merged
+
+
+def _merge_task_list_field(base: dict[str, Any], proposed: dict[str, Any], current: dict[str, Any], key: str) -> list[Any]:
+    base_items = list(base.get(key) or [])
+    proposed_items = list(proposed.get(key) or [])
+    current_items = list(current.get(key) or [])
+    appended = proposed_items[len(base_items):] if proposed_items[: len(base_items)] == base_items else proposed_items
+    merged = list(current_items)
+    for item in appended:
+        if item not in merged:
+            merged.append(item)
+    return merged
+
+
+def _merge_engine_task_update(base: dict[str, Any], proposed: dict[str, Any], current: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(current)
+    for key, value in proposed.items():
+        before = base.get(key, _MISSING)
+        if value == before:
+            continue
+        if key == "log":
+            merged[key] = _merge_task_log_for_engine_save(base, proposed, current)
+        elif key == "handoffs":
+            merged[key] = _merge_handoff_list_for_engine_save(base, proposed, current)
+        elif key in {"deliverables", "subTaskIds", "watchers", "activeSkillIds"}:
+            merged[key] = _merge_task_list_field(base, proposed, current, key)
+        elif key == "status" and str(current.get("status") or "") in TASK_TERMINAL_STATUSES and current.get("status") != before:
+            continue
+        elif key == "progress" and current.get("progress") != before:
+            try:
+                merged[key] = max(float(current.get("progress") or 0), float(value or 0))
+            except (TypeError, ValueError):
+                merged[key] = value
+        elif key == "updatedAt":
+            merged[key] = max(int(value or 0), int(current.get("updatedAt") or 0))
+        else:
+            merged[key] = value
+    return merged
+
+
+async def _save_engine_task_update(repo: Repo, base_task: dict[str, Any] | None, task: dict[str, Any]) -> dict[str, Any]:
+    if not base_task:
+        await repo.save_task(task)
+        return task
+    get_task = getattr(repo, "get_task_fresh", None) or getattr(repo, "get_task", None)
+    if not callable(get_task):
+        await repo.save_task(task)
+        return task
+    current = await get_task(str(task.get("id") or ""))
+    if not current or int(current.get("updatedAt") or 0) <= int(base_task.get("updatedAt") or 0):
+        await repo.save_task(task)
+        return task
+    merged = _merge_engine_task_update(base_task, task, current)
+    await repo.save_task(merged)
+    task.clear()
+    task.update(merged)
+    return task
 NOTIFICATION_TYPES = {
     "approval",
     "budget",
@@ -493,20 +583,38 @@ def _clip_text(text: Any, limit: int = 4000) -> str:
     return s if len(s) <= limit else s[: limit - 1] + "…"
 
 
-def _parse_json_object(text: str) -> dict[str, Any]:
+def _parse_json_object_with_meta(text: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    raw = str(text or "")
+    if not raw.strip():
+        return {}, {"ok": False, "error": "empty", "source": "none"}
     try:
-        parsed = json.loads(text)
-        return parsed if isinstance(parsed, dict) else {}
-    except json.JSONDecodeError:
-        pass
-    match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return parsed, {"ok": True, "source": "full_text"}
+        return {}, {"ok": False, "error": "json_not_object", "source": "full_text", "parsedType": type(parsed).__name__}
+    except json.JSONDecodeError as exc:
+        first_error = {"line": exc.lineno, "column": exc.colno, "message": _clip_text(exc.msg, 180)}
+    match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
     if not match:
-        return {}
+        return {}, {"ok": False, "error": "no_json_object", "source": "none", "firstError": first_error}
     try:
         parsed = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
+    except json.JSONDecodeError as exc:
+        return {}, {
+            "ok": False,
+            "error": "json_decode_error",
+            "source": "object_substring",
+            "firstError": first_error,
+            "substringError": {"line": exc.lineno, "column": exc.colno, "message": _clip_text(exc.msg, 180)},
+        }
+    if not isinstance(parsed, dict):
+        return {}, {"ok": False, "error": "json_not_object", "source": "object_substring", "parsedType": type(parsed).__name__}
+    return parsed, {"ok": True, "source": "object_substring"}
+
+
+def _parse_json_object(text: str) -> dict[str, Any]:
+    parsed, _ = _parse_json_object_with_meta(text)
+    return parsed
 
 
 def _json_list(data: dict[str, Any], key: str) -> list[Any]:
@@ -995,7 +1103,7 @@ async def _complete_runtime_turn(
             pulse = runtime_event_to_hub_pulse(event, thread_id=thread_id, msg_id=stream_msg_id)
             if pulse:
                 hub.pulse(pulse)
-                with contextlib.suppress(Exception):
+                try:
                     from .telegram_gateway import maybe_stream_telegram_progress_event
 
                     await maybe_stream_telegram_progress_event(
@@ -1006,8 +1114,10 @@ async def _complete_runtime_turn(
                         text=str(pulse.get("chunk") or pulse.get("message") or ""),
                         run=pulse.get("run") if isinstance(pulse.get("run"), dict) else None,
                     )
+                except Exception as exc:
+                    await _record_suppressed_engine_error(repo, "telegram_progress.runtime_event", exc, now=now_ms())
         if thread_id:
-            with contextlib.suppress(Exception):
+            try:
                 from .memory.ledger import record_runtime_event_ledger
 
                 async with session_scope() as s:
@@ -1020,6 +1130,8 @@ async def _complete_runtime_turn(
                         source="engine",
                         category=category,
                     )
+            except Exception as exc:
+                await _record_suppressed_engine_error(repo, "runtime_event_ledger", exc, now=now_ms())
 
     async def execute_runtime_tool(call: LLMToolCall) -> dict[str, Any]:
         async with session_scope() as s:
@@ -1213,21 +1325,25 @@ async def _chat_context_tokens_for_turn(
     try:
         provider = get_provider(str(dept.get("providerId") or "claude_code"), get_settings())
         model = str(dept.get("model") or DEFAULT_MODEL)
-        tokens = await asyncio.wait_for(
-            provider.count_context_tokens(
-                system=system,
-                messages=messages,
-                model=model,
-                effort=coerce_thinking_effort(model, str(dept.get("thinkingEffort") or "high")),
-                speed=coerce_model_speed(model, str(dept.get("speed") or "standard")),
-                tools=tools,
-            ),
-            timeout=8.0,
-        )
+        try:
+            tokens = await asyncio.wait_for(
+                provider.count_context_tokens(
+                    system=system,
+                    messages=messages,
+                    model=model,
+                    effort=coerce_thinking_effort(model, str(dept.get("thinkingEffort") or "high")),
+                    speed=coerce_model_speed(model, str(dept.get("speed") or "standard")),
+                    tools=tools,
+                ),
+                timeout=8.0,
+            )
+        except asyncio.TimeoutError:
+            return fallback, "estimate:provider_timeout"
         if tokens > 0:
             return tokens, "provider"
-    except Exception:
-        pass
+        return fallback, "estimate:provider_nonpositive"
+    except Exception as exc:
+        return fallback, f"estimate:provider_error:{type(exc).__name__}"
     return fallback, "estimate"
 
 
@@ -1509,7 +1625,7 @@ async def _complete_engine_chat_with_tools(
                     },
                 }
                 hub.pulse(pulse)
-                with contextlib.suppress(Exception):
+                try:
                     from .telegram_gateway import maybe_stream_telegram_progress_event
 
                     await maybe_stream_telegram_progress_event(
@@ -1519,6 +1635,8 @@ async def _complete_engine_chat_with_tools(
                         event_kind="tool_call",
                         run=pulse["run"],
                     )
+                except Exception as exc:
+                    await _record_suppressed_engine_error(repo, "telegram_progress.tool_call", exc, now=now_ms())
             async with session_scope() as s:
                 record = await run_chat_tool(
                     Repo(s),
@@ -1536,7 +1654,7 @@ async def _complete_engine_chat_with_tools(
                     "run": record,
                 }
                 hub.pulse(pulse)
-                with contextlib.suppress(Exception):
+                try:
                     from .telegram_gateway import maybe_stream_telegram_progress_event
 
                     await maybe_stream_telegram_progress_event(
@@ -1546,6 +1664,8 @@ async def _complete_engine_chat_with_tools(
                         event_kind="tool_result",
                         run=record,
                     )
+                except Exception as exc:
+                    await _record_suppressed_engine_error(repo, "telegram_progress.tool_result", exc, now=now_ms())
         tool_runs.extend(round_records)
         messages.append(tool_result_message(round_records))
 
@@ -1611,6 +1731,155 @@ async def _maybe_enqueue_chat_compaction(
 
 def _chat_reply_finished_state(dept: dict[str, Any]) -> str:
     return "working" if dept.get("currentTaskId") else "idle"
+
+
+async def _record_suppressed_engine_error(repo: Repo, label: str, exc: Exception, *, now: int | None = None) -> None:
+    with contextlib.suppress(Exception):
+        await repo.add_activity(_activity(
+            f"engine side-effect error [{label}]: {type(exc).__name__}: {_clip_text(str(exc), 500)}",
+            type_="system",
+            severity="warn",
+            ts=now or now_ms(),
+        ))
+
+
+async def _mark_chat_reply_timeout(repo: Repo, payload: dict[str, Any], *, timeout_s: float, now: int) -> None:
+    thread_id = str(payload.get("threadId") or "")
+    reply_message_id = str(payload.get("replyMessageId") or "")
+    user_message_id = str(payload.get("userMessageId") or "")
+    if not thread_id or not reply_message_id:
+        return
+    existing = None
+    with contextlib.suppress(Exception):
+        existing = await repo.get_message(reply_message_id, thread_id=thread_id)
+    if not existing:
+        with contextlib.suppress(Exception):
+            messages = await repo.thread_messages(thread_id, limit=50)
+            existing = next((msg for msg in messages if msg.get("id") == reply_message_id), None)
+    detail = f"chat_reply job exceeded {timeout_s:g}s"
+    fallback_text = "การตอบแชตหมดเวลา ระบบปิดสถานะกำลังตอบแล้ว สามารถสั่งให้ลองใหม่ได้"
+    if existing:
+        text = str(existing.get("text") or "").strip() or fallback_text
+        reply = {
+            **existing,
+            "text": text,
+            "pending": False,
+            "status": "failed",
+            "error": {"code": "chat_reply_timeout", "detail": detail, "retryable": True},
+        }
+        await repo.update_message(reply)
+    else:
+        reply = {
+            "id": reply_message_id,
+            "threadId": thread_id,
+            "role": "agent",
+            "authorName": str(payload.get("departmentName") or payload.get("agentName") or "AI"),
+            "text": fallback_text,
+            "ts": int(payload.get("replyTs") or now),
+            "pending": False,
+            "status": "failed",
+            "replyToMessageId": user_message_id or None,
+            "error": {"code": "chat_reply_timeout", "detail": detail, "retryable": True},
+        }
+        await repo.add_message(reply)
+    hub.pulse({
+        "kind": "msg_done",
+        "threadId": thread_id,
+        "msgId": reply_message_id,
+        "text": reply.get("text") or "",
+        "error": "chat_reply_timeout",
+    })
+
+
+def _job_timeout_retry_delay_ms(settings: Settings | None = None) -> int:
+    settings = settings or get_settings()
+    try:
+        delay_s = float(getattr(settings, "engine_timeout_retry_delay_s", 60.0) or 60.0)
+    except (TypeError, ValueError):
+        delay_s = 60.0
+    return int(max(1.0, delay_s) * 1000)
+
+
+async def _record_job_timeout_recovery(
+    repo: Repo,
+    job: Any,
+    *,
+    timeout_s: float,
+    now: int,
+    action: str,
+    retry_delay_ms: int | None = None,
+) -> None:
+    job_id = str(getattr(job, "id", "") or "")
+    kind = str(getattr(job, "kind", "") or "")
+    payload = dict(getattr(job, "payload", None) or {})
+    safe_payload_keys = (
+        "departmentId",
+        "threadId",
+        "taskId",
+        "runId",
+        "replyMessageId",
+        "userMessageId",
+        "objectiveId",
+        "triggerId",
+    )
+    safe_payload = {
+        key: payload.get(key)
+        for key in safe_payload_keys
+        if payload.get(key) is not None
+    }
+    recovery_id = f"job_timeout_{job_id}_{now}" if job_id else uid("job_timeout")
+    record = {
+        "id": recovery_id,
+        "jobId": job_id,
+        "kind": kind,
+        "action": action,
+        "jobStatusAfter": "queued" if action == "requeue" else "failed",
+        "timeoutS": timeout_s,
+        "retryDelayMs": retry_delay_ms,
+        "payload": safe_payload,
+        "visibilityOnly": False,
+        "fullAutonomyPreserved": True,
+        "ts": now,
+    }
+    with contextlib.suppress(Exception):
+        await repo.put_entity("job_timeout_recovery", record, status=action, ts=now)
+    with contextlib.suppress(Exception):
+        detail = (
+            f"requeued after {int(retry_delay_ms or 0)}ms"
+            if action == "requeue"
+            else "closed chat reply and marked failed"
+        )
+        await repo.add_activity(_activity(
+            f"job timeout recovery: {kind or 'job'} {job_id or '(unknown)'} exceeded {timeout_s:g}s; {detail}",
+            type_="system",
+            severity="warn",
+            ts=now,
+        ))
+
+
+async def _handle_job_timeout(
+    repo: Repo,
+    job: Any,
+    *,
+    timeout_s: float,
+    now: int,
+    settings: Settings | None = None,
+) -> dict[str, Any]:
+    kind = str(getattr(job, "kind", "") or "")
+    if kind == "chat_reply":
+        await _mark_chat_reply_timeout(repo, dict(getattr(job, "payload", None) or {}), timeout_s=timeout_s, now=now)
+        await _record_job_timeout_recovery(repo, job, timeout_s=timeout_s, now=now, action="fail")
+        return {"action": "fail", "retryDelayMs": None}
+    retry_delay_ms = _job_timeout_retry_delay_ms(settings)
+    await _record_job_timeout_recovery(
+        repo,
+        job,
+        timeout_s=timeout_s,
+        now=now,
+        action="requeue",
+        retry_delay_ms=retry_delay_ms,
+    )
+    return {"action": "requeue", "retryDelayMs": retry_delay_ms}
 
 
 async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int) -> None:
@@ -1852,7 +2121,7 @@ async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int)
 
     async def handle_chat_stream_event(event: LLMStreamEvent) -> None:
         await sink.handle(event)
-        with contextlib.suppress(Exception):
+        try:
             from .telegram_gateway import maybe_stream_telegram_progress_event
 
             await maybe_stream_telegram_progress_event(
@@ -1863,8 +2132,10 @@ async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int)
                 text=event.text,
                 reply=sink.message,
             )
+        except Exception as exc:
+            await _record_suppressed_engine_error(repo, "telegram_progress.chat_stream", exc, now=now_ms())
 
-    with contextlib.suppress(Exception):
+    try:
         from .telegram_gateway import maybe_stream_telegram_progress_event
 
         await maybe_stream_telegram_progress_event(
@@ -1874,6 +2145,8 @@ async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int)
             event_kind="thinking_delta",
             reply=sink.message,
         )
+    except Exception as exc:
+        await _record_suppressed_engine_error(repo, "telegram_progress.initial_thinking", exc, now=now_ms())
 
     stopped = False
     stream_error: str | None = None
@@ -2119,6 +2392,24 @@ def _cadence_ms(cadence: str) -> int:
     return cadence_interval_ms(cadence, DAY_MS) or DAY_MS
 
 
+def _due_run_after(now: int, *, batch_index: int, batch_size: int) -> int:
+    if batch_size <= 1:
+        return now
+    return now + max(0, int(batch_index)) * CATCH_UP_RUN_SPACING_MS
+
+
+def _scheduled_task_id(kind: str, *, source_id: Any, dept_id: Any, scheduled_for: int, event: Any = None) -> str:
+    identity = {
+        "kind": str(kind or ""),
+        "sourceId": str(source_id or ""),
+        "departmentId": str(dept_id or ""),
+        "scheduledFor": int(scheduled_for or 0),
+        "event": str(event or ""),
+    }
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:24]
+    return f"task_sched_{digest}"
+
+
 def _open_task_for(dept_id: str, tasks: list[dict[str, Any]]) -> dict[str, Any] | None:
     for task in tasks:
         if task.get("departmentId") == dept_id and task.get("status") in {"assigned", "backlog", "revising"}:
@@ -2198,6 +2489,7 @@ def _clear_blocked_retry_guard(task: dict[str, Any]) -> None:
 
 def _make_task(
     *,
+    task_id: str | None = None,
     title: str,
     detail: str,
     dept_id: str,
@@ -2208,7 +2500,7 @@ def _make_task(
     handoffs: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     return {
-        "id": uid("task"),
+        "id": task_id or uid("task"),
         "title": title[:80],
         "detail": detail,
         "status": "assigned",
@@ -2283,39 +2575,40 @@ async def _accrue(repo: Repo, dept: dict[str, Any], category: str, amount: float
 
 
 async def _enqueue_due_objectives(repo: Repo, now: int) -> int:
-    count = 0
-    objectives = await repo.list_objectives()
-    for obj in objectives:
-        if not obj.get("enabled") or not obj.get("nextRunAt") or obj["nextRunAt"] > now:
-            continue
-        cadence = _cadence_ms(obj.get("cadence", ""))
-        scheduled_for = int(obj["nextRunAt"])
-        due_runs: list[int] = []
-        while scheduled_for <= now and len(due_runs) < MAX_TRIGGER_CATCH_UP_RUNS:
-            due_runs.append(scheduled_for)
-            scheduled_for += cadence
-        if not due_runs:
-            continue
-        for run_at in due_runs:
-            await repo.enqueue(
-                uid("job"),
-                "objective_run",
-                {
-                    "objectiveId": obj["id"],
-                    "title": obj["title"],
-                    "departmentId": obj["departmentId"],
-                    "cadence": obj.get("cadence", ""),
-                    "scheduledFor": run_at,
-                    "catchUp": run_at < now,
-                },
-                now,
-                priority=4,
-            )
-        obj["lastRunAt"] = due_runs[-1]
-        obj["nextRunAt"] = due_runs[-1] + cadence
-        await repo.save_objective(obj)
-        count += len(due_runs)
-    return count
+    async with _OBJECTIVE_ENQUEUE_LOCK:
+        count = 0
+        objectives = await repo.list_objectives()
+        for obj in objectives:
+            if not obj.get("enabled") or not obj.get("nextRunAt") or obj["nextRunAt"] > now:
+                continue
+            cadence = _cadence_ms(obj.get("cadence", ""))
+            scheduled_for = int(obj["nextRunAt"])
+            due_runs: list[int] = []
+            while scheduled_for <= now and len(due_runs) < MAX_TRIGGER_CATCH_UP_RUNS:
+                due_runs.append(scheduled_for)
+                scheduled_for += cadence
+            if not due_runs:
+                continue
+            for index, run_at in enumerate(due_runs):
+                await repo.enqueue(
+                    uid("job"),
+                    "objective_run",
+                    {
+                        "objectiveId": obj["id"],
+                        "title": obj["title"],
+                        "departmentId": obj["departmentId"],
+                        "cadence": obj.get("cadence", ""),
+                        "scheduledFor": run_at,
+                        "catchUp": run_at < now,
+                    },
+                    _due_run_after(now, batch_index=index, batch_size=len(due_runs)),
+                    priority=4,
+                )
+            obj["lastRunAt"] = due_runs[-1]
+            obj["nextRunAt"] = due_runs[-1] + cadence
+            await repo.save_objective(obj)
+            count += len(due_runs)
+        return count
 
 
 async def _trigger_targets(repo: Repo, target: str | None) -> list[dict[str, Any]]:
@@ -2427,7 +2720,7 @@ async def _enqueue_due_triggers(repo: Repo, now: int) -> int:
                     await repo.put_entity("trigger", trigger, status=trigger.get("kind"), ts=now)
                 next_run = trigger.get("nextRunAt")
                 if next_run is not None and int(next_run) <= now:
-                    if trigger.get("oneShotAt"):
+                    if has_one_shot_at(trigger.get("oneShotAt")):
                         due_runs = [int(next_run)]
                     else:
                         cadence = _cadence_ms(trigger.get("cadence") or "")
@@ -2440,7 +2733,7 @@ async def _enqueue_due_triggers(repo: Repo, now: int) -> int:
                     due_runs = [now]
             if not due_runs:
                 continue
-            for scheduled_for in due_runs:
+            for index, scheduled_for in enumerate(due_runs):
                 await repo.enqueue(
                     uid("job"),
                     "trigger_run",
@@ -2454,11 +2747,11 @@ async def _enqueue_due_triggers(repo: Repo, now: int) -> int:
                         "scheduledFor": scheduled_for,
                         "catchUp": bool(trigger.get("kind") == "cron" and scheduled_for < now),
                     },
-                    now,
+                    _due_run_after(now, batch_index=index, batch_size=len(due_runs)),
                     priority=3,
                 )
             trigger["lastRunAt"] = due_runs[-1]
-            if trigger.get("kind") == "cron" and trigger.get("oneShotAt"):
+            if trigger.get("kind") == "cron" and has_one_shot_at(trigger.get("oneShotAt")):
                 trigger["enabled"] = False
                 trigger["nextRunAt"] = None
             elif trigger.get("kind") == "cron":
@@ -2539,6 +2832,36 @@ async def _process_task_review_reminder_job(repo: Repo, payload: dict[str, Any],
     hub.pulse({"kind": "state", "departmentId": dept["id"], "taskId": task_id})
 
 
+async def _rescan_task_review_reminders(repo: Repo, now: int) -> int:
+    tasks = await repo.list_active_tasks(limit=1000)
+    active_jobs = await repo.active_jobs(limit=5000)
+    active_reminders = {
+        (
+            str((job.get("payload") or {}).get("taskId") or ""),
+            str((job.get("payload") or {}).get("reviewScheduleToken") or ""),
+        )
+        for job in active_jobs
+        if job.get("kind") == TASK_REVIEW_REMINDER_KIND and job.get("status") in {"queued", "running"}
+    }
+    enqueued = 0
+    for task in tasks:
+        if task.get("status") in TASK_TERMINAL_STATUSES:
+            continue
+        interval = normalize_review_interval_ms(task.get("reviewIntervalMs"))
+        token = str(task.get("reviewScheduleToken") or "").strip()
+        next_review_at = int(task.get("nextReviewAt") or 0)
+        if not interval or not token or next_review_at <= 0:
+            continue
+        key = (str(task.get("id") or ""), token)
+        if key in active_reminders:
+            continue
+        job_id = await enqueue_task_review_reminder(repo, task, now=now)
+        if job_id:
+            active_reminders.add(key)
+            enqueued += 1
+    return enqueued
+
+
 async def _process_due_job(repo: Repo, job, now: int) -> None:
     if job.kind == "objective_run":
         payload = job.payload or {}
@@ -2551,7 +2874,16 @@ async def _process_due_job(repo: Repo, job, now: int) -> None:
         if dept:
             scheduled_for = int(payload.get("scheduledFor") or now)
             catch_up = bool(payload.get("catchUp"))
+            task_id = _scheduled_task_id(
+                "objective_run",
+                source_id=payload.get("objectiveId"),
+                dept_id=dept["id"],
+                scheduled_for=scheduled_for,
+            )
+            if await repo.get_task(task_id):
+                return
             task = _make_task(
+                task_id=task_id,
                 title=payload.get("title", "งานตาม objective"),
                 detail=(
                     f"งานประจำจาก objective: {payload.get('cadence', '')}"
@@ -2565,6 +2897,7 @@ async def _process_due_job(repo: Repo, job, now: int) -> None:
                 log=[
                     "scheduler สร้างงานจาก objective",
                     f"objective scheduledFor={scheduled_for}",
+                    f"objective idempotencyKey={task_id}",
                     "objective catch-up run" if catch_up else "objective on-time run",
                 ],
             )
@@ -2604,6 +2937,15 @@ async def _process_due_job(repo: Repo, job, now: int) -> None:
                 continue
             scheduled_for = int(payload.get("scheduledFor") or now)
             catch_up = bool(payload.get("catchUp"))
+            task_id = _scheduled_task_id(
+                "trigger_run",
+                source_id=payload.get("triggerId"),
+                dept_id=dept["id"],
+                scheduled_for=scheduled_for,
+                event=event,
+            )
+            if await repo.get_task(task_id):
+                continue
             observed_detail = (
                 f"\nobservedTarget={payload.get('target')}"
                 + (f"\nobservedDepartments={','.join(observed_ids)}" if observed_ids else "")
@@ -2611,6 +2953,7 @@ async def _process_due_job(repo: Repo, job, now: int) -> None:
             task_log = [
                 "scheduler สร้างงานจาก trigger",
                 f"trigger scheduledFor={scheduled_for}",
+                f"trigger idempotencyKey={task_id}",
                 "trigger catch-up run" if catch_up else "trigger on-time run",
             ]
             if payload.get("kind") == "event":
@@ -2620,6 +2963,7 @@ async def _process_due_job(repo: Repo, job, now: int) -> None:
                     else "event trigger assigned target"
                 )
             task = _make_task(
+                task_id=task_id,
                 title=payload.get("title", "งานจาก trigger"),
                 detail=(
                     f"งานจาก trigger {payload.get('triggerId')}"
@@ -2707,6 +3051,10 @@ async def _process_due_job(repo: Repo, job, now: int) -> None:
         from .telegram_gateway import process_telegram_outbound_job
 
         await process_telegram_outbound_job(repo, job.payload or {}, now)
+    elif job.kind == "telegram_update":
+        from .telegram_gateway import process_telegram_update_job
+
+        await process_telegram_update_job(repo, job.payload or {}, now)
     elif job.kind == "telegram_progress":
         from .telegram_gateway import process_telegram_progress_job
 
@@ -2826,7 +3174,18 @@ async def _process_claimed_job_record(job: SimpleNamespace, settings: Settings |
         except _RetryJobLater as exc:
             await repo.mark_job(job.id, "queued", error=exc.reason, run_after=now_ms() + exc.delay_ms)
         except asyncio.TimeoutError:
-            await repo.mark_job(job.id, "failed", error=f"TimeoutError: job exceeded {timeout_s:g}s")
+            timeout_now = now_ms()
+            recovery = await _handle_job_timeout(repo, job, timeout_s=timeout_s, now=timeout_now, settings=settings)
+            error = f"TimeoutError: job exceeded {timeout_s:g}s"
+            if recovery.get("action") == "requeue":
+                await repo.mark_job(
+                    job.id,
+                    "queued",
+                    error=error,
+                    run_after=timeout_now + int(recovery.get("retryDelayMs") or 0),
+                )
+            else:
+                await repo.mark_job(job.id, "failed", error=error)
         except Exception as exc:  # pragma: no cover - defensive runtime path
             await repo.mark_job(job.id, "failed", error=f"{type(exc).__name__}: {exc}")
     return 0
@@ -2898,10 +3257,59 @@ async def _process_due_jobs(
         except _RetryJobLater as exc:
             await repo.mark_job(job.id, "queued", error=exc.reason, run_after=now_ms() + exc.delay_ms)
         except asyncio.TimeoutError:
-            await repo.mark_job(job.id, "failed", error=f"TimeoutError: job exceeded {timeout_s:g}s")
+            timeout_now = now_ms()
+            recovery = await _handle_job_timeout(repo, job, timeout_s=timeout_s, now=timeout_now, settings=settings)
+            error = f"TimeoutError: job exceeded {timeout_s:g}s"
+            if recovery.get("action") == "requeue":
+                await repo.mark_job(
+                    job.id,
+                    "queued",
+                    error=error,
+                    run_after=timeout_now + int(recovery.get("retryDelayMs") or 0),
+                )
+            else:
+                await repo.mark_job(job.id, "failed", error=error)
         except Exception as exc:  # pragma: no cover - defensive runtime path
             await repo.mark_job(job.id, "failed", error=f"{type(exc).__name__}: {exc}")
     return processed
+
+
+def _job_reaper_stale_after_ms(settings: Settings) -> int:
+    windows = [
+        float(getattr(settings, "engine_stale_after_s", 0) or 0),
+        float(getattr(settings, "engine_job_timeout_s", 0) or 0),
+    ]
+    image_timeout = getattr(settings, "image_generation_timeout_s", None)
+    if isinstance(image_timeout, (int, float)) and image_timeout > 0:
+        windows.append(float(image_timeout))
+    return int(max(1.0, *windows) * 1000)
+
+
+def _job_reaper_excluded_kinds(settings: Settings) -> set[str]:
+    image_timeout = getattr(settings, "image_generation_timeout_s", None)
+    if image_timeout is None or image_timeout <= 0:
+        return {"image_generation"}
+    return set()
+
+
+async def _requeue_stale_running_jobs(repo: Repo, now: int, settings: Settings) -> int:
+    requeue = getattr(repo, "requeue_stale_running_jobs", None)
+    if not callable(requeue):
+        return 0
+    rows = await requeue(
+        now,
+        stale_after_ms=_job_reaper_stale_after_ms(settings),
+        exclude_kinds=_job_reaper_excluded_kinds(settings),
+    )
+    if rows:
+        ev = _activity(
+            f"Requeued {len(rows)} stale running job(s)",
+            type_="system",
+            severity="warning",
+        )
+        ev["jobs"] = rows[:20]
+        await repo.add_activity(ev)
+    return len(rows)
 
 
 async def run_chat_reply_loop(settings: Settings | None = None) -> None:
@@ -2933,6 +3341,13 @@ async def run_chat_reply_loop(settings: Settings | None = None) -> None:
                     # Explicit chat replies should not freeze just because the
                     # autonomous company engine is paused from the UI.
                     processed = finished
+                    processed += await _process_due_jobs(
+                        repo,
+                        now_ms(),
+                        settings,
+                        kind="telegram_update",
+                        limit=6,
+                    )
                     processed += await _process_due_jobs(
                         repo,
                         now_ms(),
@@ -2993,8 +3408,12 @@ async def _process_claimed_image_generation_record(job: SimpleNamespace, setting
         except asyncio.TimeoutError:
             label = "unbounded" if timeout_s is None else f"{timeout_s:g}s"
             error = f"TimeoutError: image job exceeded {label}"
-            await mark_image_generation_job_failed(repo, job.payload or {}, error)
-            await repo.mark_job(job.id, "failed", error=error)
+            timeout_result = await handle_image_generation_worker_timeout(repo, job.payload or {}, error)
+            if timeout_result.get("status") == "retry_queued":
+                delay_ms = int(timeout_result.get("delayMs") or 1)
+                await repo.mark_job(job.id, "queued", error=error, run_after=now_ms() + delay_ms)
+            else:
+                await repo.mark_job(job.id, "failed", error=error)
         except Exception as exc:  # pragma: no cover - defensive runtime path
             await repo.mark_job(job.id, "failed", error=f"{type(exc).__name__}: {exc}")
     return 0
@@ -3062,6 +3481,38 @@ def _format_transcript(messages: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+async def _embed_compaction_knowledge(texts: list[str]) -> tuple[Any, list[list[float]], dict[str, Any] | None]:
+    settings = get_settings()
+    primary = None
+    last_exc: Exception | None = None
+    try:
+        primary = await resolve_embedder(settings)
+        for attempt in range(2):
+            try:
+                vecs = await primary.embed(texts)
+                if len(vecs) != len(texts):
+                    raise ValueError(f"embedder returned {len(vecs)} vectors for {len(texts)} texts")
+                return primary, vecs, None
+            except Exception as exc:
+                last_exc = exc
+                if attempt == 0:
+                    await asyncio.sleep(0.2)
+    except Exception as exc:
+        last_exc = exc
+
+    fallback = HashEmbedder(max(1, int(getattr(settings, "embedding_dim", 256) or 256)))
+    vecs = await fallback.embed(texts)
+    primary_name = str(getattr(primary, "name", "") or type(primary).__name__ or "unknown")
+    return fallback, vecs, {
+        "status": "fallback",
+        "primaryProvider": primary_name,
+        "fallbackProvider": fallback.name,
+        "attempts": 2 if primary is not None else 0,
+        "errorType": type(last_exc).__name__ if last_exc else "UnknownError",
+        "error": _clip_text(str(last_exc or "embedding failed"), 500),
+    }
+
+
 async def _compact_department(
     repo: Repo,
     dept: dict[str, Any],
@@ -3101,7 +3552,7 @@ async def _compact_department(
         now=now,
         input_tokens=9000 if transcript else 3500,
     )
-    data = _parse_json_object(result.text) if result else {}
+    data, json_parse = _parse_json_object_with_meta(result.text) if result else ({}, {"ok": False, "error": "no_result", "source": "none"})
     archive_summary = _clip_text(
         data.get("archiveSummary"),
         1600,
@@ -3119,19 +3570,9 @@ async def _compact_department(
         "threadId": thread_id,
         "messageCount": len(messages) if messages else None,
         "transcript": transcript[:60000] if transcript else None,
+        **({"jsonParse": json_parse} if not json_parse.get("ok") else {}),
     }
     archive = attach_archive_audit(archive, department_id=dept["id"], source="compact")
-    await repo.add_archive(dept["id"], archive)
-    from .memory.ledger import record_compaction_ledger
-
-    await record_compaction_ledger(
-        repo,
-        department_id=dept["id"],
-        thread_id=thread_id,
-        archive_id=archive["id"],
-        transcript=archive.get("transcript"),
-        summary=archive_summary,
-    )
     extracted = normalize_compaction_extraction(
         data,
         department_id=dept["id"],
@@ -3143,9 +3584,24 @@ async def _compact_department(
         fallback_text=f"ฝ่าย{dept['name']}ควรแนบบริบทและเกณฑ์รับงานให้ชัดก่อนส่งต่อ เพื่อให้ทีมอื่นรับช่วงได้ทันที",
     )
     knowledge_items = extracted["knowledge"]
-    embedder = await resolve_embedder()
-    vecs = await embedder.embed([k["text"] for k in knowledge_items])
+    embedder, vecs, embedding_fallback = await _embed_compaction_knowledge([k["text"] for k in knowledge_items])
+    if embedding_fallback:
+        archive["embeddingFallback"] = embedding_fallback
+    await repo.add_archive(dept["id"], archive)
+    from .memory.ledger import record_compaction_ledger
+
+    await record_compaction_ledger(
+        repo,
+        department_id=dept["id"],
+        thread_id=thread_id,
+        archive_id=archive["id"],
+        transcript=archive.get("transcript"),
+        summary=archive_summary,
+    )
     for idx, knowledge in enumerate(knowledge_items):
+        if embedding_fallback:
+            tags = [str(tag) for tag in knowledge.get("tags", []) if str(tag).strip()]
+            knowledge = {**knowledge, "tags": [*tags, "embedding:fallback"]}
         vector = vecs[idx] if idx < len(vecs) else None
         await repo.add_knowledge(
             dept["id"],
@@ -3202,6 +3658,18 @@ async def _compact_department(
         severity="good",
         ts=now,
     ))
+    if embedding_fallback:
+        await repo.add_activity(_activity(
+            (
+                "บีบอัดความจำใช้ embedding fallback "
+                f"{embedding_fallback.get('fallbackProvider')} หลัง "
+                f"{embedding_fallback.get('primaryProvider')} ล้มเหลว ({embedding_fallback.get('errorType')})"
+            ),
+            type_="compaction",
+            department_id=dept["id"],
+            severity="warn",
+            ts=now,
+        ))
     hub.pulse({
         "kind": "compaction",
         "departmentId": dept["id"],
@@ -3210,6 +3678,7 @@ async def _compact_department(
         "messageCount": archive["messageCount"],
         "tokensSaved": saved,
         "knowledgeCount": len(knowledge_items),
+        "embeddingFallback": embedding_fallback,
         "graphNodes": graph_nodes,
         "graphEdges": graph_edges,
     })
@@ -5046,9 +5515,10 @@ async def _llm_work_step(
         )
     if not result:
         return None
-    data = _parse_json_object(result.text)
+    data, json_parse = _parse_json_object_with_meta(result.text)
     if not data:
         data = {"log": result.text, "status": "in_progress", "progressDelta": 0.12}
+        data["_jsonParse"] = json_parse
     data["_rawText"] = result.text
     data["_skillIds"] = skill_ids
     if next_context_paging is not None:
@@ -5111,9 +5581,10 @@ async def _llm_review_task(
         )
     if not result:
         return None
-    data = _parse_json_object(result.text)
+    data, json_parse = _parse_json_object_with_meta(result.text)
     if not data:
         data = {"approved": True, "deliverableMarkdown": result.text}
+        data["_jsonParse"] = json_parse
     data["_rawText"] = result.text
     if next_context_paging is not None:
         data["_contextPaging"] = next_context_paging
@@ -5204,9 +5675,10 @@ async def _llm_autonomous_task(
         )
     if not result:
         return None
-    data = _parse_json_object(result.text)
+    data, json_parse = _parse_json_object_with_meta(result.text)
     if not data:
         data = {"title": _clip_text(result.text, 80), "detail": result.text, "priority": "low"}
+        data["_jsonParse"] = json_parse
     data["_rawText"] = result.text
     return data
 
@@ -5451,6 +5923,7 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
     changed = False
     state = dept.get("state")
     task = _task_by_id(tasks, dept.get("currentTaskId"))
+    base_task = copy.deepcopy(task) if task else None
 
     if state == "working":
         if not task:
@@ -5507,7 +5980,7 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
                 )
             dept["state"] = "blocked"
             dept["mood"] = min(float(dept.get("mood", 0.6)), 0.35)
-            await repo.save_task(task)
+            await _save_engine_task_update(repo, base_task, task)
             await repo.save_department(dept)
             await repo.add_activity(_activity(
                 f"“{task['title']}” ติดบล็อก: {log_line}",
@@ -5546,7 +6019,7 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
                     trigger=BLOCKED_RETRY_GUARD_REASON,
                     suggested_action="manual_owner_input_required",
                 )
-                await repo.save_task(task)
+                await _save_engine_task_update(repo, base_task, task)
                 await repo.add_activity(_activity(
                     f"หยุด retry อัตโนมัติของงาน “{task['title']}” เพราะ blocked ซ้ำครบ {repeat_count} รอบ",
                     type_="state_change",
@@ -5570,7 +6043,7 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
             return True
         _clear_blocked_retry_guard(task)
         task["status"] = "review" if task["progress"] >= 1 or status == "review" else "in_progress"
-        await repo.save_task(task)
+        await _save_engine_task_update(repo, base_task, task)
         if task["status"] == "review":
             dept["state"] = "review"
             await repo.add_activity(_activity(f"“{task['title']}” พร้อมตรวจแล้ว", type_="task_progress", department_id=dept["id"], ts=now))
@@ -5630,7 +6103,7 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
                 task["updatedAt"] = now
                 task["log"] = [*task.get("log", []), f"review ไม่ผ่าน: {note}"]
                 dept["state"] = "working"
-                await repo.save_task(task)
+                await _save_engine_task_update(repo, base_task, task)
                 await repo.save_department(dept)
                 revision_count = sum(1 for line in task.get("log", []) if "review ไม่ผ่าน" in str(line))
                 from .eval.scoring import record_task_outcome
@@ -5761,7 +6234,7 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
                 )
                 if task.get("status") == "blocked":
                     dept["state"] = "blocked"
-                await repo.save_task(task)
+                await _save_engine_task_update(repo, base_task, task)
                 await repo.save_department(dept)
                 await repo.add_activity(_activity(
                     f"หยุด retry อัตโนมัติของงาน “{task['title']}” เพราะ blocked ซ้ำครบ {repeat_count} รอบ",
@@ -5820,7 +6293,7 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
         task["log"] = [*task.get("log", []), "resume จาก currentTaskId หลัง state idle"]
         dept["state"] = "working"
         dept["currentTaskId"] = task["id"]
-        await repo.save_task(task)
+        await _save_engine_task_update(repo, base_task, task)
         await repo.save_department(dept)
         await repo.add_activity(_activity(
             f"{dept['agentName']} กลับมาทำงาน “{task['title']}” จาก current task",
@@ -5843,13 +6316,14 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
 
     open_task = _open_task_for(dept["id"], tasks)
     if open_task:
+        base_open_task = copy.deepcopy(open_task)
         _clear_blocked_retry_guard(open_task)
         open_task["status"] = "in_progress"
         open_task["updatedAt"] = now
         open_task["log"] = [*open_task.get("log", []), "เริ่มลงมือ"]
         dept["currentTaskId"] = open_task["id"]
         dept["state"] = "working"
-        await repo.save_task(open_task)
+        await _save_engine_task_update(repo, base_open_task, open_task)
         await repo.save_department(dept)
         await repo.add_activity(_activity(
             f"{dept['agentName']} เริ่มงาน “{open_task['title']}”",
@@ -6091,6 +6565,8 @@ async def run_engine_tick(
     stats = {
         "objectiveJobs": 0,
         "triggerJobs": 0,
+        "taskReviewJobs": 0,
+        "requeuedStaleJobs": 0,
         "jobs": 0,
         "departments": 0,
         "handoffReconciliations": 0,
@@ -6114,9 +6590,19 @@ async def run_engine_tick(
             stats["objectiveJobs"] = await _enqueue_due_objectives(repo, now)
             _set_engine_phase("enqueue_triggers")
             stats["triggerJobs"] = await _enqueue_due_triggers(repo, now)
+            _set_engine_phase("rescan_task_review_reminders")
+            stats["taskReviewJobs"] = await _rescan_task_review_reminders(repo, now)
+            _set_engine_phase("requeue_stale_jobs")
+            stats["requeuedStaleJobs"] = await _requeue_stale_running_jobs(repo, now, settings)
             _set_engine_phase("process_due_jobs")
             stats["jobs"] = await _process_due_jobs(repo, now, settings)
-            changed = changed or bool(stats["objectiveJobs"] or stats["triggerJobs"] or stats["jobs"])
+            changed = changed or bool(
+                stats["objectiveJobs"]
+                or stats["triggerJobs"]
+                or stats["taskReviewJobs"]
+                or stats["requeuedStaleJobs"]
+                or stats["jobs"]
+            )
 
             departments = await repo.list_departments()
             _set_engine_phase("handoff_reconciler")

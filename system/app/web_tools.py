@@ -245,6 +245,73 @@ def _ip_is_private(value: str) -> bool:
     )
 
 
+def _resolve_host_addresses(host: str) -> tuple[list[str], str | None]:
+    try:
+        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        return [], str(exc)
+    addresses: list[str] = []
+    for info in infos:
+        address = str(info[4][0])
+        if address not in addresses:
+            addresses.append(address)
+    return addresses, None
+
+
+def _url_network_audit(raw_url: str, *, allow_private_hosts: bool) -> dict[str, Any]:
+    parsed = urllib.parse.urlparse(str(raw_url or ""))
+    host = parsed.hostname or ""
+    resolved_addresses: list[str] = []
+    resolve_error: str | None = None
+    if host:
+        resolved_addresses, resolve_error = _resolve_host_addresses(host)
+    private_host_name = _is_blocked_host_name(host) if host else False
+    private_ip_literal = _ip_is_private(host) if host else False
+    private_resolved = [address for address in resolved_addresses if _ip_is_private(address)]
+    private_network = bool(private_host_name or private_ip_literal or private_resolved)
+    out: dict[str, Any] = {
+        "url": urllib.parse.urlunparse(parsed),
+        "host": host,
+        "scheme": parsed.scheme,
+        "allowPrivateHosts": bool(allow_private_hosts),
+        "privateNetwork": private_network,
+        "privateHostName": private_host_name,
+        "privateIpLiteral": private_ip_literal,
+        "resolvedAddresses": resolved_addresses,
+        "resolvedPrivateAddresses": private_resolved,
+        "privateAccessAllowed": bool(allow_private_hosts and private_network),
+        "visibilityOnly": True,
+    }
+    if resolve_error:
+        out["resolveError"] = resolve_error
+    if private_network:
+        out["warning"] = "private/localhost/metadata-capable URL fetched because allowPrivateHosts=true" if allow_private_hosts else "private/localhost/metadata-capable URL would be blocked without allowPrivateHosts"
+    return out
+
+
+def _network_audit_delta(pre_fetch: dict[str, Any], post_fetch: dict[str, Any]) -> dict[str, Any]:
+    pre_addresses = [str(item) for item in (pre_fetch.get("resolvedAddresses") or [])]
+    post_addresses = [str(item) for item in (post_fetch.get("resolvedAddresses") or [])]
+    pre_set = set(pre_addresses)
+    post_set = set(post_addresses)
+    pre_private = [str(item) for item in (pre_fetch.get("resolvedPrivateAddresses") or [])]
+    post_private = [str(item) for item in (post_fetch.get("resolvedPrivateAddresses") or [])]
+    return {
+        "visibilityOnly": True,
+        "changed": pre_set != post_set,
+        "preFetchHost": pre_fetch.get("host"),
+        "postFetchHost": post_fetch.get("host"),
+        "preFetchResolvedAddresses": pre_addresses,
+        "postFetchResolvedAddresses": post_addresses,
+        "addedAddresses": sorted(post_set - pre_set),
+        "removedAddresses": sorted(pre_set - post_set),
+        "preFetchResolvedPrivateAddresses": pre_private,
+        "postFetchResolvedPrivateAddresses": post_private,
+        "postFetchPrivateNetwork": bool(post_fetch.get("privateNetwork")),
+        "postFetchResolveError": post_fetch.get("resolveError"),
+    }
+
+
 def _assert_http_url(raw_url: str, *, allow_private_hosts: bool = False) -> str:
     url = str(raw_url or "").strip()
     parsed = urllib.parse.urlparse(url)
@@ -254,13 +321,12 @@ def _assert_http_url(raw_url: str, *, allow_private_hosts: bool = False) -> str:
     if not allow_private_hosts:
         if _is_blocked_host_name(host) or _ip_is_private(host):
             raise ValueError("web tool blocks localhost, private-network, and metadata URLs")
-        try:
-            infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-        except socket.gaierror as exc:
+        addresses, resolve_error = _resolve_host_addresses(host)
+        if resolve_error:
+            exc = socket.gaierror(resolve_error)
             raise ValueError(f"cannot resolve URL host: {host}") from exc
-        for info in infos:
-            address = info[4][0]
-            if _ip_is_private(address):
+        for address in addresses:
+            if _ip_is_private(str(address)):
                 raise ValueError("web tool blocks hosts resolving to private-network addresses")
     return urllib.parse.urlunparse(parsed)
 
@@ -313,17 +379,22 @@ def _bounded_get(
     current = _assert_http_url(url, allow_private_hosts=allow_private_hosts)
     opener = urllib.request.build_opener(_NoRedirect)
     redirects: list[str] = []
+    network_trace: list[dict[str, Any]] = []
     for _ in range(max(0, max_redirects) + 1):
+        network_trace.append(_url_network_audit(current, allow_private_hosts=allow_private_hosts))
         req = urllib.request.Request(current, headers=headers or _headers(), method="GET")
         try:
             with opener.open(req, timeout=timeout) as res:
                 data = _read_limited(res, max_bytes)
+                final_url = res.geturl()
                 return {
-                    "url": res.geturl(),
+                    "url": final_url,
                     "status": int(res.status),
                     "headers": res.headers,
                     "body": data,
                     "redirects": redirects,
+                    "networkTrace": network_trace,
+                    "postFetchNetworkAudit": _url_network_audit(final_url, allow_private_hosts=allow_private_hosts),
                 }
         except urllib.error.HTTPError as exc:
             if exc.code in {301, 302, 303, 307, 308}:
@@ -341,6 +412,8 @@ def _bounded_get(
                 "headers": exc.headers,
                 "body": data,
                 "redirects": redirects,
+                "networkTrace": network_trace,
+                "postFetchNetworkAudit": _url_network_audit(current, allow_private_hosts=allow_private_hosts),
             }
     raise ValueError(f"too many redirects after {max_redirects}")
 
@@ -621,6 +694,14 @@ def execute_web_fetch(args: dict[str, Any]) -> dict[str, Any]:
         headers=_headers(args.get("headers")),
         allow_private_hosts=_bool_arg(args, "allowPrivateHosts"),
     )
+    network_trace = response.get("networkTrace") or []
+    final_network = network_trace[-1] if network_trace and isinstance(network_trace[-1], dict) else {}
+    post_fetch_network = response.get("postFetchNetworkAudit") if isinstance(response.get("postFetchNetworkAudit"), dict) else {}
+    dns_re_resolve = _network_audit_delta(final_network, post_fetch_network) if post_fetch_network else None
+    private_network = (
+        any(bool(item.get("privateNetwork")) for item in network_trace if isinstance(item, dict))
+        or bool(post_fetch_network.get("privateNetwork"))
+    )
     content_type = _content_type(response["headers"])
     body = response["body"]
     text = _decode_body(body, response["headers"])
@@ -654,10 +735,28 @@ def execute_web_fetch(args: dict[str, Any]) -> dict[str, Any]:
         "rawChars": len(extracted),
         "bytes": len(body),
         "redirects": response.get("redirects") or [],
+        "networkAudit": {
+            "allowPrivateHosts": _bool_arg(args, "allowPrivateHosts"),
+            "privateNetwork": private_network,
+            "privateAccessAllowed": bool(private_network and _bool_arg(args, "allowPrivateHosts")),
+            "finalHost": final_network.get("host"),
+            "resolvedAddresses": final_network.get("resolvedAddresses") or [],
+            "resolvedPrivateAddresses": final_network.get("resolvedPrivateAddresses") or [],
+            "postFetchResolvedAddresses": post_fetch_network.get("resolvedAddresses") or [],
+            "postFetchResolvedPrivateAddresses": post_fetch_network.get("resolvedPrivateAddresses") or [],
+            "dnsReResolve": dns_re_resolve,
+            "trace": network_trace,
+            "warning": (
+                (post_fetch_network.get("warning") or final_network.get("warning"))
+                if private_network else None
+            ),
+            "visibilityOnly": True,
+        },
         "images": images,
         "links": links,
         "externalContent": {
             "untrusted": True,
             "source": "web.fetch",
+            "privateNetwork": private_network,
         },
     }

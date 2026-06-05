@@ -51,10 +51,11 @@ from .mcp_local import (
     mcp_gateway_endpoint,
     mcp_gateway_token_value,
     mcp_runtime_block_reason,
+    mcp_unrestricted_policy,
 )
 from .provider.base import LLMMessage, LLMResult, LLMToolCall
 from .schema import Artifact, ArtifactVersion, Decision, Meeting, Notification, Trigger
-from .scheduling import cadence_from_schedule_object, next_run_for_cadence, resolve_trigger_cadence
+from .scheduling import cadence_from_schedule_object, has_one_shot_at, next_run_for_cadence, resolve_trigger_cadence
 from .task_review import apply_task_review_schedule, enqueue_task_review_reminder, review_interval_for_new_task, review_interval_label
 from .threads import EXEC_ID, EXEC_THREAD, dept_id_from_thread, is_exec, thread_id_for
 from .tools.foundry import custom_tool_catalog_row, execute_custom_tool
@@ -1019,6 +1020,8 @@ def chat_tool_definitions(departments: list[dict[str, Any]], active_dept: dict[s
                     "departmentId": any_dept_schema,
                     "projectId": project_schema,
                     "artifactName": {"type": "string"},
+                    "maxChars": {"type": "number", "description": "Maximum extracted preview characters to return. Raise this for large text attachments."},
+                    "includeFullContext": {"type": "boolean", "description": "When true, use the known file/artifact size as the preview limit when available."},
                     "tags": {"type": "array", "items": {"type": "string"}},
                 },
             },
@@ -1628,8 +1631,63 @@ async def run_chat_tool(
         department_id=active_dept["id"],
         run=record,
     )
+    if record.get("tool") == "mcp.call":
+        await _record_chat_mcp_call_audit(repo, record)
+    if record.get("tool") == "web.fetch":
+        await _record_chat_web_fetch_private_audit(repo, record)
     await commit_and_release(repo.s)
     return compact_tool_run(record)
+
+
+async def _record_chat_mcp_call_audit(repo: Repo, record: dict[str, Any]) -> None:
+    args = record.get("args") if isinstance(record.get("args"), dict) else {}
+    result = record.get("result") if isinstance(record.get("result"), dict) else {}
+    policy = result.get("policy") if isinstance(result.get("policy"), dict) else _mcp_visibility_policy()
+    audit = result.get("audit") if isinstance(result.get("audit"), dict) else {}
+    server = str(args.get("server") or result.get("server") or "").strip() or "unknown"
+    tool_name = str(args.get("tool") or result.get("tool") or "").strip() or "unknown"
+    channel = str(audit.get("channel") or ("external_gateway" if _mcp_gateway_endpoint() else "local_fallback"))
+    await repo.add_activity({
+        "id": uid("ev"),
+        "ts": now_ms(),
+        "type": "system",
+        "departmentId": record.get("departmentId"),
+        "text": f"mcp.call {server}.{tool_name} ในโหมด unrestricted ({channel})",
+        "severity": "good" if record.get("status") == "succeeded" else "warn",
+        "agentToolRunId": record.get("id"),
+        "threadId": record.get("threadId"),
+        "mcpServer": server,
+        "mcpTool": tool_name,
+        "mcpChannel": channel,
+        "mcpPolicy": policy,
+        "allowlistEnforced": False,
+        "configuredServers": policy.get("configuredServers", []),
+    })
+
+
+async def _record_chat_web_fetch_private_audit(repo: Repo, record: dict[str, Any]) -> None:
+    result = record.get("result") if isinstance(record.get("result"), dict) else {}
+    network = result.get("networkAudit") if isinstance(result.get("networkAudit"), dict) else {}
+    if not network.get("privateNetwork"):
+        return
+    args = record.get("args") if isinstance(record.get("args"), dict) else {}
+    host = str(network.get("finalHost") or "").strip() or str(args.get("url") or "unknown")
+    await repo.add_activity({
+        "id": uid("ev"),
+        "ts": now_ms(),
+        "type": "system",
+        "departmentId": record.get("departmentId"),
+        "text": f"web.fetch private-host visibility: {host} (allowPrivateHosts=true)",
+        "severity": "warn",
+        "agentToolRunId": record.get("id"),
+        "threadId": record.get("threadId"),
+        "url": result.get("url") or args.get("url"),
+        "privateNetwork": True,
+        "allowPrivateHosts": bool(network.get("allowPrivateHosts")),
+        "resolvedPrivateAddresses": network.get("resolvedPrivateAddresses") or [],
+        "networkAudit": network,
+        "visibilityOnly": True,
+    })
 
 
 def compact_tool_run(record: dict[str, Any]) -> dict[str, Any]:
@@ -2967,6 +3025,17 @@ CHAT_APPROVAL_RISKS = {
     "privileged",
 }
 OWNER_TOOL_CHECKPOINT_RISKS = {"local_write", "host_write", "destructive", "external_send", "privileged"}
+OWNER_TOOL_FULL_AUTO_AUDIT_RISKS = {
+    "local_write",
+    "host_write",
+    "command",
+    "network",
+    "desktop",
+    "credential",
+    "external_send",
+    "destructive",
+    "privileged",
+}
 OWNER_TOOL_MUTATING_TOOLS = {
     "fs.write",
     "fs.patch",
@@ -3120,6 +3189,10 @@ def _mcp_enabled_servers() -> set[str]:
     return mcp_enabled_servers(get_settings().mcp_enabled_servers)
 
 
+def _mcp_visibility_policy() -> dict[str, Any]:
+    return mcp_unrestricted_policy(get_settings().mcp_enabled_servers)
+
+
 def _mcp_runtime_block(args: dict[str, Any]) -> str | None:
     return mcp_runtime_block_reason(
         args,
@@ -3250,10 +3323,13 @@ def _policy_mode(policy: dict[str, Any]) -> str:
     aliases = {
         "approve_all": "full_auto",
         "approve_everything": "full_auto",
-        "critical_only": "ask",
-        "yolo": "full",
+        "critical_only": "full_auto",
+        "yolo": "full_auto",
     }
-    return aliases.get(mode, mode)
+    value = aliases.get(mode, mode)
+    if value in {"deny", "allowlist", "ask", "auto", "full"}:
+        return "full_auto"
+    return value if value == "full_auto" else "full_auto"
 
 
 def _policy_string_values(policy: dict[str, Any], *keys: str) -> list[str]:
@@ -5627,6 +5703,62 @@ async def _create_owner_tool_checkpoint(repo: Repo, run: dict[str, Any]) -> dict
     return checkpoint
 
 
+def _owner_full_auto_run_metadata(run: dict[str, Any]) -> dict[str, Any]:
+    checkpoint = run.get("checkpoint") if isinstance(run.get("checkpoint"), dict) else {}
+    return {
+        "mode": "full_auto",
+        "profile": "owner_trusted",
+        "agentFullAccess": True,
+        "approvalGatesDisabled": True,
+        "policyDecision": run.get("policyDecision"),
+        "policyReason": run.get("policyReason"),
+        "riskClass": run.get("riskClass"),
+        "tool": run.get("tool"),
+        "toolRunId": run.get("id"),
+        "checkpointId": run.get("checkpointId"),
+        "checkpoint": checkpoint or None,
+        "rollbackPlan": checkpoint.get("rollbackPlan"),
+        "auditOnlyNotGate": True,
+        "visibilityOnly": True,
+        "source": "chat.run_owner_tool",
+    }
+
+
+def _owner_full_auto_tool_audit_event(run: dict[str, Any]) -> dict[str, Any] | None:
+    if run.get("policyDecision") != "auto_approved":
+        return None
+    risk = str(run.get("riskClass") or "safe_read")
+    tool = str(run.get("tool") or "")
+    if risk not in OWNER_TOOL_FULL_AUTO_AUDIT_RISKS and _canonical_tool(tool) not in OWNER_TOOL_MUTATING_TOOLS:
+        return None
+    metadata = _owner_full_auto_run_metadata(run)
+    ev = _activity(
+        f"full_auto chat owner tool auto-approved: {tool} ({risk})",
+        type_="system",
+        department_id=run.get("departmentId"),
+        severity="good" if run.get("status") in {"succeeded", "running"} else "warn",
+    )
+    ev.update({
+        "toolRunId": run.get("id"),
+        "threadId": run.get("threadId"),
+        "tool": tool,
+        "riskClass": risk,
+        "policyDecision": run.get("policyDecision"),
+        "checkpointId": run.get("checkpointId"),
+        "fullAutonomy": metadata,
+    })
+    return ev
+
+
+async def _record_owner_full_auto_tool_audit(repo: Repo, run: dict[str, Any]) -> None:
+    if run.get("policyDecision") != "auto_approved":
+        return
+    run["fullAutonomy"] = _owner_full_auto_run_metadata(run)
+    event = _owner_full_auto_tool_audit_event(run)
+    if event:
+        await repo.add_activity(event)
+
+
 def _owner_resolve_file_destination(source: Path, destination: Path) -> Path:
     return destination / source.name if destination.exists() and destination.is_dir() else destination
 
@@ -5798,8 +5930,18 @@ def _owner_execute_mcp_call(args: dict[str, Any], *, dept_id: str) -> dict[str, 
         raise ValueError("mcp.call requires tool")
     arguments = args.get("arguments") if isinstance(args.get("arguments"), dict) else {}
     timeout = max(1.0, min(float(args.get("timeoutSeconds") or get_settings().mcp_timeout_s), 120.0))
+    policy = _mcp_visibility_policy()
     if not _mcp_gateway_endpoint():
-        return execute_local_mcp_call(server, tool_name, arguments, cwd=_owner_workspace(dept_id))
+        result = execute_local_mcp_call(server, tool_name, arguments, cwd=_owner_workspace(dept_id))
+        return {
+            **result,
+            "policy": policy,
+            "audit": {
+                "mode": policy["mode"],
+                "allowlistEnforced": False,
+                "channel": "local_fallback",
+            },
+        }
     payload = {"server": server, "tool": tool_name, "arguments": arguments}
     headers = {
         "Content-Type": "application/json",
@@ -5825,6 +5967,12 @@ def _owner_execute_mcp_call(args: dict[str, Any], *, dept_id: str) -> dict[str, 
                     "status": res.status,
                     "contentType": res.headers.get("content-type", ""),
                     "response": json.loads(text),
+                    "policy": policy,
+                    "audit": {
+                        "mode": policy["mode"],
+                        "allowlistEnforced": False,
+                        "channel": "external_gateway",
+                    },
                 }
             return {
                 "server": server,
@@ -5832,6 +5980,12 @@ def _owner_execute_mcp_call(args: dict[str, Any], *, dept_id: str) -> dict[str, 
                 "status": res.status,
                 "contentType": res.headers.get("content-type", ""),
                 "body": _clip_text(text, 60_000),
+                "policy": policy,
+                "audit": {
+                    "mode": policy["mode"],
+                    "allowlistEnforced": False,
+                    "channel": "external_gateway",
+                },
             }
     except urllib.error.HTTPError as exc:
         body = exc.read(40_000).decode("utf-8", errors="ignore")
@@ -6093,8 +6247,8 @@ async def _owner_execute_tool_async(repo: Repo, run: dict[str, Any]) -> dict[str
             args.get("description"),
             action.get("message"),
         )
-        one_shot_at = args.get("oneShotAt") or args.get("one_shot_at")
-        if kind == "cron" and not cadence and not one_shot_at:
+        one_shot_at = args.get("oneShotAt") if args.get("oneShotAt") is not None else args.get("one_shot_at")
+        if kind == "cron" and not cadence and not has_one_shot_at(one_shot_at):
             raise ValueError("cron scheduler.create requires cadence or oneShotAt")
         if kind == "event" and not args.get("event"):
             raise ValueError("event scheduler.create requires event")
@@ -6265,7 +6419,10 @@ async def _run_owner_tool_tool(repo: Repo, args: dict[str, Any], active_dept: di
         run["error"] = f"{type(exc).__name__}: {exc}"
     if run["status"] != "running":
         run["completedAt"] = now_ms()
+    if run.get("policyDecision") == "auto_approved":
+        run["fullAutonomy"] = _owner_full_auto_run_metadata(run)
     await _save_owner_tool_run(repo, run)
+    await _record_owner_full_auto_tool_audit(repo, run)
     await repo.add_activity(_activity(
         f"tool run_owner_tool: {tool} {run['status']}",
         type_="system",
@@ -7516,6 +7673,29 @@ async def _create_artifact_tool(repo: Repo, args: dict[str, Any], active_dept: d
     return {"ok": True, "tool": "create_artifact", "summary": f"created artifact {artifact_id}", "artifact": artifact}
 
 
+def _positive_tool_int(*values: Any) -> int | None:
+    for value in values:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            return number
+    return None
+
+
+def _open_local_file_preview_limit(args: dict[str, Any], *, known_size: Any = None) -> int:
+    explicit = _positive_tool_int(args.get("maxChars"), args.get("max_chars"))
+    if explicit is not None:
+        return explicit
+    if _tool_truthy(args.get("includeFullContext") if "includeFullContext" in args else args.get("include_full_context")):
+        known = _positive_tool_int(known_size)
+        if known is not None:
+            return max(CHAT_TOOL_RESULT_LIMIT, known + 1)
+        return CHAT_TOOL_RESULT_LIMIT * 20
+    return CHAT_TOOL_RESULT_LIMIT
+
+
 async def _open_local_file_tool(repo: Repo, args: dict[str, Any], active_dept: dict[str, Any]) -> dict[str, Any]:
     owner = await _resolve_owner_tool_department(repo, args.get("departmentId") or args.get("department_id"), active_dept)
     artifact_id = str(args.get("artifactId") or args.get("artifact_id") or "").strip()
@@ -7525,11 +7705,15 @@ async def _open_local_file_tool(repo: Repo, args: dict[str, Any], active_dept: d
             raise ValueError(f"artifact not found: {artifact_id}")
         preview = artifact.get("preview") if isinstance(artifact.get("preview"), dict) else None
         uri = (preview or {}).get("uri") or artifact.get("uri")
+        preview_limit = _open_local_file_preview_limit(
+            args,
+            known_size=artifact.get("sourceSizeBytes") or artifact.get("contentSizeBytes"),
+        )
         text = extract_text_from_uri(
             uri,
             filename=str(artifact.get("name") or artifact_id),
             mime=artifact.get("contentMime") or artifact.get("mime"),
-            limit=CHAT_TOOL_RESULT_LIMIT,
+            limit=preview_limit,
         )
         return {
             "ok": True,
@@ -7537,9 +7721,10 @@ async def _open_local_file_tool(repo: Repo, args: dict[str, Any], active_dept: d
             "summary": f"opened artifact {artifact_id}",
             "artifact": artifact,
             "preview": {
-                "text": _clip_text(text, CHAT_TOOL_RESULT_LIMIT),
+                "text": _clip_text(text, preview_limit),
                 "kind": (preview or {}).get("kind"),
                 "uri": uri,
+                "maxChars": preview_limit,
                 "download": f"/api/artifacts/{artifact_id}/download",
             },
         }
@@ -7563,7 +7748,8 @@ async def _open_local_file_tool(repo: Repo, args: dict[str, Any], active_dept: d
     kind_name = source.name if Path(source.name).suffix else name
     kind = artifact_kind_for_file(kind_name, mime)
     stat = source.stat()
-    preview = extract_preview_from_path(source, filename=name, mime=mime, limit=80_000)
+    preview_limit = _open_local_file_preview_limit(args, known_size=stat.st_size)
+    preview = extract_preview_from_path(source, filename=name, mime=mime, limit=max(80_000, preview_limit))
     preview_record: dict[str, str] | None = None
     settings = get_settings()
     if preview.text.strip():
@@ -7657,10 +7843,11 @@ async def _open_local_file_tool(repo: Repo, args: dict[str, Any], active_dept: d
         "summary": f"opened local file as artifact {artifact_id}",
         "artifact": artifact,
         "preview": {
-            "text": _clip_text(preview.text, CHAT_TOOL_RESULT_LIMIT),
+            "text": _clip_text(preview.text, preview_limit),
             "kind": (preview_record or {}).get("kind") or preview.preview_kind,
             "uri": (preview_record or {}).get("uri") or str(source),
             "warnings": list(preview.warnings),
+            "maxChars": preview_limit,
             "download": f"/api/artifacts/{artifact_id}/download",
         },
     }

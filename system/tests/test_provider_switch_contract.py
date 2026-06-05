@@ -6,14 +6,18 @@ from pathlib import Path
 from typing import get_args
 
 from app.catalog import (
+    MODELS,
     PROVIDERS,
     coerce_provider,
+    default_thinking_effort_for_model,
     efforts_for_model,
     is_model_available_for_provider,
     normalize_ai_config,
     provider_bypasses_agent_runtime,
     provider_has_native_chat_stream,
 )
+from app.config import Settings
+from app.provider.registry import provider_health
 from app.schema import AiProviderId
 
 
@@ -78,6 +82,37 @@ class ProviderSwitchContractTest(unittest.TestCase):
             with self.subTest(provider=provider_id):
                 self.assertFalse(provider_bypasses_agent_runtime(provider_id))
                 self.assertFalse(provider_has_native_chat_stream(provider_id))
+
+    def test_invalid_explicit_supported_efforts_falls_back_without_crashing(self) -> None:
+        model_id = "__test_bad_efforts__"
+        MODELS[model_id] = {
+            "id": model_id,
+            "name": "Bad efforts",
+            "providerIds": ["claude_code"],
+            "supportedEfforts": ["turbo"],
+            "defaultThinkingEffort": "turbo",
+            "contextWindow": 1,
+            "maxOutputTokens": 1,
+            "pricing": {"inputPerMTok": 0, "outputPerMTok": 0},
+        }
+        try:
+            efforts = efforts_for_model(model_id)
+            self.assertGreater(len(efforts), 0)
+            self.assertEqual(default_thinking_effort_for_model(model_id), efforts[0])
+        finally:
+            MODELS.pop(model_id, None)
+
+    def test_provider_health_exposes_recovery_policy_without_hard_circuit_breaker(self) -> None:
+        status = provider_health(Settings(openai_api_key="test-key"), probe_accounts=False)
+
+        policy = status["recoveryPolicy"]
+        self.assertTrue(policy["visibilityOnly"])
+        self.assertFalse(policy["hardCircuitBreaker"])
+        self.assertFalse(policy["engineCircuitBreaker"]["enabled"])
+        self.assertEqual(policy["retryLayers"]["openaiResponses"]["attempts"], 2)
+        self.assertTrue(policy["retryLayers"]["openaiResponses"]["honorsRetryAfter"])
+        self.assertEqual(policy["resume"]["manualMessageRetryRoute"], "/api/messages/{thread_id}/retry")
+        self.assertEqual(policy["resume"]["nonChatJobTimeoutRecovery"], "requeue")
 
 
 if __name__ == "__main__":

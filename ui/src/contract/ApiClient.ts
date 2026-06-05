@@ -62,6 +62,7 @@ import type {
   HealthResponse,
   HandoffMessage,
   HostBridgeParityStatusResponse,
+  AttachmentReferenceInput,
   ImportFileInput,
   ImportFileResponse,
   KnowledgeDebtReport,
@@ -78,7 +79,6 @@ import type {
   Playbook,
   PolicyMode,
   Preference,
-  Priority,
   Project,
   ProviderAuthReferenceResponse,
   ProviderAuthStartResponse,
@@ -148,20 +148,6 @@ import { isExec, deptIdFromThread } from '../lib/threads'
 const ACCENTS: Department['accent'][] = ['amber', 'teal', 'coral', 'lavender', 'sky', 'honey']
 const DAY_MS = 86_400_000
 const COST_CATEGORIES: CostCategory[] = ['work', 'chat', 'meeting', 'autonomous', 'memory', 'tool']
-const DEFAULT_TASK_REVIEW_INTERVAL_MS = 5 * 60_000
-
-function suggestedTaskReviewIntervalMs(priority?: Priority | null): number {
-  switch (priority) {
-    case 'urgent':
-      return 2 * 60_000
-    case 'high':
-      return 3 * 60_000
-    case 'low':
-      return 10 * 60_000
-    default:
-      return DEFAULT_TASK_REVIEW_INTERVAL_MS
-  }
-}
 
 const EMPTY_STATE: CompanyState = {
   companyName: 'ATRIUM',
@@ -567,42 +553,15 @@ export class ApiClient implements CompanyClient {
     return dept
   }
 
-  assignTask = (input: AssignTaskInput): Task => {
+  assignTask = async (input: AssignTaskInput): Promise<Task> => {
     const id = input.id ?? uid('task')
-    const now = Date.now()
-    const reviewIntervalMs = input.reviewIntervalMs == null || input.reviewIntervalMs === undefined
-      ? suggestedTaskReviewIntervalMs(input.priority ?? 'normal')
-      : input.reviewIntervalMs > 0
-        ? Math.max(60_000, input.reviewIntervalMs)
-        : null
-    const task: Task = {
-      id,
-      title: input.title,
-      detail: input.detail ?? '',
-      status: 'assigned',
-      priority: input.priority ?? 'normal',
-      departmentId: input.departmentId,
-      origin: input.byExecutive ? { kind: 'executive' } : { kind: 'user' },
-      progress: 0,
-      createdAt: now,
-      updatedAt: now,
-      handoffs: [],
-      log: [input.byExecutive ? 'ผู้บริหารมอบหมาย' : 'ผู้ใช้มอบหมายโดยตรง'],
-      projectId: input.projectId ?? null,
-      deliverables: [],
-      watchers: input.watchers ?? [],
-      parentTaskId: input.parentTaskId ?? null,
-      subTaskIds: [],
-      deadlineAt: input.deadlineAt ?? null,
-      result: null,
-      reviewIntervalMs,
-      nextReviewAt: reviewIntervalMs ? now + reviewIntervalMs : null,
-      lastReviewReminderAt: null,
-      reviewReminderCount: 0,
-      reviewScheduleToken: reviewIntervalMs ? uid('rev') : null,
-    }
-    this.setState({ ...this.state, tasks: [...this.state.tasks, task], now })
-    this.command(() => this.request('/api/tasks', 'POST', { ...input, id }))
+    const task = await this.request<Task>('/api/tasks', 'POST', { ...input, id })
+    this.setState({
+      ...this.state,
+      tasks: [...this.state.tasks.filter((existing) => existing.id !== task.id), task],
+      now: Date.now(),
+    })
+    void this.refresh().catch(() => undefined)
     return task
   }
 
@@ -711,8 +670,8 @@ export class ApiClient implements CompanyClient {
       ...this.state,
       now: Date.now(),
       permissionPolicy: prev
-        ? { ...prev, mode }
-        : { mode, updatedAt: null, updatedBy: 'owner', toolCatalog: [] },
+        ? { ...prev, mode: 'full_auto', requestedMode: mode === 'full_auto' ? null : mode, agentFullAccess: true }
+        : { mode: 'full_auto', requestedMode: mode === 'full_auto' ? null : mode, agentFullAccess: true, updatedAt: null, updatedBy: 'owner', toolCatalog: [] },
     })
     this.command(() => this.request('/api/policy', 'PATCH', { mode, updatedBy: 'owner' }))
   }
@@ -1035,6 +994,11 @@ export class ApiClient implements CompanyClient {
     this.afterMutation(this.request('/api/critique-reports', 'POST', input))
   importFile = (input: ImportFileInput): Promise<ImportFileResponse> =>
     this.afterMutation(this.request('/api/import/file', 'POST', input))
+  referenceAttachment = (
+    threadId: ThreadId,
+    input: Omit<AttachmentReferenceInput, 'threadId'>,
+  ): Promise<ImportFileResponse> =>
+    this.afterMutation(this.request('/api/attachments/reference', 'POST', { ...input, threadId }))
   getImageGenerationStatus = (): Promise<Record<string, unknown>> =>
     this.request('/api/images/status', 'GET')
   getImageGenerationJob = (jobId: string): Promise<Record<string, unknown>> =>

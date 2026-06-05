@@ -9,11 +9,42 @@ from .clock import DAY_MS, now_ms
 MINUTE_MS = 60_000
 HOUR_MS = 3_600_000
 WEEK_MS = 7 * DAY_MS
+MONTH_MS = 30 * DAY_MS
 
 
 def _number_from_text(text: str) -> tuple[re.Match[str] | None, float]:
     match = re.search(r"(\d+(?:\.\d+)?)", text)
     return match, float(match.group(1)) if match else 1.0
+
+
+def _cron_step(field: str) -> float | None:
+    match = re.fullmatch(r"(?:\*|\d+)/(\d+(?:\.\d+)?)", field)
+    if not match:
+        return None
+    value = float(match.group(1))
+    return value if value > 0 else None
+
+
+def _cron_interval_ms(text: str) -> int | None:
+    fields = text.split()
+    if len(fields) != 5:
+        return None
+    minute, hour, day_of_month, month, day_of_week = fields
+    for field, unit_ms in (
+        (minute, MINUTE_MS),
+        (hour, HOUR_MS),
+        (day_of_month, DAY_MS),
+        (month, MONTH_MS),
+        (day_of_week, DAY_MS),
+    ):
+        step = _cron_step(field)
+        if step is not None:
+            return int(step * unit_ms)
+    if minute not in {"*", "?"} and hour == "*" and day_of_month == "*" and month == "*" and day_of_week == "*":
+        return HOUR_MS
+    if minute not in {"*", "?"} and hour not in {"*", "?"} and day_of_month == "*" and month == "*" and day_of_week == "*":
+        return DAY_MS
+    return None
 
 
 def cadence_interval_ms(cadence: str | None, default: int | None = None) -> int | None:
@@ -23,6 +54,10 @@ def cadence_interval_ms(cadence: str | None, default: int | None = None) -> int 
     text = str(cadence).strip().lower()
     if not text:
         return default
+
+    cron_interval = _cron_interval_ms(text)
+    if cron_interval is not None:
+        return cron_interval
 
     cron_step = re.search(r"(?:^|\s)\*/(\d+(?:\.\d+)?)(?:\s|$)", text)
     if cron_step:
@@ -47,7 +82,7 @@ def cadence_interval_ms(cadence: str | None, default: int | None = None) -> int 
 
 
 def next_run_for_cadence(cadence: str | None, one_shot_at: int | str | None = None, *, now: int | None = None) -> int | None:
-    if one_shot_at is not None and str(one_shot_at).strip():
+    if has_one_shot_at(one_shot_at):
         try:
             return int(float(one_shot_at))
         except (TypeError, ValueError):
@@ -58,6 +93,10 @@ def next_run_for_cadence(cadence: str | None, one_shot_at: int | str | None = No
     if interval is None:
         return None
     return (now if now is not None else now_ms()) + interval
+
+
+def has_one_shot_at(value: Any) -> bool:
+    return value is not None and str(value).strip() != ""
 
 
 def infer_cadence_from_text(*texts: str | None) -> str | None:

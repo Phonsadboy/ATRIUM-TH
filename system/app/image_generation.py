@@ -1167,6 +1167,58 @@ async def process_image_generation_job(repo: Repo, payload: dict[str, Any], now:
     request = payload.get("request") if isinstance(payload.get("request"), dict) else run.get("request")
     if not isinstance(request, dict):
         raise ImageGenerationError(f"image generation run has no request: {run_id}")
+    existing_artifacts = [artifact for artifact in (run.get("artifacts") or []) if isinstance(artifact, dict)]
+    if run.get("status") == "succeeded" and existing_artifacts:
+        skip_count = int(run.get("idempotencySkipCount") or 0) + 1
+        skipped_run = {
+            **run,
+            "idempotencySkipCount": skip_count,
+            "lastIdempotencySkipAt": now,
+            "updatedAt": now,
+        }
+        await repo.put_entity(
+            "image_generation_run",
+            skipped_run,
+            dept=skipped_run.get("ownerDept"),
+            project=skipped_run.get("projectId"),
+            status="succeeded",
+            ts=now,
+        )
+        await repo.add_activity({
+            "id": uid("act"),
+            "ts": now,
+            "type": "system",
+            "severity": "info",
+            "departmentId": skipped_run.get("ownerDept"),
+            "detail": f"ข้ามการสร้างภาพซ้ำสำหรับ {job_id}: run สำเร็จแล้วและมี artifact อยู่แล้ว",
+        })
+        return {
+            "ok": True,
+            "tool": "generate_image_asset",
+            "async": False,
+            "asyncMode": False,
+            "status": "succeeded",
+            "mode": skipped_run.get("mode") or "generate",
+            "summary": skipped_run.get("summary") or f"image generation job {job_id} already succeeded; reused existing artifacts",
+            "model": skipped_run.get("model"),
+            "provider": "idempotency_cache",
+            "artifacts": existing_artifacts,
+            "artifact": existing_artifacts[0],
+            "locations": skipped_run.get("locations") or [artifact_location(artifact) for artifact in existing_artifacts],
+            "usage": skipped_run.get("usage"),
+            "requestId": skipped_run.get("requestId"),
+            "options": skipped_run.get("options") or {},
+            "referenceArtifactIds": skipped_run.get("referenceArtifactIds") or [],
+            "maskArtifactId": skipped_run.get("maskArtifactId"),
+            "modelPolicy": skipped_run.get("modelPolicy") or {},
+            "warnings": ["skipped duplicate image generation because the run already succeeded"],
+            "idempotency": {
+                "skippedCompletedRun": True,
+                "runId": run_id,
+                "jobId": job_id,
+                "skipCount": skip_count,
+            },
+        }
     dept = await repo.get_department(str(payload.get("departmentId") or run.get("departmentId") or run.get("ownerDept") or ""))
     if not dept:
         dept = await repo.get_department(str(run.get("ownerDept") or ""))
@@ -1360,6 +1412,65 @@ async def mark_image_generation_job_failed(repo: Repo, payload: dict[str, Any], 
     })
     await _maybe_enqueue_image_completion_wake(repo, failed_run, dept, failed_message, error=error)
     hub.mark_dirty()
+
+
+async def handle_image_generation_worker_timeout(repo: Repo, payload: dict[str, Any], error: str) -> dict[str, Any]:
+    run_id = str(payload.get("runId") or "")
+    if not run_id:
+        return {"status": "failed", "delayMs": None}
+    run = await repo.get_entity("image_generation_run", run_id)
+    if not run:
+        return {"status": "failed", "delayMs": None}
+    attempt = int(run.get("attempts") or 0)
+    if attempt <= 0:
+        attempt = 1
+    dept = await repo.get_department(str(payload.get("departmentId") or run.get("departmentId") or run.get("ownerDept") or ""))
+    if not dept:
+        dept = await repo.get_department(str(run.get("ownerDept") or ""))
+    dept = dept or {"id": run.get("ownerDept") or "exec", "name": "ATRIUM", "agentName": "ATRIUM"}
+    completed_at = now_ms()
+    if attempt < IMAGE_GENERATION_MAX_ATTEMPTS:
+        delay_ms = _image_retry_delay_ms(attempt)
+        retry_after = completed_at + delay_ms
+        retry_run = {
+            **run,
+            "status": "queued",
+            "startedAt": None,
+            "lastAttemptCompletedAt": completed_at,
+            "lastAttemptElapsedMs": max(0, completed_at - int(run.get("lastAttemptStartedAt") or run.get("startedAt") or completed_at)),
+            "completedAt": None,
+            "elapsedMs": None,
+            "updatedAt": completed_at,
+            "retryAfter": retry_after,
+            "error": error,
+            "lastError": error,
+            "workerTimeoutRetry": True,
+        }
+        await repo.put_entity(
+            "image_generation_run",
+            retry_run,
+            dept=retry_run.get("ownerDept"),
+            project=retry_run.get("projectId"),
+            status="queued",
+            ts=completed_at,
+        )
+        await _upsert_image_job_message(repo, retry_run, dept, error=error)
+        await repo.add_activity({
+            "id": uid("act"),
+            "ts": completed_at,
+            "type": "system",
+            "severity": "warn",
+            "departmentId": retry_run.get("ownerDept"),
+            "detail": (
+                f"สร้างภาพ {retry_run.get('jobId') or payload.get('jobId')} timeout ใน worker; "
+                f"จะลองใหม่ครั้งที่ {attempt + 1}/{IMAGE_GENERATION_MAX_ATTEMPTS} "
+                f"ใน {_duration_label(delay_ms)}"
+            ),
+        })
+        hub.mark_dirty()
+        return {"status": "retry_queued", "delayMs": delay_ms, "attempt": attempt}
+    await mark_image_generation_job_failed(repo, payload, error)
+    return {"status": "failed", "delayMs": None, "attempt": attempt}
 
 
 async def resolve_image_reference(repo: Repo, artifact_id: str, *, purpose: str = "reference") -> ImageReference:

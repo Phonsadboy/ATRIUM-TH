@@ -6,6 +6,7 @@ OAuth can be opted in only for routes that are known to accept it.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,7 @@ from .schema import Artifact, ArtifactVersion
 
 DEFAULT_OPENAI_AUDIO_MODEL = "gpt-4o-transcribe"
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
+AUDIO_TRANSCRIPTION_RETRY_HTTP_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504, 529}
 AUDIO_SUFFIXES = {
     ".aac",
     ".aiff",
@@ -161,6 +163,11 @@ def audio_transcription_status(settings: Settings | None = None) -> dict[str, An
         "timeoutSeconds": float(getattr(settings, "audio_transcription_timeout_s", 120.0) or 120.0),
         "maxBytes": int(getattr(settings, "audio_transcription_max_bytes", 20 * 1024 * 1024) or 0),
         "autoOnUpload": bool(getattr(settings, "audio_transcription_auto_on_upload", True)),
+        "retry": {
+            "attempts": _audio_transcription_retry_attempts(settings),
+            "baseDelaySeconds": _audio_transcription_retry_base_delay_s(settings),
+            "transientHttpStatuses": sorted(AUDIO_TRANSCRIPTION_RETRY_HTTP_STATUSES),
+        },
         "auth": {
             "apiKeyConfigured": api_key_ready,
             "chatgptAccountOAuthReady": oauth_ready,
@@ -190,6 +197,49 @@ def _clip_text(text: str, limit: int = TOOL_RESULT_TEXT_LIMIT) -> str:
     if len(text) <= limit:
         return text
     return text[:limit].rstrip() + "\n...[truncated]"
+
+
+def _audio_transcription_retry_attempts(settings: Settings) -> int:
+    raw = getattr(settings, "audio_transcription_retry_attempts", 3)
+    try:
+        return max(1, min(int(raw), 5))
+    except (TypeError, ValueError):
+        return 3
+
+
+def _audio_transcription_retry_base_delay_s(settings: Settings) -> float:
+    raw = getattr(settings, "audio_transcription_retry_delay_s", 1.0)
+    try:
+        return max(0.0, min(float(raw), 30.0))
+    except (TypeError, ValueError):
+        return 1.0
+
+
+def _retry_after_seconds(headers: httpx.Headers | dict[str, str] | None) -> float | None:
+    value = str((headers or {}).get("Retry-After") or (headers or {}).get("retry-after") or "").strip()
+    if not value:
+        return None
+    try:
+        delay = float(value)
+    except ValueError:
+        return None
+    return max(0.0, min(delay, 60.0))
+
+
+def _audio_transcription_retry_delay_s(
+    settings: Settings,
+    attempt_index: int,
+    response: httpx.Response | None = None,
+) -> float:
+    retry_after = _retry_after_seconds(response.headers if response is not None else None)
+    if retry_after is not None:
+        return retry_after
+    base = _audio_transcription_retry_base_delay_s(settings)
+    return min(60.0, base * (2 ** max(0, attempt_index)))
+
+
+def _audio_transcription_http_retryable(status_code: int) -> bool:
+    return int(status_code) in AUDIO_TRANSCRIPTION_RETRY_HTTP_STATUSES
 
 
 def _truthy(value: Any) -> bool:
@@ -509,27 +559,64 @@ async def transcribe_audio_bytes(
     if prompt_value:
         fields["prompt"] = prompt_value
 
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(
-                f"{base_url}/audio/transcriptions",
-                headers={"Authorization": f"Bearer {auth.token}"},
-                data=fields,
-                files={"file": (filename, data, selected_mime)},
-            )
-            resp.raise_for_status()
-            payload = resp.json()
-    except httpx.HTTPStatusError as exc:
-        detail = exc.response.text[:800]
-        raise AudioTranscriptionError(
-            f"OpenAI audio transcription failed with HTTP {exc.response.status_code}: {detail}"
-        ) from exc
-    except httpx.RequestError as exc:
-        raise AudioTranscriptionError(
-            f"OpenAI audio transcription request failed: {type(exc).__name__}: {exc}"
-        ) from exc
-    except ValueError as exc:
-        raise AudioTranscriptionError("OpenAI audio transcription returned invalid JSON") from exc
+    request_attempts = _audio_transcription_retry_attempts(settings)
+    transient_errors: list[dict[str, Any]] = []
+    payload: Any = None
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        for attempt in range(request_attempts):
+            try:
+                resp = await client.post(
+                    f"{base_url}/audio/transcriptions",
+                    headers={"Authorization": f"Bearer {auth.token}"},
+                    data=fields,
+                    files={"file": (filename, data, selected_mime)},
+                )
+                resp.raise_for_status()
+                payload = resp.json()
+                break
+            except httpx.HTTPStatusError as exc:
+                detail = exc.response.text[:800]
+                retryable = _audio_transcription_http_retryable(exc.response.status_code)
+                if retryable and attempt < request_attempts - 1:
+                    delay = _audio_transcription_retry_delay_s(settings, attempt, exc.response)
+                    transient_errors.append({
+                        "attempt": attempt + 1,
+                        "type": "http_status",
+                        "statusCode": exc.response.status_code,
+                        "delaySeconds": delay,
+                    })
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    continue
+                raise AudioTranscriptionError(
+                    f"OpenAI audio transcription failed with HTTP {exc.response.status_code}: {detail}"
+                ) from exc
+            except httpx.RequestError as exc:
+                if attempt < request_attempts - 1:
+                    delay = _audio_transcription_retry_delay_s(settings, attempt)
+                    transient_errors.append({
+                        "attempt": attempt + 1,
+                        "type": type(exc).__name__,
+                        "delaySeconds": delay,
+                    })
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+                    continue
+                raise AudioTranscriptionError(
+                    f"OpenAI audio transcription request failed: {type(exc).__name__}: {exc}"
+                ) from exc
+            except ValueError as exc:
+                raise AudioTranscriptionError("OpenAI audio transcription returned invalid JSON") from exc
+    if payload is None:
+        raise AudioTranscriptionError("OpenAI audio transcription returned no response")
+    if isinstance(payload, dict) and transient_errors:
+        payload = {
+            **payload,
+            "atriumRetry": {
+                "attempts": len(transient_errors) + 1,
+                "transientErrors": transient_errors[-5:],
+            },
+        }
 
     text = str(payload.get("text") or "").strip() if isinstance(payload, dict) else ""
     if not text:

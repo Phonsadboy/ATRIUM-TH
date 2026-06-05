@@ -312,6 +312,7 @@ class ProviderMultimodalMappingTest(unittest.TestCase):
                 })
 
         provider = OpenAIResponsesProvider("openai", "https://example.invalid/v1", "token")
+        provider._request_retry_delay_s = lambda attempt: 0.0
         fake_client = FakeClient()
         provider._client = fake_client
 
@@ -361,6 +362,7 @@ class ProviderMultimodalMappingTest(unittest.TestCase):
                 return FakeResponse()
 
         provider = OpenAIResponsesProvider("openai", "https://example.invalid/v1", "token")
+        provider._request_retry_delay_s = lambda attempt: 0.0
         fake_client = FakeClient()
         provider._client = fake_client
 
@@ -422,6 +424,23 @@ class ProviderMultimodalMappingTest(unittest.TestCase):
         self.assertEqual(result.text, "OK")
         self.assertEqual(fake_client.calls, 2)
 
+    def test_responses_provider_retry_delay_uses_backoff_with_jitter(self) -> None:
+        provider = OpenAIResponsesProvider("openai", "https://example.invalid/v1", "token")
+
+        with mock.patch("app.provider.openai_provider.random.uniform", return_value=0.125):
+            self.assertEqual(provider._request_retry_delay_s(0), 0.625)
+            self.assertEqual(provider._request_retry_delay_s(2), 2.125)
+
+    def test_responses_provider_retry_sleep_honors_retry_after_header(self) -> None:
+        provider = OpenAIResponsesProvider("openai", "https://example.invalid/v1", "token")
+        request = httpx.Request("POST", "https://example.invalid/v1/responses")
+        response = httpx.Response(429, request=request, headers={"Retry-After": "7"})
+
+        with mock.patch("app.provider.openai_provider.asyncio.sleep", new=mock.AsyncMock()) as sleep:
+            asyncio.run(provider._sleep_before_request_retry(0, response))
+
+        sleep.assert_awaited_once_with(7.0)
+
     def test_responses_provider_stream_retries_read_timeout_before_output_once(self) -> None:
         class FakeStreamResponse:
             def raise_for_status(self) -> None:
@@ -459,6 +478,7 @@ class ProviderMultimodalMappingTest(unittest.TestCase):
                 return FakeStream(fail=self.calls == 1)
 
         provider = OpenAIResponsesProvider("openai", "https://example.invalid/v1", "token")
+        provider._request_retry_delay_s = lambda attempt: 0.0
         fake_client = FakeClient()
         provider._client = fake_client
 

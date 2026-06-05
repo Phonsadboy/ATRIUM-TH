@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from typing import Any
 
 from .atrium_domain import agent_message_metadata, system_chat_message, thread_cost_summary
@@ -96,7 +97,43 @@ async def _recent_thread_messages(repo: Any, thread_id: str) -> list[dict[str, A
     return []
 
 
+def _visibility_event_entity_id(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:40]
+
+
+async def _visibility_event_record(repo: Any, key: str) -> dict[str, Any] | None:
+    get_entity = getattr(repo, "get_entity", None)
+    if not callable(get_entity):
+        return None
+    try:
+        record = await get_entity("work_visibility_event", _visibility_event_entity_id(key))
+    except Exception:
+        return None
+    return record if isinstance(record, dict) else None
+
+
+async def _record_visibility_event_key(repo: Any, *, thread_id: str, key: str, message_id: str, ts: int) -> None:
+    put_entity = getattr(repo, "put_entity", None)
+    if not callable(put_entity):
+        return
+    record = {
+        "id": _visibility_event_entity_id(key),
+        "threadId": thread_id,
+        "visibilityEventKey": key,
+        "messageId": message_id,
+        "ts": ts,
+    }
+    try:
+        await put_entity("work_visibility_event", record, status="sent", ts=ts)
+    except TypeError:
+        await put_entity("work_visibility_event", record)
+    except Exception:
+        return
+
+
 async def _has_visibility_event_key(repo: Any, thread_id: str, key: str) -> bool:
+    if await _visibility_event_record(repo, key):
+        return True
     for msg in await _recent_thread_messages(repo, thread_id):
         meta = msg.get("input") if isinstance(msg.get("input"), dict) else {}
         if meta.get("visibilityEventKey") == key:
@@ -268,6 +305,7 @@ async def emit_work_status_notice(
             )
             msg["input"] = input_meta
         await repo.add_message(msg)
+        await _record_visibility_event_key(repo, thread_id=thread_id, key=thread_key, message_id=str(msg.get("id") or ""), ts=ts)
         messages.append(msg)
         hub.pulse({
             "kind": "chat_activity",

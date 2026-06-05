@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import time
 from typing import Any
 
@@ -276,10 +277,29 @@ class OpenAIResponsesProvider:
         return 2
 
     def _request_retry_delay_s(self, attempt: int) -> float:
-        return 0.0
+        base = min(0.5 * (2 ** max(0, attempt)), 4.0)
+        jitter = random.uniform(0.0, min(base * 0.25, 0.5))
+        return base + jitter
 
-    async def _sleep_before_request_retry(self, attempt: int) -> None:
-        delay = self._request_retry_delay_s(attempt)
+    @staticmethod
+    def _retry_after_delay_s(response: httpx.Response | None) -> float | None:
+        if response is None:
+            return None
+        raw = response.headers.get("Retry-After")
+        if not raw:
+            return None
+        try:
+            delay = float(raw)
+        except (TypeError, ValueError):
+            return None
+        if delay < 0:
+            return None
+        return min(delay, 60.0)
+
+    async def _sleep_before_request_retry(self, attempt: int, response: httpx.Response | None = None) -> None:
+        delay = self._retry_after_delay_s(response)
+        if delay is None:
+            delay = self._request_retry_delay_s(attempt)
         if delay > 0:
             await asyncio.sleep(delay)
 
@@ -301,7 +321,7 @@ class OpenAIResponsesProvider:
                 return resp
             except httpx.HTTPStatusError as exc:
                 if attempt < attempts - 1 and self._retryable_http_status(exc.response.status_code):
-                    await self._sleep_before_request_retry(attempt)
+                    await self._sleep_before_request_retry(attempt, exc.response)
                     continue
                 raise
             except httpx.RequestError as exc:
@@ -650,7 +670,7 @@ class OpenAIResponsesProvider:
                         and self._retryable_http_status(status_code)
                     ):
                         stream_request_retry = True
-                        await self._sleep_before_request_retry(request_attempt)
+                        await self._sleep_before_request_retry(request_attempt, exc.response)
                         continue
                     try:
                         detail = exc.response.text[:800]

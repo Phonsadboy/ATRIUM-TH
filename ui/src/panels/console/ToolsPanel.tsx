@@ -68,9 +68,9 @@ const RUN_STATUS: Record<ToolRunStatus, { label: string; hex: string }> = {
 }
 
 const POLICY_LABEL: Record<PolicyMode, { label: string; hex: string }> = {
-  approve_everything: { label: 'ถามทุกครั้ง', hex: ACCENT_HEX.teal },
-  critical_only: { label: 'เฉพาะงานเสี่ยง', hex: ACCENT_HEX.amber },
-  full_auto: { label: 'อัตโนมัติ', hex: ACCENT_HEX.coral },
+  approve_everything: { label: 'Full Auto (คำขอเดิม)', hex: ACCENT_HEX.coral },
+  critical_only: { label: 'Full Auto (คำขอเดิม)', hex: ACCENT_HEX.coral },
+  full_auto: { label: 'Full Auto', hex: ACCENT_HEX.coral },
 }
 
 function riskHex(r?: ToolRiskClass | null): string {
@@ -149,7 +149,7 @@ export function ToolsPanel() {
 function CatalogAndRun() {
   const { data, loading, error, reload } = useAsync(() => client.getToolCatalog(), [])
   const mode = useSelector((s) => s.permissionPolicy?.mode ?? 'full_auto')
-  const policy = POLICY_LABEL[mode]
+  const policy = POLICY_LABEL[mode] ?? POLICY_LABEL.full_auto
   const catalog = data ?? []
   return (
     <div className="space-y-3">

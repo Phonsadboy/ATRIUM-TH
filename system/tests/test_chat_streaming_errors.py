@@ -1,8 +1,9 @@
 import asyncio
 import unittest
+from unittest import mock
 
 from app.chat_streaming import ChatMessageStreamSink, provider_exception_detail
-from app.provider.base import LLMResult
+from app.provider.base import LLMResult, LLMStreamEvent
 
 
 class _FakeSession:
@@ -99,6 +100,53 @@ class ChatMessageStreamSinkTest(unittest.IsolatedAsyncioTestCase):
         channel_reply = repo.messages["msg_reply"]["channelReply"]
         self.assertEqual(channel_reply["progressMessageId"], "100")
         self.assertFalse(repo.messages["msg_reply"]["pending"])
+
+    async def test_finish_appends_final_suffix_instead_of_silent_rewrite(self) -> None:
+        repo = _SinkRepo()
+        pulses: list[dict] = []
+        sink = ChatMessageStreamSink(
+            thread_id="executive",
+            msg_id="msg_reply",
+            message=repo.messages["msg_reply"],
+            cancel_event=asyncio.Event(),
+            repo=repo,
+        )
+
+        with mock.patch("app.chat_streaming.hub.pulse", side_effect=lambda payload: pulses.append(payload)):
+            await sink.handle(LLMStreamEvent(kind="text_delta", text="hello"))
+            result = LLMResult(text="hello world", tokens_in=0, tokens_out=2)
+            message = await sink.finish(result=result)
+
+        self.assertEqual(message["text"], "hello world")
+        self.assertEqual(result.text, "hello world")
+        self.assertEqual(message["streamReconcile"]["mode"], "appended_final_suffix")
+        self.assertTrue(any(pulse.get("kind") == "msg_delta" and pulse.get("chunk") == " world" for pulse in pulses))
+        self.assertEqual(pulses[-1]["kind"], "msg_done")
+        self.assertEqual(pulses[-1]["text"], "hello world")
+
+    async def test_finish_keeps_streamed_text_when_final_text_diverges(self) -> None:
+        repo = _SinkRepo()
+        pulses: list[dict] = []
+        sink = ChatMessageStreamSink(
+            thread_id="executive",
+            msg_id="msg_reply",
+            message=repo.messages["msg_reply"],
+            cancel_event=asyncio.Event(),
+            repo=repo,
+        )
+
+        with mock.patch("app.chat_streaming.hub.pulse", side_effect=lambda payload: pulses.append(payload)):
+            await sink.handle(LLMStreamEvent(kind="text_delta", text="streamed answer"))
+            result = LLMResult(text="provider final", tokens_in=0, tokens_out=2)
+            message = await sink.finish(result=result)
+
+        self.assertEqual(message["text"], "streamed answer")
+        self.assertEqual(result.text, "streamed answer")
+        self.assertEqual(message["streamReconcile"]["mode"], "kept_streamed_text")
+        self.assertEqual(message["streamReconcile"]["reason"], "provider_final_diverged")
+        self.assertEqual(repo.messages["msg_reply"]["text"], "streamed answer")
+        self.assertEqual(pulses[-1]["kind"], "msg_done")
+        self.assertEqual(pulses[-1]["text"], "streamed answer")
 
 
 if __name__ == "__main__":

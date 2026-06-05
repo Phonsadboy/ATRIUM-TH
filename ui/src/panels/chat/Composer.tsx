@@ -30,7 +30,22 @@ function attachmentFromArtifact(artifact: Artifact): MessageAttachment {
     mime: artifact.mime ?? artifact.contentMime ?? null,
     uri: artifact.uri,
     sizeBytes: artifact.contentSizeBytes ?? null,
+    sourcePath: artifact.sourcePath ?? null,
+    sourceSizeBytes: artifact.sourceSizeBytes ?? null,
+    sampledBytes: artifact.sampledBytes ?? null,
+    copyStatus: artifact.copyStatus ?? null,
+    referenceKind: artifact.referenceKind ?? null,
   }
+}
+
+function basenameFromPath(path: string): string {
+  const parts = path.trim().split(/[\\/]+/).filter(Boolean)
+  return parts.at(-1) || path.trim()
+}
+
+function localPathFromFile(file: File): string {
+  const value = (file as File & { path?: unknown }).path
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : ''
 }
 
 function fileSizeLabel(bytes?: number | null): string {
@@ -69,6 +84,9 @@ export function Composer({
   const [attachments, setAttachments] = useState<MessageAttachment[]>([])
   const [uploading, setUploading] = useState(0)
   const [uploadError, setUploadError] = useState<string | null>(null)
+  const [pathEntryOpen, setPathEntryOpen] = useState(false)
+  const [pathValue, setPathValue] = useState('')
+  const [copyPathAttachment, setCopyPathAttachment] = useState(false)
   const [dragActive, setDragActive] = useState(false)
   const [estimate, setEstimate] = useState<InputEstimate | null>(null)
   const [mentions, setMentions] = useState<MessageMentionTarget[] | null>(null)
@@ -182,19 +200,51 @@ export function Composer({
     void client.deleteDraft(threadId).catch(() => undefined)
   }
 
+  const appendArtifact = (artifact: Artifact) => {
+    const next = attachmentFromArtifact(artifact)
+    setAttachments((prev) =>
+      prev.some((a) => a.artifactId === next.artifactId) ? prev : [...prev, next],
+    )
+  }
+
+  const referencePath = (sourcePath: string, input: { artifactName?: string; copyToWorkspace?: boolean } = {}) => {
+    const value = sourcePath.trim()
+    if (!value) return
+    setUploadError(null)
+    setUploading((n) => n + 1)
+    client
+      .referenceAttachment(threadId, {
+        sourcePath: value,
+        artifactName: input.artifactName || basenameFromPath(value),
+        copyToWorkspace: Boolean(input.copyToWorkspace),
+      })
+      .then((res) => appendArtifact(res.artifact))
+      .catch(() => setUploadError(`แนบ ${basenameFromPath(value)} ไม่สำเร็จ`))
+      .finally(() => setUploading((n) => Math.max(0, n - 1)))
+  }
+
+  const addPathReference = () => {
+    const value = pathValue.trim()
+    if (!value) return
+    referencePath(value, { copyToWorkspace: copyPathAttachment })
+    setPathValue('')
+  }
+
   const addFiles = (files: FileList | null) => {
     if (!files?.length) return
     setUploadError(null)
     const selected = Array.from(files)
-    setUploading((n) => n + selected.length)
     selected.forEach((file) => {
+      const sourcePath = localPathFromFile(file)
+      if (sourcePath) {
+        referencePath(sourcePath, { artifactName: file.name, copyToWorkspace: false })
+        return
+      }
+      setUploading((n) => n + 1)
       client
         .uploadAttachment(threadId, file, { artifactName: file.name })
         .then((res) => {
-          const next = attachmentFromArtifact(res.artifact)
-          setAttachments((prev) =>
-            prev.some((a) => a.artifactId === next.artifactId) ? prev : [...prev, next],
-          )
+          appendArtifact(res.artifact)
         })
         .catch(() => setUploadError(`อัปโหลด ${file.name} ไม่สำเร็จ`))
         .finally(() => setUploading((n) => Math.max(0, n - 1)))
@@ -347,6 +397,9 @@ export function Composer({
               <span className="shrink-0" style={{ color: hex }}>↗</span>
               <span className="min-w-0 truncate">{item.name ?? item.artifactId ?? 'ไฟล์แนบ'}</span>
               {item.sizeBytes ? <span className="shrink-0 text-[10px] text-[var(--color-cream-faint)]">{fileSizeLabel(item.sizeBytes)}</span> : null}
+              {item.referenceKind === 'local_path' && item.copyStatus !== 'copied' ? (
+                <span className="shrink-0 text-[10px] text-[var(--color-cream-faint)]">path</span>
+              ) : null}
               <button
                 type="button"
                 onClick={() => removeAttachment(item.artifactId)}
@@ -379,6 +432,50 @@ export function Composer({
           onChange={(e) => addFiles(e.currentTarget.files)}
         />
 
+        {pathEntryOpen && (
+          <div className="flex flex-col gap-1.5 sm:flex-row sm:items-center">
+            <input
+              value={pathValue}
+              onChange={(e) => setPathValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  addPathReference()
+                }
+              }}
+              placeholder="/Users/.../report.pdf"
+              className="min-w-0 flex-1 rounded-lg border bg-[var(--color-surface-2)] px-2.5 py-2 text-[13px] text-[var(--color-cream)] outline-none placeholder:text-[var(--color-cream-faint)]"
+              style={{ borderColor: 'var(--color-line-soft)' }}
+            />
+            <label className="flex shrink-0 items-center gap-1.5 rounded-lg px-2 py-1.5 text-[12px] text-[var(--color-cream-faint)]">
+              <input
+                type="checkbox"
+                checked={copyPathAttachment}
+                onChange={(e) => setCopyPathAttachment(e.currentTarget.checked)}
+                className="h-3.5 w-3.5 accent-[var(--color-cream)]"
+              />
+              ทำสำเนา
+            </label>
+            <button
+              type="button"
+              onClick={addPathReference}
+              disabled={!pathValue.trim() || uploading > 0}
+              className="shrink-0 rounded-lg px-3 py-2 text-[12px] font-semibold transition-opacity disabled:opacity-40"
+              style={{ background: withAlpha(hex, 0.88), color: '#1a1610' }}
+            >
+              แนบ path
+            </button>
+            <button
+              type="button"
+              onClick={() => fileRef.current?.click()}
+              className="shrink-0 rounded-lg border px-3 py-2 text-[12px] text-[var(--color-cream-faint)] hover:bg-[var(--color-surface-2)]"
+              style={{ borderColor: 'var(--color-line-soft)' }}
+            >
+              อัปโหลด
+            </button>
+          </div>
+        )}
+
         <textarea
           ref={taRef}
           value={text}
@@ -408,10 +505,10 @@ export function Composer({
         <div className="flex items-center gap-2">
           <button
             type="button"
-            onClick={() => fileRef.current?.click()}
+            onClick={() => setPathEntryOpen((open) => !open)}
             className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-[var(--color-cream-faint)] transition-colors hover:bg-[var(--color-surface-2)] hover:text-[var(--color-cream-dim)]"
-            title="แนบไฟล์"
-            aria-label="แนบไฟล์"
+            title="แนบ path/ไฟล์"
+            aria-label="แนบ path/ไฟล์"
           >
             <Icon name="plus" size={14} />
           </button>

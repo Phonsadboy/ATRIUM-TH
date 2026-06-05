@@ -553,6 +553,17 @@
             ],
             "title": "Contexttool"
           },
+          "copyStatus": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Copystatus"
+          },
           "createdAt": {
             "title": "Createdat",
             "type": "integer"
@@ -637,6 +648,17 @@
             ],
             "title": "Projectid"
           },
+          "referenceKind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Referencekind"
+          },
           "renderId": {
             "anyOf": [
               {
@@ -670,6 +692,39 @@
               }
             ],
             "title": "Reviewstatus"
+          },
+          "sampledBytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sampledbytes"
+          },
+          "sourcePath": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sourcepath"
+          },
+          "sourceSizeBytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sourcesizebytes"
           },
           "status": {
             "enum": [
@@ -1092,6 +1147,17 @@
             ],
             "title": "Contentstatus"
           },
+          "copyStatus": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Copystatus"
+          },
           "note": {
             "title": "Note",
             "type": "string"
@@ -1116,6 +1182,50 @@
                 "type": "null"
               }
             ]
+          },
+          "referenceKind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Referencekind"
+          },
+          "sampledBytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sampledbytes"
+          },
+          "sourcePath": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sourcepath"
+          },
+          "sourceSizeBytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sourcesizebytes"
           },
           "storage": {
             "anyOf": [
@@ -1275,6 +1385,75 @@
           "departmentId"
         ],
         "title": "AssignTaskInput",
+        "type": "object"
+      },
+      "AttachmentReferenceInput": {
+        "properties": {
+          "artifactName": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Artifactname"
+          },
+          "copyToWorkspace": {
+            "default": false,
+            "title": "Copytoworkspace",
+            "type": "boolean"
+          },
+          "projectId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Projectid"
+          },
+          "sourcePath": {
+            "title": "Sourcepath",
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Tags",
+            "type": "array"
+          },
+          "targetDept": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Targetdept"
+          },
+          "threadId": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Threadid"
+          }
+        },
+        "required": [
+          "sourcePath"
+        ],
+        "title": "AttachmentReferenceInput",
         "type": "object"
       },
       "AuditLogEntry": {
@@ -6458,6 +6637,11 @@
             "title": "Counts",
             "type": "object"
           },
+          "database": {
+            "additionalProperties": true,
+            "title": "Database",
+            "type": "object"
+          },
           "engine": {
             "additionalProperties": true,
             "title": "Engine",
@@ -6491,6 +6675,7 @@
           "provider",
           "engine",
           "jobs",
+          "database",
           "graph",
           "memory",
           "counts"
@@ -7428,6 +7613,18 @@
             ],
             "title": "Contextargs"
           },
+          "contextMaxChars": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional per-message attachment text context limit. Use includeFullContext for full known-size text.",
+            "title": "Contextmaxchars"
+          },
           "contextTool": {
             "anyOf": [
               {
@@ -7438,6 +7635,29 @@
               }
             ],
             "title": "Contexttool"
+          },
+          "copyStatus": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Copystatus"
+          },
+          "includeFullContext": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "When true, include as much extracted attachment text as possible instead of the default preview limit.",
+            "title": "Includefullcontext"
           },
           "kind": {
             "anyOf": [
@@ -7494,6 +7714,17 @@
             ],
             "title": "Projectid"
           },
+          "referenceKind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Referencekind"
+          },
           "renderId": {
             "anyOf": [
               {
@@ -7516,6 +7747,17 @@
             ],
             "title": "Reviewstatus"
           },
+          "sampledBytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sampledbytes"
+          },
           "sizeBytes": {
             "anyOf": [
               {
@@ -7526,6 +7768,28 @@
               }
             ],
             "title": "Sizebytes"
+          },
+          "sourcePath": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sourcepath"
+          },
+          "sourceSizeBytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Sourcesizebytes"
           },
           "timelineId": {
             "anyOf": [
@@ -8798,6 +9062,18 @@
             "title": "Deniedtools",
             "type": "array"
           },
+          "fullAutonomyStatus": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fullautonomystatus"
+          },
           "mode": {
             "default": "full_auto",
             "enum": [
@@ -8813,6 +9089,17 @@
             ],
             "title": "Mode",
             "type": "string"
+          },
+          "requestedAgentFullAccess": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requestedagentfullaccess"
           },
           "requestedMode": {
             "anyOf": [
@@ -10999,6 +11286,18 @@
               }
             ],
             "title": "Executorroute"
+          },
+          "fullAutonomy": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fullautonomy"
           },
           "id": {
             "title": "Id",
@@ -13449,6 +13748,44 @@
           }
         },
         "summary": "List Artifact Versions"
+      }
+    },
+    "/api/attachments/reference": {
+      "post": {
+        "operationId": "reference_attachment_api_attachments_reference_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AttachmentReferenceInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportFileResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reference Attachment"
       }
     },
     "/api/attachments/upload": {
@@ -16232,6 +16569,50 @@
         "summary": "Get Knowledge Debt"
       }
     },
+    "/api/knowledge/embedding-migration": {
+      "get": {
+        "operationId": "knowledge_embedding_migration_status_api_knowledge_embedding_migration_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 20,
+              "maximum": 200,
+              "minimum": 0,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Knowledge Embedding Migration Status Api Knowledge Embedding Migration Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Knowledge Embedding Migration Status"
+      }
+    },
     "/api/knowledge/import": {
       "post": {
         "operationId": "import_knowledge_api_knowledge_import_post",
@@ -16270,6 +16651,62 @@
           }
         },
         "summary": "Import Knowledge"
+      }
+    },
+    "/api/knowledge/reembed-stale": {
+      "post": {
+        "operationId": "reembed_stale_knowledge_api_knowledge_reembed_stale_post",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 1000,
+              "maximum": 10000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "batchSize",
+            "required": false,
+            "schema": {
+              "default": 8,
+              "maximum": 64,
+              "minimum": 1,
+              "title": "Batchsize",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Reembed Stale Knowledge Api Knowledge Reembed Stale Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Reembed Stale Knowledge"
       }
     },
     "/api/knowledge/search": {

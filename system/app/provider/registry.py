@@ -169,6 +169,44 @@ def provider_health(settings: Settings | None = None, *, probe_accounts: bool = 
         "hasClaudeCodeAccount": has_claude_code_account,
         "claudeCodeAuth": claude_code_status,
         "claudeCodeCommand": settings.claude_code_command,
+        "recoveryPolicy": provider_recovery_policy(settings),
+    }
+
+
+def provider_recovery_policy(settings: Settings | None = None) -> dict:
+    settings = settings or get_settings()
+    return {
+        "visibilityOnly": True,
+        "hardCircuitBreaker": False,
+        "engineCircuitBreaker": {
+            "enabled": False,
+            "reason": "Full Autonomy keeps provider calls available; failures surface as retryable errors or queued job recovery, not a global provider stop gate.",
+        },
+        "requestTimeoutS": settings.provider_request_timeout_s,
+        "retryLayers": {
+            "anthropicSdk": {
+                "maxRetries": 2,
+                "scope": "Anthropic SDK client",
+            },
+            "openaiResponses": {
+                "attempts": 2,
+                "retryableHttpStatuses": [408, 409, 425, 429, 500, 501, 502, 503, 504],
+                "retryableTransportErrors": ["TimeoutException", "TransportError"],
+                "backoff": "exponential+jitter",
+                "honorsRetryAfter": True,
+            },
+            "chatgptAccountResponses": {
+                "attempts": 2,
+                "backoff": "exponential+jitter",
+                "scope": "ChatGPT account Responses transport",
+            },
+        },
+        "resume": {
+            "manualMessageRetryRoute": "/api/messages/{thread_id}/retry",
+            "nonChatJobTimeoutRecovery": "requeue",
+            "runtimeDegradedRetry": True,
+            "imageWorkerRetryRequeue": True,
+        },
     }
 
 

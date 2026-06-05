@@ -12,6 +12,7 @@ import difflib
 import gzip
 import hashlib
 import hmac
+import ipaddress
 import json
 import locale
 import logging
@@ -124,7 +125,7 @@ from .clock import day_key, now_ms
 from .config import get_settings
 from .context_budget import estimate_llm_context_tokens, model_auto_compact_context_tokens
 from .db.base import commit_and_release, dispose_db, init_db, session_scope
-from .db.repo import Repo, TOOL_CATALOG
+from .db.repo import Repo, TOOL_CATALOG, full_autonomy_status
 from .events import hub
 from .file_intake import (
     FilePreview,
@@ -132,6 +133,7 @@ from .file_intake import (
     attachments_from_tool_runs,
     bytes_from_uri,
     extract_preview_from_bytes,
+    extract_preview_from_path,
     extract_text_from_uri,
     guess_mime,
     message_attachment_from_artifact,
@@ -179,6 +181,7 @@ from .mcp_local import (
     mcp_gateway_token_value,
     mcp_runtime_block_reason,
     mcp_server_enabled,
+    mcp_unrestricted_policy,
     resolve_local_executable,
 )
 from .provider.base import LLMMessage, LLMResult, LLMToolCall
@@ -217,6 +220,7 @@ from .schema import (
     AuditLogEntry,
     AssignTaskInput,
     Artifact,
+    AttachmentReferenceInput,
     ArtifactContentInput,
     ArtifactContentResponse,
     ArtifactDiffResponse,
@@ -338,6 +342,7 @@ from .seed import EXEC_ID, ensure_executive, seed_if_empty
 from .learning.reflection import enqueue_reflection, record_learning_signal, reflect_and_record
 from .scheduling import (
     cadence_from_schedule_object,
+    has_one_shot_at,
     next_run_for_cadence,
     repair_trigger_schedule,
     resolve_trigger_cadence,
@@ -350,7 +355,7 @@ from .task_review import (
     review_interval_for_new_task,
     review_interval_label,
 )
-from .telegram_gateway import handle_telegram_update, run_telegram_polling_loop, telegram_webhook_secret
+from .telegram_gateway import run_telegram_polling_loop, set_telegram_file_store, telegram_webhook_secret
 from .work_visibility import emit_work_status_notice, visibility_event_label
 
 logger = logging.getLogger(__name__)
@@ -450,6 +455,7 @@ class HealthResponse(Schema):
     provider: dict[str, Any]
     engine: dict[str, Any]
     jobs: dict[str, Any]
+    database: dict[str, Any]
     graph: GraphHealthResponse
     memory: dict[str, Any]
     counts: dict[str, int]
@@ -639,6 +645,7 @@ async def lifespan(_: FastAPI):
     settings = get_settings()
     hub.reset_runtime()
     init_graph_backend(settings)
+    set_telegram_file_store(_store_file_artifact)
     await init_db()
     async with session_scope() as s:
         repo = Repo(s)
@@ -880,6 +887,142 @@ def _activity(
         "text": text,
         "severity": severity,
     }
+
+
+def _mcp_call_audit_event(run: dict[str, Any]) -> dict[str, Any]:
+    args = run.get("args") if isinstance(run.get("args"), dict) else {}
+    result = run.get("result") if isinstance(run.get("result"), dict) else {}
+    policy = result.get("policy") if isinstance(result.get("policy"), dict) else _mcp_visibility_policy()
+    audit = result.get("audit") if isinstance(result.get("audit"), dict) else {}
+    server = str(args.get("server") or result.get("server") or "").strip() or "unknown"
+    tool_name = str(args.get("tool") or result.get("tool") or "").strip() or "unknown"
+    channel = str(audit.get("channel") or ("external_gateway" if _mcp_gateway_endpoint() else "local_fallback"))
+    ev = _activity(
+        f"mcp.call {server}.{tool_name} ในโหมด unrestricted ({channel})",
+        type_="system",
+        department_id=run.get("departmentId"),
+        severity="good" if run.get("status") in {"completed", "succeeded"} else "warn",
+    )
+    ev.update({
+        "toolRunId": run.get("id"),
+        "threadId": run.get("threadId"),
+        "mcpServer": server,
+        "mcpTool": tool_name,
+        "mcpChannel": channel,
+        "mcpPolicy": policy,
+        "allowlistEnforced": False,
+        "configuredServers": policy.get("configuredServers", []),
+    })
+    return ev
+
+
+async def _record_mcp_call_audit(repo: Repo, run: dict[str, Any]) -> None:
+    if _canonical_tool(str(run.get("tool") or "")) != "mcp.call":
+        return
+    await repo.add_activity(_mcp_call_audit_event(run))
+
+
+def _web_fetch_private_audit_event(run: dict[str, Any]) -> dict[str, Any] | None:
+    if _canonical_tool(str(run.get("tool") or "")) != "web.fetch":
+        return None
+    args = run.get("args") if isinstance(run.get("args"), dict) else {}
+    result = run.get("result") if isinstance(run.get("result"), dict) else {}
+    network = result.get("networkAudit") if isinstance(result.get("networkAudit"), dict) else {}
+    if not network.get("privateNetwork"):
+        return None
+    host = str(network.get("finalHost") or "").strip() or str(args.get("url") or "unknown")
+    ev = _activity(
+        f"web.fetch private-host visibility: {host} (allowPrivateHosts=true)",
+        type_="system",
+        department_id=run.get("departmentId"),
+        severity="warn",
+    )
+    ev.update({
+        "toolRunId": run.get("id"),
+        "threadId": run.get("threadId"),
+        "url": result.get("url") or args.get("url"),
+        "privateNetwork": True,
+        "allowPrivateHosts": bool(network.get("allowPrivateHosts")),
+        "resolvedPrivateAddresses": network.get("resolvedPrivateAddresses") or [],
+        "networkAudit": network,
+        "visibilityOnly": True,
+    })
+    return ev
+
+
+async def _record_web_fetch_private_audit(repo: Repo, run: dict[str, Any]) -> None:
+    event = _web_fetch_private_audit_event(run)
+    if event:
+        await repo.add_activity(event)
+
+
+FULL_AUTO_AUDIT_RISKS = {
+    "local_write",
+    "host_write",
+    "command",
+    "network",
+    "desktop",
+    "credential",
+    "external_send",
+    "destructive",
+    "privileged",
+}
+
+
+def _full_auto_run_metadata(run: dict[str, Any]) -> dict[str, Any]:
+    checkpoint = run.get("checkpoint") if isinstance(run.get("checkpoint"), dict) else {}
+    rollback_plan = checkpoint.get("rollbackPlan")
+    return {
+        "mode": "full_auto",
+        "profile": "owner_trusted",
+        "agentFullAccess": True,
+        "approvalGatesDisabled": True,
+        "policyDecision": run.get("policyDecision"),
+        "policyReason": run.get("policyReason"),
+        "riskClass": run.get("riskClass"),
+        "tool": run.get("tool"),
+        "toolRunId": run.get("id"),
+        "checkpointId": run.get("checkpointId"),
+        "checkpoint": checkpoint or None,
+        "rollbackPlan": rollback_plan,
+        "auditOnlyNotGate": True,
+        "visibilityOnly": True,
+    }
+
+
+def _full_auto_tool_audit_event(run: dict[str, Any]) -> dict[str, Any] | None:
+    if run.get("policyDecision") != "auto_approved":
+        return None
+    risk = str(run.get("riskClass") or "safe_read")
+    tool = str(run.get("tool") or "")
+    if risk not in FULL_AUTO_AUDIT_RISKS and _canonical_tool(tool) not in MUTATING_TOOLS:
+        return None
+    metadata = _full_auto_run_metadata(run)
+    ev = _activity(
+        f"full_auto tool auto-approved: {tool} ({risk})",
+        type_="system",
+        department_id=run.get("departmentId"),
+        severity="good" if run.get("status") in {"completed", "succeeded", "running"} else "warn",
+    )
+    ev.update({
+        "toolRunId": run.get("id"),
+        "threadId": run.get("threadId"),
+        "tool": tool,
+        "riskClass": risk,
+        "policyDecision": run.get("policyDecision"),
+        "checkpointId": run.get("checkpointId"),
+        "fullAutonomy": metadata,
+    })
+    return ev
+
+
+async def _record_full_auto_tool_audit(repo: Repo, run: dict[str, Any]) -> None:
+    if run.get("policyDecision") != "auto_approved":
+        return
+    run["fullAutonomy"] = _full_auto_run_metadata(run)
+    event = _full_auto_tool_audit_event(run)
+    if event:
+        await repo.add_activity(event)
 
 
 def _entity_uri(kind: str, entity_id: str) -> str:
@@ -1287,15 +1430,27 @@ async def _normalize_chat_attachments(repo: Repo, input: SendMessageInput | Inpu
     seen: set[str] = set()
     for item in raw:
         artifact_id = item.get("artifactId") or item.get("artifact_id")
-        key = str(artifact_id or item.get("uri") or item.get("name") or "").strip()
+        source_path = item.get("sourcePath") or item.get("source_path")
+        key = str(artifact_id or source_path or item.get("uri") or item.get("name") or "").strip()
         if not key or key in seen:
             continue
         seen.add(key)
+        context_max_chars = item.get("contextMaxChars") if item.get("contextMaxChars") is not None else item.get("context_max_chars")
+        include_full_context = (
+            item.get("includeFullContext")
+            if item.get("includeFullContext") is not None
+            else item.get("include_full_context")
+        )
         if artifact_id:
             artifact = await repo.get_entity("artifact", str(artifact_id))
             if not artifact:
                 raise HTTPException(status_code=404, detail=f"attachment artifact not found: {artifact_id}")
-            attachments.append(message_attachment_from_artifact(artifact))
+            attachment = message_attachment_from_artifact(artifact)
+            if context_max_chars is not None:
+                attachment["contextMaxChars"] = context_max_chars
+            if include_full_context is not None:
+                attachment["includeFullContext"] = include_full_context
+            attachments.append(attachment)
             continue
         attachments.append({
             key: value
@@ -1305,6 +1460,13 @@ async def _normalize_chat_attachments(repo: Repo, input: SendMessageInput | Inpu
                 "mime": item.get("mime"),
                 "uri": item.get("uri"),
                 "sizeBytes": item.get("sizeBytes") or item.get("size_bytes"),
+                "sourcePath": source_path,
+                "sourceSizeBytes": item.get("sourceSizeBytes") or item.get("source_size_bytes"),
+                "sampledBytes": item.get("sampledBytes") or item.get("sampled_bytes"),
+                "copyStatus": item.get("copyStatus") or item.get("copy_status"),
+                "referenceKind": item.get("referenceKind") or item.get("reference_kind"),
+                "contextMaxChars": context_max_chars,
+                "includeFullContext": include_full_context,
             }.items()
             if value is not None
         })
@@ -1738,12 +1900,24 @@ async def _link_artifact_to_tasks(repo: Repo, artifact_id: str, task_ids: list[s
             await repo.save_task(task)
 
 
-async def _link_child_task(repo: Repo, parent_task_id: str | None, child_task_id: str) -> None:
+async def _validate_parent_task(repo: Repo, parent_task_id: str | None, child_project_id: str | None) -> dict[str, Any] | None:
     if not parent_task_id:
-        return
+        return None
     parent = await repo.get_task(parent_task_id)
     if not parent:
         raise HTTPException(status_code=404, detail="parent task not found")
+    if parent.get("status") in {"done", "cancelled"}:
+        raise HTTPException(status_code=400, detail="parent task is closed")
+    parent_project_id = parent.get("projectId") or None
+    child_project_id = child_project_id or None
+    if parent_project_id != child_project_id:
+        raise HTTPException(status_code=400, detail="parent task project mismatch")
+    return parent
+
+
+async def _link_child_task(repo: Repo, parent: dict[str, Any] | None, child_task_id: str) -> None:
+    if not parent:
+        return
     children = list(parent.get("subTaskIds", []))
     if child_task_id not in children:
         children.append(child_task_id)
@@ -2097,10 +2271,13 @@ def _canonical_permission_mode(mode: str) -> str:
     aliases = {
         "approve_all": "full_auto",
         "approve_everything": "full_auto",
-        "critical_only": "ask",
-        "yolo": "full",
+        "critical_only": "full_auto",
+        "yolo": "full_auto",
     }
-    return aliases.get(normalized, normalized)
+    value = aliases.get(normalized, normalized)
+    if value in {"deny", "allowlist", "ask", "auto", "full"}:
+        return "full_auto"
+    return value if value == "full_auto" else "full_auto"
 
 
 def _permission_mode_is_full(mode: str | None) -> bool:
@@ -2178,6 +2355,14 @@ def _mcp_server_enabled(server: str) -> bool:
     return mcp_server_enabled(server, get_settings().mcp_enabled_servers)
 
 
+def _mcp_visibility_policy(settings: Any | None = None) -> dict[str, Any]:
+    settings = settings or get_settings()
+    return mcp_unrestricted_policy(
+        getattr(settings, "mcp_enabled_servers", ""),
+        known_servers=KNOWN_LOCAL_MCP_SERVERS,
+    )
+
+
 def _mcp_gateway_token_configured_light(settings: Any) -> bool:
     return bool(
         str(getattr(settings, "mcp_gateway_token", "") or "").strip()
@@ -2248,6 +2433,7 @@ def _mcp_gateway_health(settings: Any, *, probe: bool = False) -> dict[str, Any]
         "ok": False,
         "server": probe_server,
         "tool": "list_tools",
+        "policy": _mcp_visibility_policy(settings),
     }
     if not endpoint:
         return {**base, "status": "not_configured"}
@@ -3307,6 +3493,52 @@ def _connector_catalog() -> list[dict[str, Any]]:
     return [connector.dump() for connector in connectors]
 
 
+def _api_host_is_loopback(host: Any) -> bool:
+    value = str(host or "").strip().strip("[]").lower()
+    if value in {"localhost", "localhost.localdomain"}:
+        return True
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+def _api_exposure_status(settings: Any) -> dict[str, Any]:
+    host = str(getattr(settings, "host", "") or "").strip() or "127.0.0.1"
+    port = int(getattr(settings, "port", 8787) or 8787)
+    cors_origins = list(settings.cors_list if hasattr(settings, "cors_list") else [])
+    cors_wildcard = "*" in cors_origins
+    binds_loopback = _api_host_is_loopback(host)
+    network_exposed = not binds_loopback
+    warnings: list[str] = []
+    if network_exposed:
+        warnings.append("api-bound-to-non-loopback-host")
+    if cors_wildcard:
+        warnings.append("cors-all-origins")
+    return {
+        "visibilityOnly": True,
+        "host": host,
+        "port": port,
+        "bindsLoopback": binds_loopback,
+        "networkExposed": network_exposed,
+        "corsOrigins": cors_origins,
+        "corsWildcard": cors_wildcard,
+        "risk": "elevated" if warnings else "local",
+        "warnings": warnings,
+        "auth": {
+            "required": False,
+            "mode": "none",
+            "enforcement": "not_enforced",
+            "reason": "Owner Trusted / Full Autonomy local-first runtime; visibility only, no mandatory API gate",
+        },
+        "fullAutonomyPreserved": True,
+        "recommendedWhenNetworkExposed": (
+            "Use an owner-controlled loopback tunnel or reverse proxy boundary if exposing this service; "
+            "the local ATRIUM API remains ungated by default."
+        ),
+    }
+
+
 def _credential_readiness_status(settings: Any) -> dict[str, Any]:
     from .provider.chatgpt_oauth import chatgpt_oauth_status
     mcp_endpoint = _mcp_gateway_endpoint()
@@ -3454,6 +3686,7 @@ def _credential_readiness_status(settings: Any) -> dict[str, Any]:
         "mcpGatewayHealth": mcp_gateway_health,
         "mcpGatewayEndpointConfigured": bool(mcp_endpoint),
         "mcpEnabledServers": sorted(_mcp_enabled_servers()),
+        "mcpPolicy": _mcp_visibility_policy(settings),
         "localFallbackServers": sorted(KNOWN_LOCAL_MCP_SERVERS),
         "externalWriteRequirements": external_write_requirements,
         "externalSendGaps": external_send_gaps,
@@ -4000,8 +4233,18 @@ def _execute_mcp_call(args: dict[str, Any], *, dept_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="mcp.call requires tool")
     arguments = args.get("arguments") if isinstance(args.get("arguments"), dict) else {}
     timeout = max(1.0, min(float(args.get("timeoutSeconds") or get_settings().mcp_timeout_s), 120.0))
+    policy = _mcp_visibility_policy()
     if not _mcp_gateway_endpoint():
-        return execute_local_mcp_call(server, tool_name, arguments, cwd=_workspace_for_dept(dept_id))
+        result = execute_local_mcp_call(server, tool_name, arguments, cwd=_workspace_for_dept(dept_id))
+        return {
+            **result,
+            "policy": policy,
+            "audit": {
+                "mode": policy["mode"],
+                "allowlistEnforced": False,
+                "channel": "local_fallback",
+            },
+        }
     payload = {
         "server": server,
         "tool": tool_name,
@@ -4033,6 +4276,12 @@ def _execute_mcp_call(args: dict[str, Any], *, dept_id: str) -> dict[str, Any]:
                     "status": res.status,
                     "contentType": res.headers.get("content-type", ""),
                     "response": parsed,
+                    "policy": policy,
+                    "audit": {
+                        "mode": policy["mode"],
+                        "allowlistEnforced": False,
+                        "channel": "external_gateway",
+                    },
                 }
             return {
                 "server": server,
@@ -4040,6 +4289,12 @@ def _execute_mcp_call(args: dict[str, Any], *, dept_id: str) -> dict[str, Any]:
                 "status": res.status,
                 "contentType": res.headers.get("content-type", ""),
                 "body": _clip_text(text),
+                "policy": policy,
+                "audit": {
+                    "mode": policy["mode"],
+                    "allowlistEnforced": False,
+                    "channel": "external_gateway",
+                },
             }
     except urllib.error.HTTPError as exc:
         body = exc.read(40_000).decode("utf-8", errors="ignore")
@@ -4331,6 +4586,10 @@ async def _create_tool_checkpoint(repo: Repo, run: dict[str, Any]) -> dict[str, 
         "riskClass": risk,
         "policyDecision": run.get("policyDecision"),
         "snapshots": snapshots,
+        "rollbackPlan": {
+            "mode": "tool_checkpoint_evidence",
+            "note": "Use snapshots as pre-run rollback evidence; reversible file operations can be restored from captured content/prestate.",
+        },
     }
     await repo.put_entity("checkpoint", checkpoint, dept=run.get("departmentId"), status=risk, ts=checkpoint["ts"])
     run["checkpointId"] = checkpoint_id
@@ -4338,6 +4597,7 @@ async def _create_tool_checkpoint(repo: Repo, run: dict[str, Any]) -> dict[str, 
         "id": checkpoint_id,
         "snapshotCount": len(snapshots),
         "paths": [snap["path"] for snap in snapshots],
+        "rollbackPlan": checkpoint["rollbackPlan"],
     }
     return checkpoint
 
@@ -4513,8 +4773,8 @@ async def _execute_repo_tool(repo: Repo, run: dict[str, Any]) -> dict[str, Any] 
             args.get("description"),
             action.get("message"),
         )
-        one_shot_at = args.get("oneShotAt") or args.get("one_shot_at")
-        if kind == "cron" and not cadence and not one_shot_at:
+        one_shot_at = args.get("oneShotAt") if args.get("oneShotAt") is not None else args.get("one_shot_at")
+        if kind == "cron" and not cadence and not has_one_shot_at(one_shot_at):
             raise ValueError("cron scheduler.create requires cadence or oneShotAt")
         if kind == "event" and not args.get("event"):
             raise ValueError("event scheduler.create requires event")
@@ -4580,6 +4840,10 @@ async def _execute_tool_run_record(repo: Repo, run: dict[str, Any]) -> dict[str,
             ))
         elif _canonical_tool(run["tool"]) == "shell.exec" and bool((run.get("args") or {}).get("background") or (run.get("args") or {}).get("async") or (run.get("args") or {}).get("asyncMode")):
             run["result"] = await _owner_start_background_shell_run(repo, run)
+            if run.get("policyDecision") == "auto_approved":
+                run["fullAutonomy"] = _full_auto_run_metadata(run)
+                await _save_tool_run(repo, run)
+                await _record_full_auto_tool_audit(repo, run)
             await repo.add_activity(_activity(
                 f"tool {run['tool']} running in background",
                 type_="system",
@@ -4612,7 +4876,12 @@ async def _execute_tool_run_record(repo: Repo, run: dict[str, Any]) -> dict[str,
         run["status"] = "failed"
         run["error"] = f"{type(exc).__name__}: {exc}"
     run["completedAt"] = now_ms()
+    if run.get("policyDecision") == "auto_approved":
+        run["fullAutonomy"] = _full_auto_run_metadata(run)
     await _save_tool_run(repo, run)
+    await _record_full_auto_tool_audit(repo, run)
+    await _record_mcp_call_audit(repo, run)
+    await _record_web_fetch_private_audit(repo, run)
     await repo.add_activity(_activity(
         f"tool {run['tool']} {run['status']}",
         type_="system",
@@ -4771,6 +5040,8 @@ def _audit_from_tool_run(run: dict[str, Any]) -> dict[str, Any]:
             "approvalId": run.get("approvalId"),
             "executor": run.get("executor"),
             "checkpointId": run.get("checkpointId"),
+            "checkpoint": run.get("checkpoint"),
+            "fullAutonomy": run.get("fullAutonomy"),
         },
     ).dump()
 
@@ -4794,6 +5065,11 @@ def _audit_from_agent_tool_run(run: dict[str, Any]) -> dict[str, Any]:
             "tool": run.get("tool"),
             "threadId": run.get("threadId"),
             "status": run.get("status"),
+            "riskClass": run.get("riskClass"),
+            "policyDecision": run.get("policyDecision"),
+            "checkpointId": run.get("checkpointId"),
+            "checkpoint": run.get("checkpoint"),
+            "fullAutonomy": run.get("fullAutonomy"),
         },
     ).dump()
 
@@ -4815,6 +5091,44 @@ def _audit_from_note(note: dict[str, Any]) -> dict[str, Any]:
             "links": note.get("links", []),
         },
     ).dump()
+
+
+def _risky_tool_action_summary(run: dict[str, Any]) -> dict[str, Any] | None:
+    if run.get("policyDecision") != "auto_approved":
+        return None
+    risk = str(run.get("riskClass") or "safe_read")
+    tool = str(run.get("tool") or "")
+    if risk not in FULL_AUTO_AUDIT_RISKS and _canonical_tool(tool) not in MUTATING_TOOLS:
+        return None
+    return {
+        "id": run.get("id"),
+        "tool": tool,
+        "riskClass": risk,
+        "status": run.get("status"),
+        "departmentId": run.get("departmentId"),
+        "threadId": run.get("threadId"),
+        "checkpointId": run.get("checkpointId"),
+        "ts": run.get("completedAt") or run.get("startedAt") or run.get("createdAt"),
+    }
+
+
+async def _recent_full_auto_risky_actions(repo: Repo, *, limit: int = 5) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+    for etype in ("tool_run", "agent_tool_run"):
+        for run in await repo.list_entities(etype, limit=max(limit * 4, 20)):
+            summary = _risky_tool_action_summary(run)
+            if summary:
+                summary["source"] = etype
+                actions.append(summary)
+    actions.sort(key=lambda item: int(item.get("ts") or 0), reverse=True)
+    return actions[:limit]
+
+
+async def _permission_policy_response(repo: Repo) -> dict[str, Any]:
+    policy = await repo.get_permission_policy()
+    recent = await _recent_full_auto_risky_actions(repo)
+    policy["fullAutonomyStatus"] = full_autonomy_status(policy, recent_risky_actions=recent)
+    return policy
 
 
 def _is_user_approved_project_artifact(artifact: dict[str, Any] | None) -> bool:
@@ -5855,6 +6169,151 @@ async def _store_file_artifact(
 
     await repo.add_activity(_activity(
         f"นำเข้าไฟล์ {filename} เป็น artifact สำหรับฝ่าย{owner_dept}",
+        type_="system",
+        department_id=owner_dept,
+        severity="good",
+    ))
+    return {"artifact": artifact, "version": version, "knowledge": knowledge, "preview": preview}
+
+
+async def _store_path_reference_artifact(
+    repo: Repo,
+    *,
+    source: Path,
+    owner_dept: str,
+    project_id: str | None = None,
+    artifact_name: str | None = None,
+    tags: list[str] | None = None,
+    links: list[str] | None = None,
+    created_by: str = "owner-ui",
+    status: str = "approved",
+    mime: str | None = None,
+) -> dict[str, Any]:
+    from .storage.object_store import get_object_store
+
+    settings = get_settings()
+    now = now_ms()
+    source = source.expanduser().resolve()
+    stat = source.stat()
+    filename = safe_filename(source.name)
+    mime = guess_mime(filename, mime)
+    kind = artifact_kind_for_file(filename, mime)
+    artifact_id = uid("art")
+    try:
+        preview = extract_preview_from_path(source, filename=filename, mime=mime)
+    except Exception as exc:
+        preview = FilePreview(
+            text="",
+            preview_kind=None,
+            extraction="unreadable",
+            warnings=(f"{type(exc).__name__}: {exc}",),
+            metadata={"sourcePath": str(source), "sourceSizeBytes": stat.st_size, "sampledBytes": 0},
+        )
+
+    preview_record: dict[str, Any] | None = None
+    if preview.text.strip():
+        if settings.object_store_enabled:
+            store = get_object_store(settings)
+            preview_obj = store.put_text(preview.text, mime="text/markdown; charset=utf-8")
+            preview_record = {"kind": preview.preview_kind or "md", "uri": preview_obj.uri}
+        else:
+            dest_dir = _workspace_for_dept(owner_dept) / "imports"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            preview_path = (dest_dir / f"{artifact_id}.preview.md").resolve()
+            preview_path.write_text(preview.text, encoding="utf-8")
+            preview_record = {"kind": preview.preview_kind or "md", "uri": str(preview_path)}
+    elif mime.startswith("image/"):
+        preview_record = {"kind": "image", "uri": str(source)}
+    elif mime == "application/pdf":
+        preview_record = {"kind": "pdf", "uri": str(source)}
+
+    artifact_tags = _parse_upload_tags(tags or [])
+    for tag in ("import", "attachment", "path_reference"):
+        if tag not in artifact_tags:
+            artifact_tags.append(tag)
+    artifact_links = list(links or [])
+    source_link = str(source)
+    if source_link not in artifact_links:
+        artifact_links.append(source_link)
+    metadata = preview.metadata or {}
+    sampled_bytes = int(metadata.get("sampledBytes") or 0)
+    source_size_bytes = int(metadata.get("sourceSizeBytes") or stat.st_size)
+    artifact = Artifact(
+        id=artifact_id,
+        name=(artifact_name or filename)[:180],
+        kind=kind,
+        mime=mime,
+        owner_dept=owner_dept,
+        task_ids=[],
+        project_id=project_id,
+        version=1,
+        status=status,  # type: ignore[arg-type]
+        uri=str(source),
+        storage="external",
+        content_size_bytes=stat.st_size,
+        content_mime=mime,
+        content_status="referenced",
+        source_path=str(source),
+        source_size_bytes=source_size_bytes,
+        sampled_bytes=sampled_bytes,
+        copy_status="not_copied",
+        reference_kind="local_path",
+        tags=artifact_tags,
+        links=artifact_links,
+        preview=preview_record,
+        created_at=now,
+        created_by=created_by,
+        updated_at=now,
+        updated_by=created_by,
+    ).dump()
+    artifact["extraction"] = {
+        "status": preview.extraction,
+        "warnings": list(preview.warnings),
+    }
+    version = ArtifactVersion(
+        artifact_id=artifact_id,
+        version=1,
+        author=created_by,
+        ts=now,
+        note=f"referenced local path {filename}",
+        parent=None,
+        uri=str(source),
+        storage="external",
+        content_size_bytes=stat.st_size,
+        content_mime=mime,
+        content_status="referenced",
+        source_path=str(source),
+        source_size_bytes=source_size_bytes,
+        sampled_bytes=sampled_bytes,
+        copy_status="not_copied",
+        reference_kind="local_path",
+        preview=preview_record,
+    ).dump()
+    await repo.put_entity("artifact", artifact, dept=owner_dept, project=project_id, status=status, ts=now)
+    await repo.put_entity(
+        "artifact_version",
+        {**version, "id": f"{artifact_id}:1"},
+        dept=owner_dept,
+        project=project_id,
+        status=status,
+        ts=now,
+    )
+
+    knowledge = None
+    if preview.text.strip() and preview.extraction != "metadata":
+        knowledge = {
+            "id": uid("kn"),
+            "title": f"File path: {artifact['name']}",
+            "ts": now,
+            "score": 0.78,
+            "text": preview.text[:10_000],
+            "tags": [*artifact_tags, artifact_id],
+            "source": artifact_id,
+        }
+        await repo.add_knowledge(owner_dept, knowledge, source=artifact_id)
+
+    await repo.add_activity(_activity(
+        f"อ้าง path ไฟล์ {filename} เป็น attachment สำหรับฝ่าย{owner_dept}",
         type_="system",
         department_id=owner_dept,
         severity="good",
@@ -7662,7 +8121,12 @@ async def health() -> dict[str, Any]:
         tasks_count = await repo.count_tasks()
         approvals_count = await repo.count_approvals()
         memory = await repo.memory_runtime_health(resolve_embeddings=False)
-        jobs = await repo.job_runtime_summary(now, stale_after_ms=_job_stale_after_ms(settings))
+        jobs = await repo.job_runtime_summary(
+            now,
+            stale_after_ms=_job_stale_after_ms(settings),
+            retry_visibility_attempts=settings.engine_retry_visibility_attempts,
+        )
+        database = {**_database_fingerprint(settings), "schema": await repo.database_schema_health()}
     engine = engine_runtime_snapshot(settings)
     provider = provider_health(settings, probe_accounts=False)
     graph = graph_health()
@@ -7670,9 +8134,11 @@ async def health() -> dict[str, Any]:
     ok = bool(provider.get("ready")) and not engine.get("stale") and not jobs.get("staleRunning")
     return {
         "ok": ok,
+        "apiExposure": _api_exposure_status(settings),
         "provider": provider,
         "engine": engine,
         "jobs": jobs,
+        "database": database,
         "graph": graph,
         "memory": memory,
         "counts": {
@@ -7699,9 +8165,15 @@ async def runtime_status() -> dict[str, Any]:
     async with session_scope() as s:
         repo = Repo(s)
         company = await repo.get_company()
-        jobs = await repo.job_runtime_summary(now, stale_after_ms=_job_stale_after_ms(settings))
+        jobs = await repo.job_runtime_summary(
+            now,
+            stale_after_ms=_job_stale_after_ms(settings),
+            retry_visibility_attempts=settings.engine_retry_visibility_attempts,
+        )
+        database = {**_database_fingerprint(settings), "schema": await repo.database_schema_health()}
         memory = await repo.memory_runtime_health()
         departments = await repo.list_departments()
+        permission_policy = await _permission_policy_response(repo)
         capability_stats = (await build_capability_registry(repo)).stats()
         custom_tool_count = await load_custom_tools(repo, registry)
     engine = engine_runtime_snapshot(settings)
@@ -7726,6 +8198,7 @@ async def runtime_status() -> dict[str, Any]:
         "running": bool(company.running if company else False),
         "engine": engine,
         "jobs": jobs,
+        "apiExposure": _api_exposure_status(settings),
         "provider": provider,
         "wsClients": hub.client_count,
         "v2": {
@@ -7739,13 +8212,19 @@ async def runtime_status() -> dict[str, Any]:
                 "model": settings.ollama_embedding_model,
             },
             "memory": memory,
-            "database": _database_fingerprint(settings),
+        "database": database,
             "objectStoreEnabled": settings.object_store_enabled,
             "backup": _backup_runtime_status(settings, now),
             "toolRegistryCount": len(registry.list()),
             "customToolCount": custom_tool_count,
             "hostBridge": host_bridge,
             "credentialReadiness": _credential_readiness_status(settings),
+            "fullAutonomy": permission_policy.get("fullAutonomyStatus") or full_autonomy_status(permission_policy),
+            "mcp": {
+                "policy": _mcp_visibility_policy(settings),
+                "gatewayHealth": _mcp_gateway_health(settings, probe=False),
+                "localFallbackServers": sorted(KNOWN_LOCAL_MCP_SERVERS),
+            },
             "eval": eval_status,
             "learning": {
                 "reflectionEnabled": settings.reflection_enabled,
@@ -8178,7 +8657,7 @@ async def get_executive() -> dict[str, Any]:
 @app.get("/api/policy", response_model=PermissionPolicy)
 async def get_policy() -> dict[str, Any]:
     async with session_scope() as s:
-        return await Repo(s).get_permission_policy()
+        return await _permission_policy_response(Repo(s))
 
 
 @app.get("/api/permissions/mode", response_model=PermissionPolicy)
@@ -8196,6 +8675,10 @@ async def update_policy(input: PermissionPolicyInput) -> dict[str, Any]:
         repo = Repo(s)
         update_fields = input.model_dump(by_alias=True, exclude_none=True, exclude={"mode", "updatedBy", "updated_by"})
         policy = await repo.set_permission_policy(requested_mode, updated_by, **update_fields)
+        policy["fullAutonomyStatus"] = full_autonomy_status(
+            policy,
+            recent_risky_actions=await _recent_full_auto_risky_actions(repo),
+        )
         mode = policy["mode"]
         note = (
             f" (คำขอ {requested_mode} ถูกบังคับเป็น {mode})"
@@ -9234,6 +9717,12 @@ async def assign_task(input: AssignTaskInput) -> dict[str, Any]:
         dept = await repo.get_department(input.department_id)
         if not dept:
             raise HTTPException(status_code=404, detail="department not found")
+        task_id = input.id or uid("task")
+        if input.id and await repo.get_task(task_id):
+            raise HTTPException(status_code=409, detail="task id already exists")
+        title = input.title.strip()
+        if not title:
+            raise HTTPException(status_code=400, detail="title cannot be empty")
         if input.project_id:
             project = await repo.get_entity("project", input.project_id)
             if not project:
@@ -9241,9 +9730,10 @@ async def assign_task(input: AssignTaskInput) -> dict[str, Any]:
             allowed = set(project.get("departments", []))
             if input.department_id not in allowed:
                 raise HTTPException(status_code=400, detail="department is not a member of the project")
+        parent_task = await _validate_parent_task(repo, input.parent_task_id, input.project_id)
         task = {
-            "id": input.id or uid("task"),
-            "title": input.title,
+            "id": task_id,
+            "title": title,
             "detail": input.detail or "",
             "status": "assigned",
             "priority": input.priority or "normal",
@@ -9266,7 +9756,7 @@ async def assign_task(input: AssignTaskInput) -> dict[str, Any]:
         apply_task_review_schedule(task, interval_ms, now)
         if interval_ms:
             task["log"].append(f"ตั้งรอบปลุกผู้บริหารตรวจงานทุก {review_interval_label(interval_ms)}")
-        await _link_child_task(repo, input.parent_task_id, task["id"])
+        await _link_child_task(repo, parent_task, task["id"])
         await repo.save_task(task)
         woke = await _wake_department_for_assigned_task(repo, dept, task, now)
         await enqueue_task_review_reminder(repo, task, now=now)
@@ -9531,10 +10021,17 @@ async def telegram_webhook(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Telegram update must be an object")
     async with session_scope() as s:
         repo = Repo(s)
-        result = await handle_telegram_update(repo, update, settings=settings, store_file=_store_file_artifact)
-    if result.get("status") in {"queued", "blocked", "sent", "retry_queued"}:
-        hub.mark_dirty()
-    return result
+        job_id = uid("job")
+        await repo.enqueue(
+            job_id,
+            "telegram_update",
+            {"update": update, "source": "webhook"},
+            now_ms(),
+            priority=9,
+        )
+    set_telegram_file_store(_store_file_artifact)
+    hub.mark_dirty()
+    return {"ok": True, "status": "queued", "jobId": job_id, "webhookAsync": True}
 
 
 @app.post("/api/messages/{thread_id}", response_model=SendMessageResponse)
@@ -10792,6 +11289,25 @@ async def search_knowledge_warehouse(
         "count": len(hits),
         "hits": hits,
     }
+
+
+@app.get("/api/knowledge/embedding-migration")
+async def knowledge_embedding_migration_status(
+    limit: int = Query(default=20, ge=0, le=200),
+) -> dict[str, Any]:
+    async with session_scope() as s:
+        return await Repo(s).knowledge_embedding_migration_status(limit=limit)
+
+
+@app.post("/api/knowledge/reembed-stale")
+async def reembed_stale_knowledge(
+    limit: int = Query(default=1000, ge=1, le=10_000),
+    batch_size: int = Query(default=8, alias="batchSize", ge=1, le=64),
+) -> dict[str, Any]:
+    async with session_scope() as s:
+        result = await Repo(s).reembed_stale_knowledge(limit=limit, batch_size=batch_size)
+    hub.mark_dirty()
+    return result
 
 
 @app.get("/api/eval/summary/{department_id}")
@@ -12368,7 +12884,7 @@ async def list_triggers(kind: str | None = None, limit: int = 500) -> list[dict[
 @app.post("/api/triggers", response_model=Trigger)
 async def create_trigger(input: CreateTriggerInput) -> dict[str, Any]:
     cadence = resolve_trigger_cadence(input.cadence or cadence_from_schedule_object(input.schedule), input.title)
-    if input.kind == "cron" and not cadence and not input.one_shot_at:
+    if input.kind == "cron" and not cadence and not has_one_shot_at(input.one_shot_at):
         raise HTTPException(status_code=400, detail="cron trigger requires cadence or oneShotAt")
     if input.kind == "event" and not input.event:
         raise HTTPException(status_code=400, detail="event trigger requires event")
@@ -12413,7 +12929,7 @@ async def update_trigger(trigger_id: str, input: UpdateTriggerInput) -> dict[str
             cadence = resolve_trigger_cadence(trigger.get("cadence"), trigger.get("title"))
             if cadence:
                 trigger["cadence"] = cadence
-            if not cadence and not trigger.get("oneShotAt"):
+            if not cadence and not has_one_shot_at(trigger.get("oneShotAt")):
                 raise HTTPException(status_code=400, detail="cron trigger requires cadence or oneShotAt")
         if trigger.get("kind") == "event" and not trigger.get("event"):
             raise HTTPException(status_code=400, detail="event trigger requires event")
@@ -12870,18 +13386,72 @@ async def import_file(input: ImportFileInput) -> dict[str, Any]:
         repo = Repo(s)
         if not await repo.get_department(input.target_dept):
             raise HTTPException(status_code=404, detail="target department not found")
-        result = await _store_file_artifact(
-            repo,
-            data=source.read_bytes(),
-            filename=source.name,
-            owner_dept=input.target_dept,
-            project_id=input.project_id,
-            artifact_name=input.artifact_name,
-            tags=input.tags,
-            links=[str(source)],
-            created_by="importer",
-            status="approved",
-        )
+        if input.copy_to_workspace:
+            result = await _store_file_artifact(
+                repo,
+                data=source.read_bytes(),
+                filename=source.name,
+                owner_dept=input.target_dept,
+                project_id=input.project_id,
+                artifact_name=input.artifact_name,
+                tags=input.tags,
+                links=[str(source)],
+                created_by="importer",
+                status="approved",
+            )
+        else:
+            result = await _store_path_reference_artifact(
+                repo,
+                source=source,
+                owner_dept=input.target_dept,
+                project_id=input.project_id,
+                artifact_name=input.artifact_name,
+                tags=input.tags,
+                links=[str(source)],
+                created_by="importer",
+                status="approved",
+            )
+    hub.mark_dirty()
+    return {"artifact": result["artifact"], "knowledge": result.get("knowledge")}
+
+
+@app.post("/api/attachments/reference", response_model=ImportFileResponse)
+async def reference_attachment(input: AttachmentReferenceInput) -> dict[str, Any]:
+    source = Path(input.source_path).expanduser().resolve()
+    if not source.exists() or not source.is_file():
+        raise HTTPException(status_code=404, detail="source file not found")
+    dept_id = input.target_dept or (dept_id_from_thread(input.thread_id) if input.thread_id else EXEC_ID)
+    async with session_scope() as s:
+        repo = Repo(s)
+        if not await repo.get_department(dept_id):
+            raise HTTPException(status_code=404, detail="target department not found")
+        if input.project_id and not await repo.get_entity("project", input.project_id):
+            raise HTTPException(status_code=404, detail="project not found")
+        if input.copy_to_workspace:
+            result = await _store_file_artifact(
+                repo,
+                data=source.read_bytes(),
+                filename=source.name,
+                owner_dept=dept_id,
+                project_id=input.project_id,
+                artifact_name=input.artifact_name,
+                tags=input.tags,
+                links=[str(source)],
+                created_by="owner-ui",
+                status="approved",
+            )
+        else:
+            result = await _store_path_reference_artifact(
+                repo,
+                source=source,
+                owner_dept=dept_id,
+                project_id=input.project_id,
+                artifact_name=input.artifact_name,
+                tags=input.tags,
+                links=[str(source)],
+                created_by="owner-ui",
+                status="approved",
+            )
     hub.mark_dirty()
     return {"artifact": result["artifact"], "knowledge": result.get("knowledge")}
 

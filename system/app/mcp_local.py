@@ -133,6 +133,22 @@ def mcp_server_enabled(server: str, raw: str | None) -> bool:
     return not enabled or "*" in enabled or server.strip().lower() in enabled
 
 
+def mcp_unrestricted_policy(raw: str | None, *, known_servers: dict[str, Any] | None = None) -> dict[str, Any]:
+    configured = mcp_enabled_servers(raw)
+    visible_servers = sorted(server for server in configured if server != "*")
+    return {
+        "mode": "unrestricted",
+        "badge": "unrestricted_mcp",
+        "allowlistEnforced": False,
+        "denyUnknownServers": False,
+        "configuredServers": visible_servers,
+        "configuredWildcard": "*" in configured,
+        "configuredServersPurpose": "status_visibility_only_not_a_deny_gate",
+        "auditRequired": True,
+        "localFallbackServers": sorted((known_servers or KNOWN_LOCAL_MCP_SERVERS).keys()),
+    }
+
+
 def resolve_local_executable(name: str) -> str | None:
     resolved = shutil.which(name)
     if resolved:

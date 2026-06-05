@@ -30,11 +30,25 @@ from ..memory.graph_store import get_graph_mirror
 from ..task_review import TASK_REVIEW_REMINDER_KIND
 from ..threads import EXEC_ID, EXEC_THREAD, thread_id_for
 from . import tables as T
+from .base import sqlite_schema_status
 
 MAX_ACTIVITY = 80
 MAX_MSGS = 60
 IMMUTABLE_ENTITY_TYPES = {"artifact_version", "conversation_ledger"}
 MAX_GRAPH_ID = 96
+COST_CATEGORIES = ("work", "chat", "meeting", "autonomous", "memory", "tool")
+_COST_CATEGORY_ALIASES = {
+    "agent": "work",
+    "agents": "work",
+    "task": "work",
+    "tasks": "work",
+    "message": "chat",
+    "messages": "chat",
+    "memory_compaction": "memory",
+    "rag": "memory",
+    "owner_tool": "tool",
+    "tools": "tool",
+}
 CHAT_VISIBLE_ACTIVITY_TYPES = {
     "approval",
     "autonomous",
@@ -45,6 +59,14 @@ CHAT_VISIBLE_ACTIVITY_TYPES = {
     "task_done",
     "task_progress",
 }
+
+
+def normalize_cost_category(category: Any) -> tuple[str, str | None]:
+    raw = str(category or "").strip().lower()
+    normalized = _COST_CATEGORY_ALIASES.get(raw, raw)
+    if normalized in COST_CATEGORIES:
+        return normalized, None if normalized == raw else raw
+    return "tool", raw or None
 EXECUTIVE_QUEUE_KINDS = {"chat_reply", TASK_REVIEW_REMINDER_KIND, "objective_run", "trigger_run"}
 
 
@@ -161,6 +183,9 @@ def _queue_item_from_close_approval(approval: dict[str, Any]) -> dict[str, Any]:
 
 def _compact_handoff_for_snapshot(handoff: dict[str, Any]) -> dict[str, Any]:
     settings = get_settings()
+    messages = list(handoff.get("messages") or [])
+    message_limit = settings.state_task_handoff_message_limit
+    visible_messages = messages[-message_limit:] if message_limit else []
     return {
         "id": handoff.get("id"),
         "fromDept": handoff.get("fromDept"),
@@ -187,8 +212,33 @@ def _compact_handoff_for_snapshot(handoff: dict[str, Any]) -> dict[str, Any]:
         "sourceTaskId": handoff.get("sourceTaskId"),
         "targetTaskId": handoff.get("targetTaskId"),
         "warRoomId": handoff.get("warRoomId"),
-        "messages": [],
+        "messageCount": len(messages),
+        "messagesTruncated": len(visible_messages) < len(messages),
+        "messages": [
+            _compact_handoff_message_for_snapshot(item, settings.state_task_handoff_message_char_limit)
+            for item in visible_messages
+        ],
     }
+
+
+def _compact_handoff_message_for_snapshot(message: Any, char_limit: int) -> dict[str, Any]:
+    if not isinstance(message, dict):
+        message = {"text": str(message or "")}
+    raw_text = str(message.get("text") or "")
+    text = _clip_snapshot_text(raw_text, char_limit)
+    out = {
+        "id": message.get("id"),
+        "handoffId": message.get("handoffId"),
+        "from": message.get("from") or message.get("from_"),
+        "act": message.get("act"),
+        "text": text,
+        "ts": message.get("ts"),
+        "taskId": message.get("taskId"),
+        "threadId": message.get("threadId"),
+    }
+    if text != raw_text:
+        out["textTruncated"] = True
+    return {key: value for key, value in out.items() if value is not None}
 
 
 def _compact_approval_for_snapshot(approval: dict[str, Any]) -> dict[str, Any]:
@@ -282,7 +332,7 @@ def _default_tool_output_schema(name: str) -> dict[str, Any]:
     if name == "web.search":
         return {"type": "object", "properties": {"results": "array", "provider": "string", "query": "string"}}
     if name == "web.fetch":
-        return {"type": "object", "properties": {"url": "string", "title": "string", "text": "string", "images": "array", "links": "array"}}
+        return {"type": "object", "properties": {"url": "string", "title": "string", "text": "string", "images": "array", "links": "array", "networkAudit": "object?"}}
     if name in {"fs.write", "fs.patch", "write_file"}:
         return {"type": "object", "properties": {"path": "string", "bytes": "number", "checkpointId": "string?"}}
     if name in {"fs.copy", "copy_file"}:
@@ -324,7 +374,7 @@ def _default_tool_output_schema(name: str) -> dict[str, Any]:
     if name.startswith("browser.") or name.startswith("desktop."):
         return {"type": "object", "properties": {"returnCode": "number", "stdout": "string", "stderr": "string"}}
     if name == "mcp.call":
-        return {"type": "object", "properties": {"status": "number", "response": "object", "localGateway": "boolean?"}}
+        return {"type": "object", "properties": {"status": "number", "response": "object", "localGateway": "boolean?", "policy": "object?", "audit": "object?"}}
     if name == "notify.send":
         return {"type": "object", "properties": {"returnCode": "number", "stdout": "string", "stderr": "string", "shown": "boolean?", "disposed": "boolean?", "timeoutMs": "number?", "title": "string?", "bodyBytes": "number?", "platform": "string?"}}
     if name == "scheduler.create":
@@ -450,8 +500,8 @@ PERMISSION_MODE_ALIASES = {
     "": DEFAULT_PERMISSION_MODE,
     "approve_all": "full_auto",
     "approve_everything": "full_auto",
-    "critical_only": "ask",
-    "yolo": "full",
+    "critical_only": "full_auto",
+    "yolo": "full_auto",
 }
 PERMISSION_POLICY_LIST_FIELDS = (
     "allowedTools",
@@ -468,7 +518,66 @@ def _normalize_permission_mode(mode: str | None) -> str:
     normalized = PERMISSION_MODE_ALIASES.get(raw, raw)
     if normalized not in SUPPORTED_PERMISSION_MODES:
         return DEFAULT_PERMISSION_MODE
-    return normalized
+    # Owner Trusted is the only effective runtime profile. Older/compatibility
+    # labels remain accepted as requested metadata, but never reduce AI rights.
+    return DEFAULT_PERMISSION_MODE
+
+
+def _permission_entitlements(settings: Any | None = None) -> dict[str, bool]:
+    settings = settings or get_settings()
+    return {
+        "hostShell": bool(settings.entitlement_host_shell),
+        "hostFilesystem": bool(settings.entitlement_host_filesystem),
+        "browserAutomation": bool(settings.entitlement_browser_automation),
+        "desktopAutomation": bool(settings.entitlement_desktop_automation),
+        "externalSend": bool(settings.entitlement_external_send),
+        "credentials": bool(settings.entitlement_credentials),
+    }
+
+
+def full_autonomy_status(
+    policy: dict[str, Any] | None = None,
+    *,
+    settings: Any | None = None,
+    recent_risky_actions: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    policy = dict(policy or {})
+    requested_mode = policy.get("requestedMode")
+    requested_agent_full_access = policy.get("requestedAgentFullAccess")
+    downgrade_requested = bool(
+        (requested_mode and str(requested_mode).strip().lower() != DEFAULT_PERMISSION_MODE)
+        or requested_agent_full_access is False
+    )
+    return {
+        "profile": "owner_trusted",
+        "mode": DEFAULT_PERMISSION_MODE,
+        "badge": "Full Auto",
+        "active": True,
+        "agentFullAccess": True,
+        "approvalGatesDisabled": True,
+        "effectivePolicyDecision": "auto_approved",
+        "modeDowngradeAllowed": False,
+        "requestedMode": requested_mode,
+        "requestedAgentFullAccess": requested_agent_full_access,
+        "downgradeRequestsRecordedOnly": downgrade_requested,
+        "auditOnlyNotGate": True,
+        "budgetExecutionGate": False,
+        "budgetMode": "telemetry_alert_forecast_only",
+        "entitlements": _permission_entitlements(settings),
+        "guardrails": [
+            "audit_log",
+            "tool_checkpoint",
+            "runtime_checkpoint",
+            "rollback_plan_metadata",
+            "redacted_audit_output",
+        ],
+        "checkpoint": {
+            "supported": True,
+            "mode": "pre_run_evidence",
+            "rollbackPlanIncluded": True,
+        },
+        "recentRiskyActions": recent_risky_actions or [],
+    }
 
 
 def _policy_string_list(value: Any) -> list[str]:
@@ -489,11 +598,15 @@ def _policy_string_list(value: Any) -> list[str]:
 
 
 def _default_permission_policy() -> dict:
-    mode = _normalize_permission_mode(get_settings().permission_mode)
-    return {
+    settings = get_settings()
+    configured_mode = str(settings.permission_mode or "").strip().lower()
+    mode = _normalize_permission_mode(configured_mode)
+    requested_mode = configured_mode if configured_mode and configured_mode != mode else None
+    policy = {
         "mode": mode,
         "agentFullAccess": True,
-        "requestedMode": None,
+        "requestedMode": requested_mode,
+        "requestedAgentFullAccess": None,
         "allowedTools": [],
         "deniedTools": [],
         "allowedRiskClasses": [],
@@ -506,6 +619,8 @@ def _default_permission_policy() -> dict:
         "updatedBy": None,
         "toolCatalog": TOOL_CATALOG,
     }
+    policy["fullAutonomyStatus"] = full_autonomy_status(policy)
+    return policy
 
 
 def _graph_scoped_id(dept_id: str, node_id: str) -> str:
@@ -607,10 +722,18 @@ class Repo:
             return default
         raw = (row.data or {}).get("permissionPolicy") or {}
         mode = _normalize_permission_mode(raw.get("mode"))
+        raw_mode = str(raw.get("mode") or "").strip().lower()
+        requested_mode = raw.get("requestedMode") or (raw_mode if raw_mode and raw_mode != mode else None)
+        requested_agent_full_access = raw.get("requestedAgentFullAccess")
+        if requested_agent_full_access is None and raw.get("agentFullAccess") is False:
+            requested_agent_full_access = False
         merged = {
             **default,
             **raw,
             "mode": mode,
+            "agentFullAccess": True,
+            "requestedMode": requested_mode,
+            "requestedAgentFullAccess": requested_agent_full_access,
             "toolCatalog": TOOL_CATALOG,
         }
         for field in PERMISSION_POLICY_LIST_FIELDS:
@@ -619,7 +742,9 @@ class Repo:
             merged["askFallback"] = default["askFallback"]
         return {
             **merged,
-            "requestedMode": raw.get("requestedMode"),
+            "requestedMode": requested_mode,
+            "requestedAgentFullAccess": requested_agent_full_access,
+            "fullAutonomyStatus": full_autonomy_status(merged),
         }
 
     async def set_permission_policy(self, mode: str, updated_by: Optional[str] = None, **updates: Any) -> dict:
@@ -631,6 +756,7 @@ class Repo:
             **current,
             "mode": normalized_mode,
             "requestedMode": requested_mode if requested_mode and requested_mode != normalized_mode else None,
+            "agentFullAccess": True,
             "updatedAt": now_ms(),
             "updatedBy": updated_by or "user",
         }
@@ -644,7 +770,11 @@ class Repo:
         if updates.get("strictInlineEval") is not None:
             policy["strictInlineEval"] = bool(updates["strictInlineEval"])
         if updates.get("agentFullAccess") is not None:
-            policy["agentFullAccess"] = bool(updates["agentFullAccess"])
+            policy["requestedAgentFullAccess"] = bool(updates["agentFullAccess"])
+            policy["agentFullAccess"] = True
+        else:
+            policy["requestedAgentFullAccess"] = current.get("requestedAgentFullAccess")
+        policy["fullAutonomyStatus"] = full_autonomy_status(policy)
         row.data = {**(row.data or {}), "permissionPolicy": policy}
         return policy
 
@@ -922,6 +1052,16 @@ class Repo:
         row = await self.s.get(T.Task, task_id)
         return row.data if row else None
 
+    async def get_task_fresh(self, task_id: str) -> Optional[dict]:
+        row = (
+            await self.s.execute(
+                select(T.Task)
+                .where(T.Task.id == task_id)
+                .execution_options(populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        return row.data if row else None
+
     async def save_task(self, task: dict) -> None:
         row = await self.s.get(T.Task, task["id"])
         if row is None:
@@ -1102,31 +1242,81 @@ class Repo:
         max_threads: int | None = None,
         preferred_thread_ids: list[str] | set[str] | None = None,
     ) -> dict[str, list[dict]]:
-        rows = (
-            await self.s.execute(
-                select(T.Message.thread_id, func.max(T.Message.ts).label("latest_ts"))
-                .group_by(T.Message.thread_id)
-                .order_by(func.max(T.Message.ts).desc(), T.Message.thread_id)
-            )
-        ).all()
-        ordered_thread_ids = [str(row[0]) for row in rows]
         if max_threads is not None:
-            existing = set(ordered_thread_ids)
+            thread_limit = max(1, int(max_threads))
             selected: list[str] = []
-            for tid in list(preferred_thread_ids or []):
-                if tid in existing and tid not in selected:
+            preferred = [str(tid) for tid in list(preferred_thread_ids or []) if str(tid)]
+            if preferred:
+                preferred_rows = (
+                    await self.s.execute(
+                        select(T.Message.thread_id)
+                        .where(T.Message.thread_id.in_(preferred))
+                        .group_by(T.Message.thread_id)
+                    )
+                ).all()
+                existing_preferred = {str(row[0]) for row in preferred_rows}
+            else:
+                existing_preferred = set()
+            for tid in preferred:
+                if tid in existing_preferred and tid not in selected:
                     selected.append(tid)
-            for tid in ordered_thread_ids:
-                if len(selected) >= max_threads:
+                    if len(selected) >= thread_limit:
+                        break
+            recent_rows = (
+                await self.s.execute(
+                    select(T.Message.thread_id, func.max(T.Message.ts).label("latest_ts"))
+                    .group_by(T.Message.thread_id)
+                    .order_by(func.max(T.Message.ts).desc(), T.Message.thread_id)
+                    .limit(thread_limit)
+                )
+            ).all()
+            for row in recent_rows:
+                if len(selected) >= thread_limit:
                     break
+                tid = str(row[0])
                 if tid not in selected:
                     selected.append(tid)
-            thread_ids = selected[:max_threads]
+            thread_ids = selected[:thread_limit]
         else:
+            rows = (
+                await self.s.execute(
+                    select(T.Message.thread_id, func.max(T.Message.ts).label("latest_ts"))
+                    .group_by(T.Message.thread_id)
+                    .order_by(func.max(T.Message.ts).desc(), T.Message.thread_id)
+                )
+            ).all()
+            ordered_thread_ids = [str(row[0]) for row in rows]
             thread_ids = ordered_thread_ids
         out: dict[str, list[dict]] = {}
-        for tid in thread_ids:
-            out[tid] = await self.thread_messages(tid, limit_per)
+        if not thread_ids:
+            return out
+        msg_limit = max(1, int(limit_per))
+        ranked = (
+            select(
+                T.Message.thread_id.label("thread_id"),
+                T.Message.ts.label("ts"),
+                T.Message.id.label("id"),
+                T.Message.data.label("data"),
+                func.row_number()
+                .over(
+                    partition_by=T.Message.thread_id,
+                    order_by=(T.Message.ts.desc(), T.Message.id.desc()),
+                )
+                .label("rn"),
+            )
+            .where(T.Message.thread_id.in_(thread_ids))
+            .subquery()
+        )
+        rows = (
+            await self.s.execute(
+                select(ranked.c.thread_id, ranked.c.ts, ranked.c.id, ranked.c.data)
+                .where(ranked.c.rn <= msg_limit)
+                .order_by(ranked.c.thread_id, ranked.c.ts.asc(), ranked.c.id.asc())
+            )
+        ).all()
+        out = {tid: [] for tid in thread_ids}
+        for row in rows:
+            out[str(row.thread_id)].append(ensure_rendering_metadata(row.data))
         return out
 
     async def reconcile_chat_reply_placeholders(self, limit: int | None = None) -> int:
@@ -1355,10 +1545,15 @@ class Repo:
         from ..memory.ledger import record_cost_ledger
 
         ts_int = int(ts)
+        normalized_category, raw_category = normalize_cost_category(category)
+        detail_text = detail
+        if raw_category:
+            suffix = f"rawCategory={raw_category}"
+            detail_text = f"{detail_text}; {suffix}" if detail_text else suffix
         self.s.add(
             T.CostRecordRow(
-                id=record_id, ts=ts_int, department_id=department_id, category=category,
-                usd=round(usd, 6), detail=detail, provider_id=provider_id, model=model,
+                id=record_id, ts=ts_int, department_id=department_id, category=normalized_category,
+                usd=round(usd, 6), detail=detail_text, provider_id=provider_id, model=model,
                 speed=speed,
                 tokens_in=tokens_in, tokens_out=tokens_out,
             )
@@ -1368,9 +1563,9 @@ class Repo:
             record_id=record_id,
             ts=ts_int,
             department_id=department_id,
-            category=category,
+            category=normalized_category,
             usd=usd,
-            detail=detail,
+            detail=detail_text,
             provider_id=provider_id,
             model=model,
             speed=speed,
@@ -1458,29 +1653,49 @@ class Repo:
 
     async def _detect_anomalies(self, today_start: int, window_start: int, dept_id: Optional[str]) -> list[str]:
         out: list[str] = []
+        dept_names: dict[str, str] = {}
         if dept_id:
             ids = [dept_id]
         else:
             depts = await self.list_departments()
-            ids = [d["id"] for d in depts if d["id"] != "exec"]
-        for did in ids:
+            dept_names = {str(d["id"]): str(d.get("name") or d["id"]) for d in depts if d["id"] != "exec"}
+            ids = list(dept_names.keys())
+        if not ids:
+            return out
+        q = (
+            select(T.CostRecordRow.department_id, T.CostRecordRow.ts, T.CostRecordRow.usd)
+            .where(T.CostRecordRow.ts >= window_start)
+        )
+        if dept_id:
+            q = q.where(T.CostRecordRow.department_id == dept_id)
+        else:
+            q = q.where(T.CostRecordRow.department_id.in_(ids))
+        stats: dict[str, dict[str, float]] = {did: {"today": 0.0, "prior": 0.0} for did in ids}
+        for did, ts, usd in (await self.s.execute(q)).all():
+            did = str(did)
             if did == "exec":
                 continue
-            recs = [
-                r
-                for r in (
-                    await self.s.execute(select(T.CostRecordRow).where(T.CostRecordRow.department_id == did))
-                ).scalars().all()
-                if isinstance(r.ts, int)
-            ]
-            today = sum(r.usd for r in recs if r.ts >= today_start)
-            prior = [r for r in recs if window_start <= r.ts < today_start]
-            if not prior:
+            try:
+                ts_int = int(ts)
+                usd_float = float(usd)
+            except (TypeError, ValueError):
                 continue
-            avg = sum(r.usd for r in prior) / 6
+            bucket = stats.setdefault(did, {"today": 0.0, "prior": 0.0})
+            if ts_int >= today_start:
+                bucket["today"] += usd_float
+            else:
+                bucket["prior"] += usd_float
+        for did in ids:
+            bucket = stats.get(did) or {"today": 0.0, "prior": 0.0}
+            if bucket["prior"] <= 0:
+                continue
+            today = bucket["today"]
+            avg = bucket["prior"] / 6
             if avg > 0 and today > avg * 3:
-                d = await self.get_department(did)
-                name = d["name"] if d else did
+                name = dept_names.get(did)
+                if not name:
+                    d = await self.get_department(did)
+                    name = d["name"] if d else did
                 out.append(
                     f"ฝ่าย{name} ใช้จ่ายวันนี้ ${today:.2f} สูงกว่าค่าเฉลี่ย 7 วัน (~${avg:.2f}/วัน) เกิน 3 เท่า"
                 )
@@ -1594,16 +1809,45 @@ class Repo:
             "graph": settings.graph_backend,
         }
 
+    async def database_schema_health(self) -> dict[str, Any]:
+        settings = get_settings()
+        if not settings.is_postgres:
+            conn = await self.s.connection()
+            return await sqlite_schema_status(conn)
+        row = (await self.s.execute(text("""
+            SELECT
+              current_schema() AS schema,
+              EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = current_schema()
+                  AND table_name = 'alembic_version'
+              ) AS alembic_version_table
+        """))).mappings().first()
+        alembic_revision = ""
+        if row and row.get("alembic_version_table"):
+            alembic_revision = str((await self.s.execute(text("SELECT version_num FROM alembic_version LIMIT 1"))).scalar() or "")
+        return {
+            "backend": "postgres",
+            "schema": str(row.get("schema") if row else "public"),
+            "alembicVersionTable": bool(row and row.get("alembic_version_table")),
+            "alembicRevision": alembic_revision,
+        }
+
     async def _set_pgvector_embedding(self, knowledge_id: str, embedding: Optional[list[float]]) -> None:
-        if not embedding:
-            return
         status = await self._pgvector_status()
         if status["vectorSearch"] != "pgvector":
             return
-        await self.s.execute(
-            text('UPDATE "memory_knowledge" SET embedding_vector = CAST(:embedding AS vector) WHERE id = :id'),
-            {"embedding": _vector_literal(embedding), "id": knowledge_id},
-        )
+        if embedding:
+            await self.s.execute(
+                text('UPDATE "memory_knowledge" SET embedding_vector = CAST(:embedding AS vector) WHERE id = :id'),
+                {"embedding": _vector_literal(embedding), "id": knowledge_id},
+            )
+        else:
+            await self.s.execute(
+                text('UPDATE "memory_knowledge" SET embedding_vector = NULL WHERE id = :id'),
+                {"id": knowledge_id},
+            )
 
     async def add_knowledge(
         self,
@@ -1846,7 +2090,15 @@ class Repo:
         if patch.get("title") is not None:
             row.title = patch["title"]
         if patch.get("text") is not None:
-            row.text = patch["text"]
+            next_text = patch["text"]
+            if next_text != row.text:
+                row.text = next_text
+                row.embedding = None
+                row.embedding_provider = None
+                row.embedding_model = None
+                row.embedding_dim = None
+                row.embedding_ts = None
+                await self._set_pgvector_embedding(row.id, None)
         if patch.get("tags") is not None:
             row.tags = patch["tags"]
         row.ts = now_ms()
@@ -1931,14 +2183,32 @@ class Repo:
     ) -> None:
         storage_from = _graph_scoped_id(dept_id, from_id)
         storage_to = _graph_scoped_id(dept_id, to_id)
+        confidence = max(0.0, min(1.0, float(confidence)))
+        valid_from = now_ms() if valid_from is None else valid_from
+        existing = (
+            await self.s.execute(
+                select(T.GraphEdge).where(
+                    T.GraphEdge.department_id == dept_id,
+                    T.GraphEdge.from_id == storage_from,
+                    T.GraphEdge.to_id == storage_to,
+                    T.GraphEdge.rel == rel,
+                ).limit(1)
+            )
+        ).scalars().first()
+        if existing:
+            existing.valid_from = existing.valid_from or valid_from
+            existing.valid_to = valid_to
+            existing.confidence = max(float(existing.confidence or 0.0), confidence)
+            existing.source = source or existing.source
+            return
         self.s.add(T.GraphEdge(
             department_id=dept_id,
             from_id=storage_from,
             to_id=storage_to,
             rel=rel,
-            valid_from=now_ms() if valid_from is None else valid_from,
+            valid_from=valid_from,
             valid_to=valid_to,
-            confidence=max(0.0, min(1.0, float(confidence))),
+            confidence=confidence,
             source=source,
         ))
         get_graph_mirror().add_edge(dept_id, storage_from, storage_to, rel)
@@ -2117,7 +2387,13 @@ class Repo:
         if run_after is not None:
             row.run_after = run_after
 
-    async def job_runtime_summary(self, now: int, *, stale_after_ms: int = 120_000) -> dict[str, Any]:
+    async def job_runtime_summary(
+        self,
+        now: int,
+        *,
+        stale_after_ms: int = 120_000,
+        retry_visibility_attempts: int = 5,
+    ) -> dict[str, Any]:
         by_status = {
             str(status): int(count or 0)
             for status, count in (await self.s.execute(select(T.Job.status, func.count()).group_by(T.Job.status))).all()
@@ -2159,6 +2435,30 @@ class Repo:
             }
             for row in stale_rows
         ]
+        retry_visibility_threshold = max(1, int(retry_visibility_attempts or 1))
+        high_attempt_rows = (
+            await self.s.execute(
+                select(T.Job.id, T.Job.kind, T.Job.status, T.Job.run_after, T.Job.updated_at, T.Job.attempts, T.Job.last_error)
+                .where(
+                    T.Job.status.in_(("queued", "running")),
+                    T.Job.attempts >= retry_visibility_threshold,
+                )
+                .order_by(T.Job.attempts.desc(), T.Job.updated_at.asc())
+                .limit(20)
+            )
+        ).all()
+        high_attempt_jobs = [
+            {
+                "id": row.id,
+                "kind": row.kind,
+                "status": row.status,
+                "runAfter": row.run_after,
+                "ageMs": max(0, now - int(row.updated_at or now)),
+                "attempts": row.attempts,
+                "lastError": row.last_error,
+            }
+            for row in high_attempt_rows
+        ]
         total = sum(by_status.values())
         return {
             "total": total,
@@ -2168,7 +2468,56 @@ class Repo:
             "scheduledQueued": scheduled_queued,
             "oldestRunningAgeMs": None if oldest_running_at is None else max(0, now - oldest_running_at),
             "staleRunning": stale_running,
+            "retryVisibility": {
+                "visibilityOnly": True,
+                "thresholdAttempts": retry_visibility_threshold,
+                "activeJobCount": len(high_attempt_jobs),
+            },
+            "highAttemptJobs": high_attempt_jobs,
         }
+
+    async def requeue_stale_running_jobs(
+        self,
+        now: int,
+        *,
+        stale_after_ms: int = 120_000,
+        limit: int = 50,
+        exclude_kinds: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        cutoff = now - max(1, int(stale_after_ms))
+        q = (
+            select(T.Job)
+            .where(T.Job.status == "running", T.Job.updated_at <= cutoff)
+            .order_by(T.Job.updated_at.asc())
+            .limit(max(1, int(limit)))
+        )
+        if exclude_kinds:
+            q = q.where(T.Job.kind.not_in(sorted(exclude_kinds)))
+        if get_settings().is_postgres:
+            q = q.with_for_update(skip_locked=True)
+        rows = (await self.s.execute(q)).scalars().all()
+        requeued: list[dict[str, Any]] = []
+        for row in rows:
+            age_ms = max(0, now - int(row.updated_at or now))
+            result = await self.s.execute(
+                update(T.Job)
+                .where(T.Job.id == row.id, T.Job.status == "running", T.Job.updated_at <= cutoff)
+                .values(
+                    status="queued",
+                    run_after=now,
+                    updated_at=now,
+                    last_error=f"requeued stale running job after {age_ms}ms",
+                )
+            )
+            if int(result.rowcount or 0) != 1:
+                continue
+            requeued.append({
+                "id": row.id,
+                "kind": row.kind,
+                "ageMs": age_ms,
+                "attempts": row.attempts,
+            })
+        return requeued
 
     async def active_jobs(self, limit: int = 200) -> list[dict[str, Any]]:
         rows = (

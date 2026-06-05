@@ -191,18 +191,51 @@ class ChatMessageStreamSink:
         error: str | None = None,
     ) -> dict[str, Any]:
         stopped = stopped or self.cancel_event.is_set()
+        stream_reconcile: dict[str, Any] | None = None
         if result and result.text and not stopped:
+            result_text = result.text
             if not self.text:
                 self.seq += 1
                 hub.pulse({
                     "kind": "msg_delta",
                     "threadId": self.thread_id,
                     "msgId": self.msg_id,
-                    "chunk": result.text,
-                    "text": result.text,
+                    "chunk": result_text,
+                    "text": result_text,
                     "seq": self.seq,
                 })
-            self.text = result.text
+                self.text = result_text
+            elif result_text == self.text:
+                pass
+            elif result_text.startswith(self.text):
+                suffix = result_text[len(self.text):]
+                if suffix:
+                    self.seq += 1
+                    hub.pulse({
+                        "kind": "msg_delta",
+                        "threadId": self.thread_id,
+                        "msgId": self.msg_id,
+                        "chunk": suffix,
+                        "text": result_text,
+                        "seq": self.seq,
+                    })
+                stream_reconcile = {
+                    "mode": "appended_final_suffix",
+                    "streamedChars": len(self.text),
+                    "finalChars": len(result_text),
+                    "suffixChars": len(suffix),
+                }
+                self.text = result_text
+            else:
+                stream_reconcile = {
+                    "mode": "kept_streamed_text",
+                    "reason": "provider_final_prefix" if self.text.startswith(result_text) else "provider_final_diverged",
+                    "streamedChars": len(self.text),
+                    "finalChars": len(result_text),
+                }
+            if stream_reconcile:
+                result.meta["streamReconcile"] = stream_reconcile
+            result.text = self.text
         if stopped and not self.text:
             self.text = "หยุดการตอบแล้วก่อนมีข้อความตอบกลับ"
         reasoning = ""
@@ -240,6 +273,8 @@ class ChatMessageStreamSink:
             })
             if result.meta.get("toolRuns"):
                 message["toolRuns"] = result.meta["toolRuns"]
+            if result.meta.get("streamReconcile"):
+                message["streamReconcile"] = result.meta["streamReconcile"]
         self.message = message
         await self.persist(pending=False, force=True)
         event: dict[str, Any] = {
@@ -267,6 +302,8 @@ class ChatMessageStreamSink:
             }
             if result.meta.get("toolRuns"):
                 event["toolRuns"] = result.meta["toolRuns"]
+            if result.meta.get("streamReconcile"):
+                event["streamReconcile"] = result.meta["streamReconcile"]
         hub.pulse(event)
         return self.message
 

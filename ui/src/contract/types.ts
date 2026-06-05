@@ -413,6 +413,13 @@ export interface MessageAttachment {
   name?: string | null
   sizeBytes?: number | null
   uri?: string | null
+  sourcePath?: string | null
+  sourceSizeBytes?: number | null
+  sampledBytes?: number | null
+  copyStatus?: string | null
+  referenceKind?: string | null
+  contextMaxChars?: number | null
+  includeFullContext?: boolean | null
   projectId?: ID | null
   videoProjectId?: ID | null
   assetId?: ID | null
@@ -816,6 +823,12 @@ export interface Artifact {
   contentHash?: string | null
   contentMime?: string | null
   contentSizeBytes?: number | null
+  contentStatus?: string | null
+  sourcePath?: string | null
+  sourceSizeBytes?: number | null
+  sampledBytes?: number | null
+  copyStatus?: string | null
+  referenceKind?: string | null
   tags: string[]
   links: string[]
   preview?: ArtifactPreview | null
@@ -994,6 +1007,10 @@ export interface ToolCatalogItem {
 
 export interface PermissionPolicy {
   mode: PolicyMode
+  agentFullAccess?: boolean
+  requestedMode?: string | null
+  requestedAgentFullAccess?: boolean | null
+  fullAutonomyStatus?: Record<string, unknown> | null
   updatedAt?: number | null
   updatedBy?: string | null
   toolCatalog: ToolCatalogItem[]
@@ -1090,6 +1107,7 @@ export interface ToolRun {
   redactedFields?: string[]
   riskClass?: ToolRiskClass | null
   policyDecision?: PolicyDecision | null
+  fullAutonomy?: Record<string, unknown> | null
   taskId?: ID | null
   approvalId?: ID | null
   result?: Record<string, unknown> | null
@@ -1930,6 +1948,16 @@ export interface ArtifactQualityReview {
 export interface ImportFileInput {
   sourcePath: string
   targetDept: ID
+  projectId?: ID | null
+  artifactName?: string | null
+  tags?: string[]
+  copyToWorkspace?: boolean
+}
+
+export interface AttachmentReferenceInput {
+  sourcePath: string
+  threadId?: ID | null
+  targetDept?: ID | null
   projectId?: ID | null
   artifactName?: string | null
   tags?: string[]

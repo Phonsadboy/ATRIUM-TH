@@ -271,7 +271,9 @@ def is_model_available_for_provider(model_id: str, provider_id: str) -> bool:
 def efforts_for_model(model_id: str) -> list[str]:
     explicit = MODELS.get(model_id, {}).get("supportedEfforts")
     if isinstance(explicit, list) and explicit:
-        return [str(e) for e in explicit if e in EFFORT_ORDER]
+        valid = [str(e) for e in explicit if e in EFFORT_ORDER]
+        if valid:
+            return valid
     return [e for e in EFFORT_ORDER if e != "xhigh" or model_id in _XHIGH_MODELS]
 
 
@@ -281,7 +283,8 @@ def is_effort_available_for_model(model_id: str, effort: str) -> bool:
 
 def default_thinking_effort_for_model(model_id: str) -> str:
     fallback = str(MODELS.get(model_id, {}).get("defaultThinkingEffort") or "high")
-    return fallback if is_effort_available_for_model(model_id, fallback) else efforts_for_model(model_id)[0]
+    efforts = efforts_for_model(model_id)
+    return fallback if fallback in efforts else efforts[0] if efforts else "high"
 
 
 def speeds_for_model(model_id: str) -> list[str]:

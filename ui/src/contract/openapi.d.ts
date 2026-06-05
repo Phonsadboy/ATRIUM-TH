@@ -231,6 +231,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/attachments/reference": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Reference Attachment */
+        post: operations["reference_attachment_api_attachments_reference_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/attachments/upload": {
         parameters: {
             query?: never;
@@ -1060,6 +1077,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/knowledge/embedding-migration": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Knowledge Embedding Migration Status */
+        get: operations["knowledge_embedding_migration_status_api_knowledge_embedding_migration_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/knowledge/import": {
         parameters: {
             query?: never;
@@ -1071,6 +1105,23 @@ export interface paths {
         put?: never;
         /** Import Knowledge */
         post: operations["import_knowledge_api_knowledge_import_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/knowledge/reembed-stale": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Reembed Stale Knowledge */
+        post: operations["reembed_stale_knowledge_api_knowledge_reembed_stale_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2802,6 +2853,8 @@ export interface components {
             } | null;
             /** Contexttool */
             contextTool?: string | null;
+            /** Copystatus */
+            copyStatus?: string | null;
             /** Createdat */
             createdAt: number;
             /** Createdby */
@@ -2826,6 +2879,8 @@ export interface components {
             preview?: components["schemas"]["ArtifactPreview"] | null;
             /** Projectid */
             projectId?: string | null;
+            /** Referencekind */
+            referenceKind?: string | null;
             /** Renderid */
             renderId?: string | null;
             /** Reviewgate */
@@ -2834,6 +2889,12 @@ export interface components {
             } | null;
             /** Reviewstatus */
             reviewStatus?: string | null;
+            /** Sampledbytes */
+            sampledBytes?: number | null;
+            /** Sourcepath */
+            sourcePath?: string | null;
+            /** Sourcesizebytes */
+            sourceSizeBytes?: number | null;
             /**
              * Status
              * @enum {string}
@@ -2968,11 +3029,21 @@ export interface components {
             contentSizeBytes?: number | null;
             /** Contentstatus */
             contentStatus?: string | null;
+            /** Copystatus */
+            copyStatus?: string | null;
             /** Note */
             note: string;
             /** Parent */
             parent?: number | null;
             preview?: components["schemas"]["ArtifactPreview"] | null;
+            /** Referencekind */
+            referenceKind?: string | null;
+            /** Sampledbytes */
+            sampledBytes?: number | null;
+            /** Sourcepath */
+            sourcePath?: string | null;
+            /** Sourcesizebytes */
+            sourceSizeBytes?: number | null;
             /** Storage */
             storage?: ("object_store" | "filesystem" | "external") | null;
             /** Ts */
@@ -3009,6 +3080,26 @@ export interface components {
             title: string;
             /** Watchers */
             watchers?: string[];
+        };
+        /** AttachmentReferenceInput */
+        AttachmentReferenceInput: {
+            /** Artifactname */
+            artifactName?: string | null;
+            /**
+             * Copytoworkspace
+             * @default false
+             */
+            copyToWorkspace: boolean;
+            /** Projectid */
+            projectId?: string | null;
+            /** Sourcepath */
+            sourcePath: string;
+            /** Tags */
+            tags?: string[];
+            /** Targetdept */
+            targetDept?: string | null;
+            /** Threadid */
+            threadId?: string | null;
         };
         /** AuditLogEntry */
         AuditLogEntry: {
@@ -4599,6 +4690,10 @@ export interface components {
             counts: {
                 [key: string]: number;
             };
+            /** Database */
+            database: {
+                [key: string]: unknown;
+            };
             /** Engine */
             engine: {
                 [key: string]: unknown;
@@ -4951,8 +5046,20 @@ export interface components {
             contextArgs?: {
                 [key: string]: unknown;
             } | null;
+            /**
+             * Contextmaxchars
+             * @description Optional per-message attachment text context limit. Use includeFullContext for full known-size text.
+             */
+            contextMaxChars?: number | null;
             /** Contexttool */
             contextTool?: string | null;
+            /** Copystatus */
+            copyStatus?: string | null;
+            /**
+             * Includefullcontext
+             * @description When true, include as much extracted attachment text as possible instead of the default preview limit.
+             */
+            includeFullContext?: boolean | null;
             /** Kind */
             kind?: string | null;
             /** Mediahandle */
@@ -4963,12 +5070,20 @@ export interface components {
             name?: string | null;
             /** Projectid */
             projectId?: string | null;
+            /** Referencekind */
+            referenceKind?: string | null;
             /** Renderid */
             renderId?: string | null;
             /** Reviewstatus */
             reviewStatus?: string | null;
+            /** Sampledbytes */
+            sampledBytes?: number | null;
             /** Sizebytes */
             sizeBytes?: number | null;
+            /** Sourcepath */
+            sourcePath?: string | null;
+            /** Sourcesizebytes */
+            sourceSizeBytes?: number | null;
             /** Timelineid */
             timelineId?: string | null;
             /** Timelineversion */
@@ -5416,12 +5531,18 @@ export interface components {
             deniedRiskClasses?: string[];
             /** Deniedtools */
             deniedTools?: string[];
+            /** Fullautonomystatus */
+            fullAutonomyStatus?: {
+                [key: string]: unknown;
+            } | null;
             /**
              * Mode
              * @default full_auto
              * @enum {string}
              */
             mode: "deny" | "allowlist" | "ask" | "auto" | "full" | "full_auto" | "approve_everything" | "approve_all" | "critical_only";
+            /** Requestedagentfullaccess */
+            requestedAgentFullAccess?: boolean | null;
             /** Requestedmode */
             requestedMode?: string | null;
             /**
@@ -6182,6 +6303,10 @@ export interface components {
             executor?: string | null;
             /** Executorroute */
             executorRoute?: {
+                [key: string]: unknown;
+            } | null;
+            /** Fullautonomy */
+            fullAutonomy?: {
                 [key: string]: unknown;
             } | null;
             /** Id */
@@ -7097,6 +7222,39 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ArtifactVersion"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reference_attachment_api_attachments_reference_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AttachmentReferenceInput"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ImportFileResponse"];
                 };
             };
             /** @description Validation Error */
@@ -8933,6 +9091,39 @@ export interface operations {
             };
         };
     };
+    knowledge_embedding_migration_status_api_knowledge_embedding_migration_get: {
+        parameters: {
+            query?: {
+                limit?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     import_knowledge_api_knowledge_import_post: {
         parameters: {
             query?: never;
@@ -8945,6 +9136,40 @@ export interface operations {
                 "application/json": components["schemas"]["Body_import_knowledge_api_knowledge_import_post"];
             };
         };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reembed_stale_knowledge_api_knowledge_reembed_stale_post: {
+        parameters: {
+            query?: {
+                limit?: number;
+                batchSize?: number;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
         responses: {
             /** @description Successful Response */
             200: {

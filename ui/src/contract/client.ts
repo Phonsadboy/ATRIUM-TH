@@ -105,7 +105,7 @@ export interface CompanyClient {
     opts?: SendMessageOptions,
   ): Promise<SendMessageResponse | null>
   createDepartment(input: CreateDepartmentInput): Department
-  assignTask(input: AssignTaskInput): Task
+  assignTask(input: AssignTaskInput): Promise<Task>
   reassignTask(taskId: ID, input: ReassignTaskInput): Promise<Task>
   updateTaskReviewSchedule(taskId: ID, reviewIntervalMs: number | null): Promise<Task>
 

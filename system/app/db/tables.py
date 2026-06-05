@@ -9,7 +9,7 @@ for the axes we actually filter on (dept, status, project, ts).
 """
 from __future__ import annotations
 
-from sqlalchemy import BigInteger, Boolean, Float, Index, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, CheckConstraint, Float, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from .base import Base, JSONFlex
@@ -75,6 +75,12 @@ class Objective(Base):
 
 class CostRecordRow(Base):
     __tablename__ = "cost_records"
+    __table_args__ = (
+        CheckConstraint(
+            "category IN ('work','chat','meeting','autonomous','memory','tool')",
+            name="ck_cost_records_category",
+        ),
+    )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     ts: Mapped[int] = mapped_column(BigInteger, index=True)
     department_id: Mapped[str] = mapped_column(String(64), index=True)
@@ -90,6 +96,8 @@ class CostRecordRow(Base):
 
 
 Index("ix_cost_dept_ts", CostRecordRow.department_id, CostRecordRow.ts)
+Index("ix_cost_category_ts", CostRecordRow.category, CostRecordRow.ts)
+Index("ix_cost_dept_category_ts", CostRecordRow.department_id, CostRecordRow.category, CostRecordRow.ts)
 
 
 class MemoryArchive(Base):
@@ -181,3 +189,14 @@ class Entity(Base):
 
 
 Index("ix_entities_type_ts", Entity.type, Entity.ts)
+Index("ix_entities_type_status_ts", Entity.type, Entity.status, Entity.ts)
+Index("ix_entities_type_dept_ts", Entity.type, Entity.dept, Entity.ts)
+Index("ix_entities_type_dept_status_ts", Entity.type, Entity.dept, Entity.status, Entity.ts)
+Index(
+    "ix_entities_type_dept_project_status_ts",
+    Entity.type,
+    Entity.dept,
+    Entity.project,
+    Entity.status,
+    Entity.ts,
+)

@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import copy
+import contextlib
+import contextvars
+import fnmatch
 import hashlib
 import asyncio
 import html
@@ -9,8 +12,10 @@ import json
 import mimetypes
 import os
 import re
+import signal
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -54,6 +59,16 @@ VIDEO_TOOL_NAMES = {
 
 VIDEO_BACKGROUND_TOOL_NAMES = {"video.render_edit", "video.render_motion", "video.transcribe"}
 VIDEO_JOB_TERMINAL_STATUSES = {"done", "failed", "cancelled"}
+_CURRENT_VIDEO_JOB_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar("current_video_job_id", default=None)
+_VIDEO_RUNTIME_LOCK = threading.Lock()
+_VIDEO_CANCEL_EVENTS: dict[str, threading.Event] = {}
+_VIDEO_PROCESSES: dict[str, subprocess.Popen[str]] = {}
+
+
+class VideoJobCancelledError(RuntimeError):
+    pass
+
+
 PATCH_CONTROL_KEYS = {
     "op",
     "type",
@@ -250,30 +265,148 @@ def _append_project_audit(
     return event
 
 
-def _run(command: list[str], *, cwd: Path | None = None, timeout: float = 120.0) -> dict[str, Any]:
+def _register_video_job_runtime(job_id: str) -> threading.Event:
+    event = threading.Event()
+    with _VIDEO_RUNTIME_LOCK:
+        _VIDEO_CANCEL_EVENTS[job_id] = event
+    return event
+
+
+def _unregister_video_job_runtime(job_id: str, event: threading.Event) -> None:
+    with _VIDEO_RUNTIME_LOCK:
+        if _VIDEO_CANCEL_EVENTS.get(job_id) is event:
+            _VIDEO_CANCEL_EVENTS.pop(job_id, None)
+        _VIDEO_PROCESSES.pop(job_id, None)
+
+
+def _current_video_cancel_event() -> threading.Event | None:
+    job_id = _CURRENT_VIDEO_JOB_ID.get()
+    if not job_id:
+        return None
+    with _VIDEO_RUNTIME_LOCK:
+        return _VIDEO_CANCEL_EVENTS.get(job_id)
+
+
+def _set_video_process(job_id: str | None, proc: subprocess.Popen[str] | None) -> None:
+    if not job_id:
+        return
+    with _VIDEO_RUNTIME_LOCK:
+        if proc is None:
+            _VIDEO_PROCESSES.pop(job_id, None)
+        else:
+            _VIDEO_PROCESSES[job_id] = proc
+
+
+def _signal_process(proc: subprocess.Popen[str], *, force: bool = False) -> None:
+    if proc.poll() is not None:
+        return
     try:
-        completed = subprocess.run(
-            command,
-            cwd=str(cwd) if cwd else None,
-            text=True,
-            capture_output=True,
-            timeout=timeout,
-            check=False,
-        )
-    except FileNotFoundError:
-        raise ValueError(f"executable not found: {command[0]}") from None
-    except subprocess.TimeoutExpired as exc:
+        if os.name != "nt":
+            os.killpg(proc.pid, signal.SIGKILL if force else signal.SIGTERM)
+        elif force:
+            proc.kill()
+        else:
+            proc.terminate()
+    except ProcessLookupError:
+        return
+    except Exception:
+        if force:
+            with contextlib.suppress(Exception):
+                proc.kill()
+        else:
+            with contextlib.suppress(Exception):
+                proc.terminate()
+
+
+def _stop_process(proc: subprocess.Popen[str]) -> tuple[str, str]:
+    _signal_process(proc)
+    try:
+        return proc.communicate(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        _signal_process(proc, force=True)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            return proc.communicate(timeout=2.0)
+    return "", ""
+
+
+def _cancel_video_job_runtime(job_id: str, reason: str = "video job cancelled") -> bool:
+    with _VIDEO_RUNTIME_LOCK:
+        event = _VIDEO_CANCEL_EVENTS.get(job_id)
+        proc = _VIDEO_PROCESSES.get(job_id)
+    cancelled = False
+    if event is not None:
+        event.set()
+        cancelled = True
+    if proc is not None:
+        _signal_process(proc)
+        cancelled = True
+    return cancelled
+
+
+def _video_record_cancelled(record: Any) -> bool:
+    return isinstance(record, dict) and str(record.get("status") or "") == "cancelled"
+
+
+async def _latest_video_record(repo: Any, job_id: str, fallback: dict[str, Any]) -> dict[str, Any]:
+    latest = await repo.get_entity("video_job", job_id)
+    return dict(latest) if isinstance(latest, dict) else fallback
+
+
+def _run(command: list[str], *, cwd: Path | None = None, timeout: float = 120.0) -> dict[str, Any]:
+    cancel_event = _current_video_cancel_event()
+    if cancel_event is not None and cancel_event.is_set():
         return {
             "command": command,
-            "returnCode": 124,
-            "stdout": exc.stdout or "",
-            "stderr": exc.stderr or f"command timed out after {timeout}s",
+            "returnCode": 130,
+            "stdout": "",
+            "stderr": "command cancelled before start",
         }
+    popen_kwargs: dict[str, Any] = {
+        "cwd": str(cwd) if cwd else None,
+        "text": True,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+    }
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+    try:
+        proc = subprocess.Popen(command, **popen_kwargs)
+    except FileNotFoundError:
+        raise ValueError(f"executable not found: {command[0]}") from None
+    job_id = _CURRENT_VIDEO_JOB_ID.get()
+    _set_video_process(job_id, proc)
+    deadline = time.monotonic() + max(0.01, float(timeout or 120.0))
+    try:
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                stdout, stderr = _stop_process(proc)
+                return {
+                    "command": command,
+                    "returnCode": 130,
+                    "stdout": stdout or "",
+                    "stderr": stderr or "command cancelled",
+                }
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stdout, stderr = _stop_process(proc)
+                return {
+                    "command": command,
+                    "returnCode": 124,
+                    "stdout": stdout or "",
+                    "stderr": stderr or f"command timed out after {timeout}s",
+                }
+            try:
+                stdout, stderr = proc.communicate(timeout=min(0.25, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                continue
+    finally:
+        _set_video_process(job_id, None)
     return {
         "command": command,
-        "returnCode": completed.returncode,
-        "stdout": completed.stdout,
-        "stderr": completed.stderr,
+        "returnCode": int(proc.returncode or 0),
+        "stdout": stdout or "",
+        "stderr": stderr or "",
     }
 
 
@@ -800,6 +933,143 @@ def _job_log_path(record: dict[str, Any]) -> Path | None:
     return Path(raw) if raw else None
 
 
+VIDEO_RENDER_INTERMEDIATE_PATTERNS = (
+    "segment_*.mp4",
+    "base.mp4",
+    "concat.txt",
+    "overlays.mp4",
+    "text.mp4",
+    "audio.mp4",
+    "text_layer_*.png",
+)
+MOTION_RENDER_CACHE_DIR_NAMES = (
+    ".cache",
+    ".parcel-cache",
+    ".remotion",
+    ".tmp",
+    ".turbo",
+    ".vite",
+    "temp",
+    "tmp",
+)
+MOTION_RENDER_OUTPUT_DIR_NAMES = ("out", "renders")
+MOTION_RENDER_OUTPUT_SUFFIXES = {".gif", ".jpeg", ".jpg", ".log", ".mkv", ".mov", ".mp4", ".part", ".png", ".tmp", ".webm"}
+
+
+def _cleanup_video_render_intermediates(
+    render_dir: Path,
+    *,
+    preserve_paths: set[Path] | None = None,
+) -> dict[str, Any]:
+    preserve = {path.resolve() for path in (preserve_paths or set())}
+    summary: dict[str, Any] = {
+        "enabled": True,
+        "mode": "known_intermediate_patterns",
+        "patterns": list(VIDEO_RENDER_INTERMEDIATE_PATTERNS),
+        "deletedCount": 0,
+        "deletedBytes": 0,
+        "preserved": [str(path) for path in sorted(preserve, key=str)],
+        "errors": [],
+    }
+    if not render_dir.exists() or not render_dir.is_dir():
+        summary["missingRenderDir"] = True
+        return summary
+    for path in sorted(render_dir.iterdir(), key=lambda item: item.name):
+        if not path.is_file():
+            continue
+        resolved = path.resolve()
+        if resolved in preserve:
+            continue
+        if not any(fnmatch.fnmatch(path.name, pattern) for pattern in VIDEO_RENDER_INTERMEDIATE_PATTERNS):
+            continue
+        try:
+            size = path.stat().st_size
+            path.unlink()
+            summary["deletedCount"] += 1
+            summary["deletedBytes"] += int(size)
+        except Exception as exc:  # pragma: no cover - defensive filesystem path
+            summary["errors"].append({"path": str(path), "error": f"{type(exc).__name__}: {exc}"})
+    summary["ok"] = not summary["errors"]
+    return summary
+
+
+def _path_total_size(path: Path) -> int:
+    if path.is_file():
+        return int(path.stat().st_size)
+    total = 0
+    for item in path.rglob("*"):
+        if item.is_file():
+            total += int(item.stat().st_size)
+    return total
+
+
+def _path_is_preserved(path: Path, preserve: set[Path]) -> bool:
+    resolved = path.resolve()
+    if resolved in preserve:
+        return True
+    if not path.is_dir():
+        return False
+    for preserved in preserve:
+        with contextlib.suppress(ValueError):
+            preserved.relative_to(resolved)
+            return True
+    return False
+
+
+def _cleanup_motion_render_intermediates(
+    package_dir: Path,
+    *,
+    preserve_paths: set[Path] | None = None,
+) -> dict[str, Any]:
+    preserve = {path.resolve() for path in (preserve_paths or set())}
+    summary: dict[str, Any] = {
+        "enabled": True,
+        "mode": "motion_cache_and_extra_outputs",
+        "cacheDirNames": list(MOTION_RENDER_CACHE_DIR_NAMES),
+        "outputDirNames": list(MOTION_RENDER_OUTPUT_DIR_NAMES),
+        "outputSuffixes": sorted(MOTION_RENDER_OUTPUT_SUFFIXES),
+        "deletedCount": 0,
+        "deletedBytes": 0,
+        "preserved": [str(path) for path in sorted(preserve, key=str)],
+        "errors": [],
+    }
+    if not package_dir.exists() or not package_dir.is_dir():
+        summary["missingPackageDir"] = True
+        return summary
+    for name in MOTION_RENDER_CACHE_DIR_NAMES:
+        path = package_dir / name
+        if not path.exists() or _path_is_preserved(path, preserve):
+            continue
+        try:
+            size = _path_total_size(path)
+            if path.is_dir():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+            summary["deletedCount"] += 1
+            summary["deletedBytes"] += int(size)
+        except Exception as exc:  # pragma: no cover - defensive filesystem path
+            summary["errors"].append({"path": str(path), "error": f"{type(exc).__name__}: {exc}"})
+    for name in MOTION_RENDER_OUTPUT_DIR_NAMES:
+        out_dir = package_dir / name
+        if not out_dir.is_dir():
+            continue
+        for path in sorted((item for item in out_dir.rglob("*") if item.is_file()), key=lambda item: str(item)):
+            if _path_is_preserved(path, preserve):
+                continue
+            if path.suffix.lower() not in MOTION_RENDER_OUTPUT_SUFFIXES:
+                continue
+            try:
+                size = path.stat().st_size
+                path.unlink()
+                summary["deletedCount"] += 1
+                summary["deletedBytes"] += int(size)
+            except Exception as exc:  # pragma: no cover - defensive filesystem path
+                summary["errors"].append({"path": str(path), "error": f"{type(exc).__name__}: {exc}"})
+    summary["ok"] = not summary["errors"]
+    return summary
+
+
 def _append_job_event(
     record: dict[str, Any],
     message: str,
@@ -1100,6 +1370,7 @@ async def _cancel_job(repo: Any, run: dict[str, Any], args: dict[str, Any]) -> d
     if not record and not queue:
         raise ValueError(f"video job not found: {job_id}")
     reason = str(args.get("reason") or "cancelled by video.cancel_job").strip()[:500]
+    runtime_cancelled = _cancel_video_job_runtime(job_id, reason)
     if queue and queue.get("status") not in VIDEO_JOB_TERMINAL_STATUSES:
         await repo.mark_job(job_id, "cancelled", error=reason)
     now = now_ms()
@@ -1119,6 +1390,7 @@ async def _cancel_job(repo: Any, run: dict[str, Any], args: dict[str, Any]) -> d
         updated["logPath"] = str(_job_dir(str(updated.get("ownerDept") or run["departmentId"]), updated.get("projectId"), job_id) / "events.jsonl")
     updated["statusUrl"] = updated.get("statusUrl") or f"atrium://video/jobs/{job_id}"
     _set_job_progress(updated, "cancelled", int((updated.get("progress") or {}).get("percent") or 0), reason, reason=reason)
+    updated["runtimeCancelSignalled"] = runtime_cancelled
     await _put_video_job(repo, updated)
     return {"ok": True, "cancelled": True, "job": _video_job_public(updated, await repo.get_job(job_id))}
 
@@ -1253,6 +1525,8 @@ async def process_video_job(repo: Any, payload: dict[str, Any], now: int | None 
         "requestedBy": payload.get("requestedBy") or dept_id,
         "args": args,
     }
+    runtime_cancel_event = _register_video_job_runtime(job_id)
+    runtime_token = _CURRENT_VIDEO_JOB_ID.set(job_id)
     try:
         if tool == "video.render_edit":
             work_phase = "rendering"
@@ -1272,6 +1546,18 @@ async def process_video_job(repo: Any, payload: dict[str, Any], now: int | None 
             raise ValueError(f"unsupported video job tool: {tool}")
         if result.get("ok") is False:
             raise ValueError(str(result.get("dependencyMissing") or result.get("error") or f"{tool} returned ok=false"))
+        latest = await _latest_video_record(repo, job_id, record)
+        if _video_record_cancelled(latest):
+            record = latest
+            _set_job_progress(
+                record,
+                "cancelled",
+                int((record.get("progress") or {}).get("percent") or 35),
+                str(record.get("error") or "video job cancelled"),
+                reason=str(record.get("error") or "video job cancelled"),
+            )
+            await _put_video_job(repo, record)
+            raise VideoJobCancelledError(str(record.get("error") or "video job cancelled"))
         _set_job_progress(record, "finalizing", 90, f"persisting {tool} result")
         await _put_video_job(repo, record)
         record["status"] = "done"
@@ -1290,7 +1576,34 @@ async def process_video_job(repo: Any, payload: dict[str, Any], now: int | None 
                 "severity": "good",
             })
         return result
+    except VideoJobCancelledError:
+        raise
+    except asyncio.CancelledError:
+        runtime_cancel_event.set()
+        with contextlib.suppress(BaseException):
+            latest = await _latest_video_record(repo, job_id, record)
+            if _video_record_cancelled(latest):
+                record = latest
+            else:
+                record["status"] = "failed"
+                record["completedAt"] = now_ms()
+                record["error"] = "CancelledError: video job worker cancelled"
+                _set_job_progress(record, "failed", int((record.get("progress") or {}).get("percent") or 10), record["error"], level="error")
+            await _put_video_job(repo, record)
+        raise
     except Exception as exc:
+        latest = await _latest_video_record(repo, job_id, record)
+        if _video_record_cancelled(latest):
+            record = latest
+            _set_job_progress(
+                record,
+                "cancelled",
+                int((record.get("progress") or {}).get("percent") or 10),
+                str(record.get("error") or "video job cancelled"),
+                reason=str(record.get("error") or "video job cancelled"),
+            )
+            await _put_video_job(repo, record)
+            raise VideoJobCancelledError(str(record.get("error") or "video job cancelled")) from exc
         record["status"] = "failed"
         record["completedAt"] = now_ms()
         record["error"] = f"{type(exc).__name__}: {exc}"
@@ -1307,6 +1620,9 @@ async def process_video_job(repo: Any, payload: dict[str, Any], now: int | None 
                 "severity": "warn",
             })
         raise
+    finally:
+        _CURRENT_VIDEO_JOB_ID.reset(runtime_token)
+        _unregister_video_job_runtime(job_id, runtime_cancel_event)
 
 
 async def _create_project(repo: Any, run: dict[str, Any], args: dict[str, Any]) -> dict[str, Any]:
@@ -1755,11 +2071,16 @@ async def _render_edit(repo: Any, run: dict[str, Any], args: dict[str, Any]) -> 
         else:
             raise ValueError("timeline spec or timelineId is required")
     spec = _normalize_timeline_spec(project, spec, args)
+    path_usage = _timeline_path_usage(project, spec)
     render_id = uid("render")
     render_dir = _project_dir(dept_id, project_id) / "renders" / render_id
     render_dir.mkdir(parents=True, exist_ok=True)
     spec_path = _save_timeline_spec(project, spec, source="render_edit")
-    rendered = await asyncio.to_thread(_render_ffmpeg, project, spec, render_dir)
+    try:
+        rendered = await asyncio.to_thread(_render_ffmpeg, project, spec, render_dir)
+    except Exception:
+        _cleanup_video_render_intermediates(render_dir)
+        raise
     render_hash = _sha256_file(rendered)
     spec_hash = _sha256_file(spec_path)
     manifest = {
@@ -1775,6 +2096,8 @@ async def _render_edit(repo: Any, run: dict[str, Any], args: dict[str, Any]) -> 
         "createdAt": now_ms(),
         "renderer": "ffmpeg",
         "mediaContext": _media_context(project, timeline=spec),
+        "pathUsage": path_usage,
+        "hostPathAudit": _host_path_audit(path_usage),
     }
     manifest_path = render_dir / "manifest.json"
     _write_json(manifest_path, manifest)
@@ -1799,6 +2122,7 @@ async def _render_edit(repo: Any, run: dict[str, Any], args: dict[str, Any]) -> 
     artifact.update(_video_artifact_context_fields(project, artifact["id"], timeline=spec, render=manifest))
     await repo.put_entity("artifact", artifact, dept=dept_id, project=project_id, status=artifact.get("status"), ts=manifest["createdAt"])
     manifest["manifestPath"] = str(manifest_path)
+    manifest["cleanup"] = _cleanup_video_render_intermediates(render_dir, preserve_paths={rendered, manifest_path})
     _write_json(manifest_path, manifest)
     project.setdefault("renders", []).append(manifest)
     _append_project_audit(
@@ -1808,8 +2132,8 @@ async def _render_edit(repo: Any, run: dict[str, Any], args: dict[str, Any]) -> 
         entity_type="video_render",
         entity_id=render_id,
         summary=f"Rendered {manifest['kind']} video from {spec['id']} v{spec['version']}",
-        refs={"timelineId": spec["id"], "timelineVersion": spec["version"], "artifactId": artifact["id"], "renderer": "ffmpeg"},
-        paths={"render": str(rendered), "manifest": str(manifest_path), "spec": str(spec_path)},
+        refs={"timelineId": spec["id"], "timelineVersion": spec["version"], "artifactId": artifact["id"], "renderer": "ffmpeg", "hostPathCount": manifest["hostPathAudit"]["hostPathCount"]},
+        paths={"render": str(rendered), "manifest": str(manifest_path), "spec": str(spec_path), "hostPaths": [item["path"] for item in manifest["hostPathAudit"]["hostPaths"]]},
         checksum=render_hash,
     )
     _save_project(project)
@@ -3037,6 +3361,7 @@ async def _render_motion(repo: Any, run: dict[str, Any], args: dict[str, Any]) -
     motion_id = uid("motion")
     package_dir = _project_dir(dept_id, project_id) / "motion" / motion_id
     payload = _motion_timeline_payload(project, spec)
+    path_usage = _timeline_path_usage(project, spec)
     renderers = _motion_renderers(args)
     renderer = renderers[0] if len(renderers) == 1 else "multi"
     packages: list[dict[str, Any]] = []
@@ -3085,6 +3410,8 @@ async def _render_motion(repo: Any, run: dict[str, Any], args: dict[str, Any]) -
         "commands": packages[0]["commands"] if packages else {},
         "packages": packages,
         "status": "packaged",
+        "pathUsage": path_usage,
+        "hostPathAudit": _host_path_audit(path_usage),
     }
     manifest_path = package_dir / "motion_manifest.json"
     _write_json(manifest_path, manifest)
@@ -3108,7 +3435,9 @@ async def _render_motion(repo: Any, run: dict[str, Any], args: dict[str, Any]) -
     await repo.put_entity("artifact", artifact, dept=dept_id, project=project_id, status=artifact.get("status"), ts=manifest["createdAt"])
     render_result = None
     render_artifact = None
-    if bool(args.get("render") or args.get("renderNow") or args.get("render_now")):
+    render_required = bool(args.get("render") or args.get("renderNow") or args.get("render_now"))
+    partial_render_allowed = bool(args.get("allowPartialRender") or args.get("allow_partial_render"))
+    if render_required:
         if "remotion" in renderers and len(renderers) == 1:
             render_result, render_artifact = await _maybe_render_remotion(repo, run, project, manifest, package_dir, args)
             manifest["renderResult"] = render_result
@@ -3122,16 +3451,38 @@ async def _render_motion(repo: Any, run: dict[str, Any], args: dict[str, Any]) -
         else:
             render_result = {"ok": False, "status": "skipped", "reason": "Automatic rendering is currently supported for a single renderer=remotion or renderer=hyperframes only."}
             manifest["renderResult"] = render_result
+    render_failed = render_required and isinstance(render_result, dict) and render_result.get("ok") is False
+    if render_failed:
+        render_status = str(render_result.get("status") or "render_failed")
+        manifest["status"] = "render_failed" if render_status != "skipped" else "render_skipped"
+        manifest["renderRequired"] = True
+        manifest["partialRenderAllowed"] = partial_render_allowed
+        manifest["renderFailure"] = {
+            "status": render_status,
+            "reason": render_result.get("reason"),
+            "returnCode": render_result.get("returnCode"),
+        }
+    else:
+        manifest["renderRequired"] = render_required
+        manifest["partialRenderAllowed"] = partial_render_allowed
     project.setdefault("motionPackages", []).append(manifest)
     _save_project(project)
     await repo.put_entity("video_project", project, dept=dept_id, project=project_id, status="active", ts=project["updatedAt"])
     await repo.put_entity("video_motion", manifest, dept=dept_id, project=project_id, status=manifest.get("status"), ts=manifest["createdAt"])
+    ok = not (render_failed and not partial_render_allowed)
+    error = None
+    if not ok:
+        failure = manifest.get("renderFailure") if isinstance(manifest.get("renderFailure"), dict) else {}
+        error = f"motion render failed: {failure.get('status') or 'render_failed'}"
+        if failure.get("reason"):
+            error = f"{error}: {failure['reason']}"
     return {
-        "ok": True,
+        "ok": ok,
         "motion": manifest,
         "artifact": artifact,
         "renderArtifact": render_artifact,
         "renderResult": render_result,
+        **({"error": error, "packageOk": True} if error else {}),
         "context": _media_context(project, timeline=spec),
     }
 
@@ -3178,6 +3529,7 @@ async def _maybe_render_remotion(
         project_id=str(project["id"]),
         note=f"rendered Remotion package {manifest['id']}",
     )
+    cleanup = _cleanup_motion_render_intermediates(package_dir, preserve_paths={output_path})
     render_manifest = {
         "id": render_id,
         "projectId": project["id"],
@@ -3194,6 +3546,7 @@ async def _maybe_render_remotion(
         "createdAt": now_ms(),
         "renderer": "remotion",
         "motionId": manifest["id"],
+        "cleanup": cleanup,
     }
     artifact.update(_video_artifact_context_fields(project, artifact["id"], render=render_manifest))
     await repo.put_entity("artifact", artifact, dept=str(project["ownerDept"]), project=str(project["id"]), status=artifact.get("status"), ts=render_manifest["createdAt"])
@@ -3337,6 +3690,7 @@ async def _maybe_render_hyperframes(
         project_id=str(project["id"]),
         note=f"rendered HyperFrames package {manifest['id']}",
     )
+    cleanup = _cleanup_motion_render_intermediates(package_dir, preserve_paths={output_path})
     render_manifest = {
         "id": render_id,
         "projectId": project["id"],
@@ -3353,6 +3707,7 @@ async def _maybe_render_hyperframes(
         "createdAt": now_ms(),
         "renderer": "hyperframes",
         "motionId": manifest["id"],
+        "cleanup": cleanup,
         "lint": {"returnCode": lint["returnCode"], "stdout": str(lint.get("stdout") or "")[-1200:], "stderr": str(lint.get("stderr") or "")[-1200:]},
         **({"inspect": {"returnCode": inspect_result["returnCode"], "stdout": str(inspect_result.get("stdout") or "")[-1200:], "stderr": str(inspect_result.get("stderr") or "")[-1200:]}} if inspect_result else {}),
     }
@@ -3753,6 +4108,78 @@ def _resolve_font(project: dict[str, Any], value: Any) -> Path | None:
             if preferred.lower() in font["name"].lower() or preferred.lower() in font["familyHint"].lower():
                 return Path(font["path"])
     return None
+
+
+def _path_scope(project: dict[str, Any], path: Path) -> str:
+    resolved = path.resolve()
+    project_root = _project_dir(str(project["ownerDept"]), str(project["id"])).resolve()
+    workspace_root = _workspace(str(project["ownerDept"])).resolve()
+    with contextlib.suppress(ValueError):
+        resolved.relative_to(project_root)
+        return "project"
+    with contextlib.suppress(ValueError):
+        resolved.relative_to(workspace_root)
+        return "workspace"
+    return "host"
+
+
+def _path_usage_record(project: dict[str, Any], role: str, path: Path, *, ref: str | None = None) -> dict[str, Any]:
+    resolved = path.resolve()
+    return {
+        "role": role,
+        "path": str(resolved),
+        "scope": _path_scope(project, resolved),
+        **({"ref": ref} if ref else {}),
+    }
+
+
+def _host_path_audit(records: list[dict[str, Any]]) -> dict[str, Any]:
+    host_paths = [record for record in records if record.get("scope") == "host"]
+    return {
+        "enabled": True,
+        "mode": "visibility_only_full_autonomy",
+        "totalPathCount": len(records),
+        "hostPathCount": len(host_paths),
+        "hostPaths": host_paths[:50],
+    }
+
+
+def _timeline_path_usage(project: dict[str, Any], spec: dict[str, Any]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+
+    def add(role: str, path: Path, ref: str | None = None) -> None:
+        record = _path_usage_record(project, role, path, ref=ref)
+        key = (str(record.get("role") or ""), str(record.get("path") or ""), str(record.get("ref") or ""))
+        if key in seen:
+            return
+        seen.add(key)
+        records.append(record)
+
+    for clip in spec.get("clips") or []:
+        if not isinstance(clip, dict):
+            continue
+        with contextlib.suppress(Exception):
+            add("clip", _clip_source(project, clip), str(clip.get("id") or ""))
+    for layer in spec.get("overlays") or []:
+        if not isinstance(layer, dict):
+            continue
+        with contextlib.suppress(Exception):
+            add("overlay", _image_source(project, layer), str(layer.get("id") or ""))
+    for layer in spec.get("audio") or []:
+        if not isinstance(layer, dict):
+            continue
+        with contextlib.suppress(Exception):
+            add("audio", _audio_source(project, layer), str(layer.get("id") or ""))
+    for layer in _timeline_text_layers(spec):
+        raw_font = layer.get("fontFile") or layer.get("fontPath") or layer.get("font")
+        if not raw_font:
+            continue
+        with contextlib.suppress(Exception):
+            font_path = _resolve_font(project, raw_font)
+            if font_path is not None:
+                add("font", font_path, str(layer.get("id") or ""))
+    return records
 
 
 def _ff_escape(value: str) -> str:
@@ -4977,7 +5404,22 @@ async def _transcribe(repo: Any, run: dict[str, Any], args: dict[str, Any]) -> d
     project_id = str(args.get("projectId") or args.get("project_id") or "").strip()
     project = _load_project(dept_id, project_id) if project_id else None
     source = await _resolve_source_path(repo, dept_id, args, project=project)
-    out_dir = (_project_dir(dept_id, project_id) / "transcripts" if project else _workspace(dept_id) / "video_transcripts" / uid("transcript"))
+    if project:
+        source_path_usage = [_path_usage_record(project, "source", source, ref="transcribe")]
+    else:
+        source_scope = "host"
+        workspace_root = _workspace(dept_id).resolve()
+        with contextlib.suppress(ValueError):
+            source.resolve().relative_to(workspace_root)
+            source_scope = "workspace"
+        source_path_usage = [{"role": "source", "path": str(source.resolve()), "scope": source_scope, "ref": "transcribe"}]
+    source_host_path_audit = _host_path_audit(source_path_usage)
+    transcript_id = uid("transcript")
+    out_dir = (
+        _project_dir(dept_id, project_id) / "transcripts" / transcript_id
+        if project
+        else _workspace(dept_id) / "video_transcripts" / transcript_id
+    )
     out_dir.mkdir(parents=True, exist_ok=True)
     engine = shutil.which("whisperx") or shutil.which("whisper")
     audio_path = out_dir / "audio.wav"
@@ -4990,12 +5432,16 @@ async def _transcribe(repo: Any, run: dict[str, Any], args: dict[str, Any]) -> d
         raise ValueError(f"audio extraction failed: {(extract.get('stderr') or '')[-1500:]}")
     if not engine:
         transcript = {
-            "id": uid("transcript"),
+            "id": transcript_id,
             "projectId": project_id or None,
             "source": str(source),
             "status": "dependency_missing",
             "message": "Install whisperx or whisper to enable transcript generation.",
             "audioPath": str(audio_path),
+            "workDir": str(out_dir),
+            "isolatedWorkDir": True,
+            "pathUsage": source_path_usage,
+            "hostPathAudit": source_host_path_audit,
             "createdAt": now_ms(),
         }
         transcript_path = out_dir / "transcript.json"
@@ -5010,10 +5456,12 @@ async def _transcribe(repo: Any, run: dict[str, Any], args: dict[str, Any]) -> d
         command.extend(["--language", language])
     result = await asyncio.to_thread(_run, command, timeout=float(args.get("timeoutSeconds") or 3600))
     normalized = _best_transcript_output(out_dir) if result["returnCode"] == 0 else {"segments": [], "words": [], "text": ""}
-    normalized["id"] = uid("transcript")
+    normalized["id"] = transcript_id
     normalized["projectId"] = project_id or None
     normalized["source"] = str(source)
     normalized["engine"] = Path(engine).name
+    normalized["pathUsage"] = source_path_usage
+    normalized["hostPathAudit"] = source_host_path_audit
     if language and not normalized.get("language"):
         normalized["language"] = language
     normalized["createdAt"] = now_ms()
@@ -5063,6 +5511,10 @@ async def _transcribe(repo: Any, run: dict[str, Any], args: dict[str, Any]) -> d
         "srtPath": str(srt_path) if srt_path.is_file() else None,
         "vttPath": str(vtt_path) if vtt_path.is_file() else None,
         "assPath": str(ass_path) if ass_path.is_file() else None,
+        "workDir": str(out_dir),
+        "isolatedWorkDir": True,
+        "pathUsage": source_path_usage,
+        "hostPathAudit": source_host_path_audit,
         "segmentCount": len(normalized.get("segments") or []),
         "wordCount": len(normalized.get("words") or []),
         "speakers": normalized.get("speakers") or [],

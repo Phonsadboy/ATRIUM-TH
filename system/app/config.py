@@ -333,9 +333,11 @@ class Settings(BaseSettings):
     state_approval_count: int = 80
     state_task_detail_chars: int = 320
     state_task_handoff_reason_chars: int = 180
+    state_task_handoff_messages: int = 3
+    state_task_handoff_message_chars: int = 320
     state_task_log_entries: int = 5
     state_task_log_chars: int = 160
-    state_task_deliverable_chars: int = 0
+    state_task_deliverable_chars: int = 12_000
     # Auto compaction is primarily based on estimated prompt/context tokens.
     # Keep the legacy message-count trigger opt-in only; <= 0 disables it.
     compact_message_threshold: int = 0
@@ -354,6 +356,11 @@ class Settings(BaseSettings):
     engine_job_timeout_s: float = 1800.0
     engine_tick_timeout_s: float = 1800.0
     engine_stale_after_s: float = 600.0
+    # Visibility-only threshold for surfacing active jobs that have retried often.
+    # This is not a max-attempt cap and never stops/rejects job execution.
+    engine_retry_visibility_attempts: int = 5
+    # Timeout recovery delay before non-chat jobs are retried. This is not a cap.
+    engine_timeout_retry_delay_s: float = 60.0
     chat_reply_worker_concurrency: int = Field(
         default=5,
         validation_alias=AliasChoices("ATRIUM_CHAT_REPLY_WORKER_CONCURRENCY", "CHAT_REPLY_WORKER_CONCURRENCY"),
@@ -529,6 +536,14 @@ class Settings(BaseSettings):
     @property
     def state_task_handoff_reason_char_limit(self) -> int:
         return max(80, min(int(self.state_task_handoff_reason_chars), 2000))
+
+    @property
+    def state_task_handoff_message_limit(self) -> int:
+        return max(0, min(int(self.state_task_handoff_messages), 20))
+
+    @property
+    def state_task_handoff_message_char_limit(self) -> int:
+        return max(40, min(int(self.state_task_handoff_message_chars), 4000))
 
     @property
     def state_task_log_entry_limit(self) -> int:

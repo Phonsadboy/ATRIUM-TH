@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useSelector, client, shallowArrayEqual } from '../state/useCompany'
 import { useUI } from '../state/ui'
 import { Field, Modal, Toggle, inputClass, withAlpha } from '../components/primitives'
@@ -71,8 +71,11 @@ function AssignTaskForm({
   const [priority, setPriority] = useState<Priority>('normal')
   const [byExec, setByExec] = useState(initialByExec)
   const [reviewMinutes, setReviewMinutes] = useState('5')
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const submittingRef = useRef(false)
 
-  const canSubmit = title.trim() !== '' && deptId !== ''
+  const canSubmit = title.trim() !== '' && deptId !== '' && !submitting
 
   const choosePriority = (next: Priority) => {
     setReviewMinutes((current) => (
@@ -83,20 +86,35 @@ function AssignTaskForm({
     setPriority(next)
   }
 
-  const submit = () => {
-    if (!canSubmit) return
-    const reviewIntervalMs = Math.max(1, Number(reviewMinutes) || 5) * 60_000
-    client.assignTask({
-      title: title.trim(),
-      detail: detail.trim() || undefined,
-      departmentId: deptId,
-      priority,
-      byExecutive: byExec,
-      reviewIntervalMs,
-    })
-    select(deptId)
-    setRightTab('tasks')
-    onClose()
+  const submit = async () => {
+    if (!canSubmit || submittingRef.current) return
+    const trimmedReviewMinutes = reviewMinutes.trim()
+    const parsedReviewMinutes = Number(trimmedReviewMinutes)
+    const reviewIntervalMs = (
+      trimmedReviewMinutes === '' || !Number.isFinite(parsedReviewMinutes)
+        ? 5
+        : Math.max(0, parsedReviewMinutes)
+    ) * 60_000
+    submittingRef.current = true
+    setSubmitting(true)
+    setError(null)
+    try {
+      const task = await client.assignTask({
+        title: title.trim(),
+        detail: detail.trim() || undefined,
+        departmentId: deptId,
+        priority,
+        byExecutive: byExec,
+        reviewIntervalMs,
+      })
+      select(task.departmentId)
+      setRightTab('tasks')
+      onClose()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+      submittingRef.current = false
+      setSubmitting(false)
+    }
   }
 
   return (
@@ -168,7 +186,7 @@ function AssignTaskForm({
             className={inputClass}
             style={{ borderColor: 'var(--color-line-soft)' }}
             type="number"
-            min={1}
+            min={0}
             step={1}
             value={reviewMinutes}
             onChange={(e) => setReviewMinutes(e.target.value)}
@@ -191,11 +209,27 @@ function AssignTaskForm({
         </div>
       </div>
 
+      {error && (
+        <div
+          role="alert"
+          className="mt-4 rounded-xl border px-3 py-2 text-xs leading-relaxed"
+          style={{
+            borderColor: withAlpha(ACCENT_HEX.coral, 0.42),
+            background: withAlpha(ACCENT_HEX.coral, 0.12),
+            color: 'var(--color-cream)',
+          }}
+        >
+          <div className="font-semibold">ส่งงานไม่สำเร็จ</div>
+          <div className="mt-1 text-[var(--color-cream-dim)]">{error}</div>
+        </div>
+      )}
+
       <div className="mt-5 flex justify-end gap-2">
         <button
           type="button"
           onClick={onClose}
-          className="rounded-xl border px-4 py-2 text-sm text-[var(--color-cream-dim)] transition-colors hover:text-[var(--color-cream)]"
+          disabled={submitting}
+          className="rounded-xl border px-4 py-2 text-sm text-[var(--color-cream-dim)] transition-colors hover:text-[var(--color-cream)] disabled:opacity-40"
           style={{ borderColor: 'var(--color-line-soft)' }}
         >
           ยกเลิก
@@ -207,7 +241,7 @@ function AssignTaskForm({
           className="rounded-xl px-4 py-2 text-sm font-semibold transition-opacity disabled:opacity-40"
           style={{ background: ACCENT_HEX.amber, color: '#1a1610' }}
         >
-          มอบงาน
+          {submitting ? 'กำลังมอบงาน…' : 'มอบงาน'}
         </button>
       </div>
     </>

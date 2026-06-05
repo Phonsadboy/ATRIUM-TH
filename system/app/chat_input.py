@@ -392,6 +392,64 @@ def summarize_messages(messages: list[dict[str, Any]], *, limit: int = 12) -> st
     return "\n".join(lines)
 
 
+def _attachment_context_body(text: str, *, limit: int = MAX_ATTACHMENT_CONTEXT_CHARS) -> str:
+    body = str(text or "")
+    if len(body) <= limit:
+        return body
+    return (
+        body[:limit]
+        + f"\n[attachment context truncated at {limit} chars; use the artifact id, uri, or sourcePath to inspect the full file]"
+    )
+
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on", "full"}
+
+
+def _positive_int(*values: Any) -> int | None:
+    for value in values:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            continue
+        if number > 0:
+            return number
+    return None
+
+
+def _attachment_context_limit(attachment: dict[str, Any], artifact: dict[str, Any]) -> int:
+    explicit = _positive_int(attachment.get("contextMaxChars"), attachment.get("context_max_chars"))
+    if explicit is not None:
+        return explicit
+    include_full = _truthy(
+        _first_present(
+            attachment.get("includeFullContext"),
+            attachment.get("include_full_context"),
+            artifact.get("includeFullContext"),
+            artifact.get("include_full_context"),
+        )
+    )
+    if include_full:
+        known_size = _positive_int(
+            artifact.get("sourceSizeBytes"),
+            artifact.get("source_size_bytes"),
+            artifact.get("contentSizeBytes"),
+            artifact.get("content_size_bytes"),
+            attachment.get("sourceSizeBytes"),
+            attachment.get("source_size_bytes"),
+            attachment.get("sizeBytes"),
+            attachment.get("size_bytes"),
+        )
+        if known_size is not None:
+            return max(MAX_ATTACHMENT_CONTEXT_CHARS + 1, known_size + 1)
+        return MAX_ATTACHMENT_CONTEXT_CHARS * 20
+    return MAX_ATTACHMENT_CONTEXT_CHARS
+
+
 async def attachment_context(repo, attachments: list[dict[str, Any]]) -> str:
     parts: list[str] = []
     for attachment in attachments:
@@ -408,6 +466,7 @@ async def attachment_context(repo, attachments: list[dict[str, Any]]) -> str:
         uri = uri or artifact.get("uri")
         label = artifact.get("name") or artifact_id
         mime = artifact.get("contentMime") or artifact.get("mime") or attachment.get("mime")
+        context_limit = _attachment_context_limit(attachment, artifact)
         video_context = _video_media_context_text(attachment, artifact, label=str(label))
         if video_context:
             parts.append(video_context)
@@ -417,17 +476,22 @@ async def attachment_context(repo, attachments: list[dict[str, Any]]) -> str:
             model = str((audio_transcription or {}).get("model") or "unknown")
             parts.append(
                 f"Attachment {artifact_id} ({label}) audio transcript"
-                f" [model={model}]:\n{transcript[:MAX_ATTACHMENT_CONTEXT_CHARS]}"
+                f" [model={model}]:\n{_attachment_context_body(transcript, limit=context_limit)}"
             )
             continue
-        text = extract_text_from_uri(uri, filename=str(label), mime=mime, limit=MAX_ATTACHMENT_CONTEXT_CHARS)
+        text = extract_text_from_uri(uri, filename=str(label), mime=mime, limit=context_limit + 1)
         if text:
-            parts.append(f"Attachment {artifact_id} ({label}):\n{text[:MAX_ATTACHMENT_CONTEXT_CHARS]}")
+            parts.append(f"Attachment {artifact_id} ({label}):\n{_attachment_context_body(text, limit=context_limit)}")
         elif not video_context:
+            source_path = artifact.get("sourcePath") or attachment.get("sourcePath") or attachment.get("source_path")
+            reference = f" sourcePath={source_path}" if source_path else ""
+            copy_status = artifact.get("copyStatus") or attachment.get("copyStatus") or attachment.get("copy_status")
+            copy_note = f" copyStatus={copy_status}" if copy_status else ""
             parts.append(
                 f"Attachment {artifact_id} ({label}): no text preview available; "
                 f"kind={artifact.get('kind') or attachment.get('kind') or 'file'} "
                 f"mime={mime or 'unknown'} size={artifact.get('contentSizeBytes') or attachment.get('sizeBytes') or 'unknown'}"
+                f"{reference}{copy_note}"
             )
     return "\n\n".join(parts)
 
@@ -501,6 +565,13 @@ def attachment_reference_text(attachments: list[dict[str, Any]], *, limit: int =
         mime = str(attachment.get("mime") or "").strip()
         size = attachment.get("sizeBytes") or attachment.get("size_bytes")
         uri = str(attachment.get("uri") or "").strip()
+        source_path = str(attachment.get("sourcePath") or attachment.get("source_path") or "").strip()
+        copy_status = str(attachment.get("copyStatus") or attachment.get("copy_status") or "").strip()
+        reference_kind = str(attachment.get("referenceKind") or attachment.get("reference_kind") or "").strip()
+        context_max_chars = attachment.get("contextMaxChars") or attachment.get("context_max_chars")
+        include_full_context = attachment.get("includeFullContext")
+        if include_full_context is None:
+            include_full_context = attachment.get("include_full_context")
         video_context = _video_media_context(attachment, attachment)
         bits = [name]
         if artifact_id:
@@ -518,6 +589,16 @@ def attachment_reference_text(attachments: list[dict[str, Any]], *, limit: int =
             bits.append(f"size={size}")
         if uri:
             bits.append(f"uri={uri}")
+        if source_path and source_path != uri:
+            bits.append(f"sourcePath={source_path}")
+        if reference_kind:
+            bits.append(f"referenceKind={reference_kind}")
+        if copy_status:
+            bits.append(f"copyStatus={copy_status}")
+        if context_max_chars:
+            bits.append(f"contextMaxChars={context_max_chars}")
+        if include_full_context is not None:
+            bits.append(f"includeFullContext={bool(_truthy(include_full_context))}")
         refs.append("; ".join(bits))
     if not refs:
         return ""

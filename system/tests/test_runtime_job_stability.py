@@ -7,6 +7,445 @@ from unittest import mock
 
 
 class RuntimeJobStabilityTest(unittest.IsolatedAsyncioTestCase):
+    async def test_requeue_stale_running_jobs_restores_only_stale_running_rows(self) -> None:
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+        from app.db.base import Base
+        from app.db import tables as T
+        from app.db.repo import Repo
+
+        engine_db = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+        try:
+            async with engine_db.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            sessionmaker = async_sessionmaker(engine_db, expire_on_commit=False)
+            async with sessionmaker() as session:
+                session.add_all([
+                    T.Job(
+                        id="job_stale",
+                        kind="objective_run",
+                        status="running",
+                        run_after=0,
+                        priority=5,
+                        payload={},
+                        attempts=2,
+                        created_at=100,
+                        updated_at=700,
+                    ),
+                    T.Job(
+                        id="job_fresh",
+                        kind="objective_run",
+                        status="running",
+                        run_after=0,
+                        priority=5,
+                        payload={},
+                        attempts=1,
+                        created_at=100,
+                        updated_at=950,
+                    ),
+                    T.Job(
+                        id="job_excluded",
+                        kind="image_generation",
+                        status="running",
+                        run_after=0,
+                        priority=5,
+                        payload={},
+                        attempts=3,
+                        created_at=100,
+                        updated_at=600,
+                    ),
+                    T.Job(
+                        id="job_done",
+                        kind="objective_run",
+                        status="done",
+                        run_after=0,
+                        priority=5,
+                        payload={},
+                        attempts=4,
+                        created_at=100,
+                        updated_at=500,
+                    ),
+                ])
+                await session.commit()
+
+                repo = Repo(session)
+                requeued = await repo.requeue_stale_running_jobs(
+                    1000,
+                    stale_after_ms=200,
+                    exclude_kinds={"image_generation"},
+                )
+
+                self.assertEqual([item["id"] for item in requeued], ["job_stale"])
+                stale = await session.get(T.Job, "job_stale")
+                fresh = await session.get(T.Job, "job_fresh")
+                excluded = await session.get(T.Job, "job_excluded")
+                done = await session.get(T.Job, "job_done")
+                self.assertEqual(stale.status, "queued")
+                self.assertEqual(stale.run_after, 1000)
+                self.assertEqual(stale.updated_at, 1000)
+                self.assertEqual(stale.attempts, 2)
+                self.assertIn("requeued stale running job", stale.last_error)
+                self.assertEqual(fresh.status, "running")
+                self.assertEqual(excluded.status, "running")
+                self.assertEqual(done.status, "done")
+        finally:
+            await engine_db.dispose()
+
+    async def test_sqlite_claim_due_jobs_does_not_double_claim_same_row(self) -> None:
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+        from app.db.base import Base
+        from app.db import repo as repo_module
+        from app.db import tables as T
+        from app.db.repo import Repo
+
+        with tempfile.TemporaryDirectory(prefix="atrium-sqlite-claim-") as tmp:
+            engine_db = create_async_engine(f"sqlite+aiosqlite:///{Path(tmp) / 'claim.db'}", future=True)
+            try:
+                async with engine_db.begin() as conn:
+                    await conn.run_sync(Base.metadata.create_all)
+                sessionmaker = async_sessionmaker(engine_db, expire_on_commit=False)
+                async with sessionmaker() as session:
+                    session.add(T.Job(
+                        id="job_once",
+                        kind="objective_run",
+                        status="queued",
+                        run_after=0,
+                        priority=5,
+                        payload={},
+                        attempts=0,
+                        created_at=100,
+                        updated_at=100,
+                    ))
+                    await session.commit()
+
+                async def claim_once() -> list[str]:
+                    async with sessionmaker() as session:
+                        with mock.patch.object(repo_module, "get_settings", return_value=SimpleNamespace(is_postgres=False)):
+                            claimed = await Repo(session).claim_due_jobs(1000, limit=1)
+                        await session.commit()
+                        return [job.id for job in claimed]
+
+                first, second = await asyncio.gather(claim_once(), claim_once())
+
+                claimed_ids = first + second
+                self.assertEqual(claimed_ids.count("job_once"), 1)
+                async with sessionmaker() as session:
+                    row = await session.get(T.Job, "job_once")
+                    self.assertEqual(row.status, "running")
+            finally:
+                await engine_db.dispose()
+
+    async def test_job_runtime_summary_reports_high_attempt_jobs_without_capping(self) -> None:
+        from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
+
+        from app.db.base import Base
+        from app.db import tables as T
+        from app.db.repo import Repo
+
+        engine_db = create_async_engine("sqlite+aiosqlite:///:memory:", future=True)
+        try:
+            async with engine_db.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+            sessionmaker = async_sessionmaker(engine_db, expire_on_commit=False)
+            async with sessionmaker() as session:
+                session.add_all([
+                    T.Job(
+                        id="job_retry_queued",
+                        kind="chat_reply",
+                        status="queued",
+                        run_after=1200,
+                        priority=5,
+                        payload={},
+                        attempts=7,
+                        last_error="runtime unavailable",
+                        created_at=100,
+                        updated_at=800,
+                    ),
+                    T.Job(
+                        id="job_retry_running",
+                        kind="objective_run",
+                        status="running",
+                        run_after=0,
+                        priority=5,
+                        payload={},
+                        attempts=5,
+                        last_error="retry later",
+                        created_at=100,
+                        updated_at=700,
+                    ),
+                    T.Job(
+                        id="job_low_attempt",
+                        kind="objective_run",
+                        status="queued",
+                        run_after=900,
+                        priority=5,
+                        payload={},
+                        attempts=4,
+                        created_at=100,
+                        updated_at=850,
+                    ),
+                    T.Job(
+                        id="job_done_high_attempt",
+                        kind="objective_run",
+                        status="done",
+                        run_after=0,
+                        priority=5,
+                        payload={},
+                        attempts=9,
+                        created_at=100,
+                        updated_at=600,
+                    ),
+                ])
+                await session.commit()
+
+                summary = await Repo(session).job_runtime_summary(
+                    1000,
+                    stale_after_ms=1000,
+                    retry_visibility_attempts=5,
+                )
+
+                self.assertEqual(summary["retryVisibility"], {
+                    "visibilityOnly": True,
+                    "thresholdAttempts": 5,
+                    "activeJobCount": 2,
+                })
+                self.assertEqual(
+                    [job["id"] for job in summary["highAttemptJobs"]],
+                    ["job_retry_queued", "job_retry_running"],
+                )
+                self.assertEqual(summary["highAttemptJobs"][0]["attempts"], 7)
+                self.assertEqual(summary["highAttemptJobs"][1]["status"], "running")
+
+                retry_queued = await session.get(T.Job, "job_retry_queued")
+                retry_running = await session.get(T.Job, "job_retry_running")
+                self.assertEqual(retry_queued.status, "queued")
+                self.assertEqual(retry_queued.attempts, 7)
+                self.assertEqual(retry_running.status, "running")
+                self.assertEqual(retry_running.attempts, 5)
+        finally:
+            await engine_db.dispose()
+
+    async def test_engine_reaper_records_activity_and_uses_conservative_window(self) -> None:
+        from app import engine
+
+        class FakeRepo:
+            def __init__(self) -> None:
+                self.calls: list[dict] = []
+                self.activities: list[dict] = []
+
+            async def requeue_stale_running_jobs(self, now, **kwargs):
+                self.calls.append({"now": now, **kwargs})
+                return [{"id": "job_1", "kind": "objective_run", "ageMs": 5000, "attempts": 1}]
+
+            async def add_activity(self, ev):
+                self.activities.append(ev)
+
+        repo = FakeRepo()
+        settings = SimpleNamespace(
+            engine_stale_after_s=10,
+            engine_job_timeout_s=30,
+            image_generation_timeout_s=600,
+        )
+
+        count = await engine._requeue_stale_running_jobs(repo, 10_000, settings)
+
+        self.assertEqual(count, 1)
+        self.assertEqual(repo.calls[0]["stale_after_ms"], 600_000)
+        self.assertEqual(repo.calls[0]["exclude_kinds"], set())
+        self.assertEqual(repo.activities[0]["severity"], "warning")
+        self.assertEqual(repo.activities[0]["jobs"][0]["id"], "job_1")
+
+    def test_engine_reaper_excludes_unbounded_image_jobs(self) -> None:
+        from app import engine
+
+        settings = SimpleNamespace(image_generation_timeout_s=0)
+
+        self.assertEqual(engine._job_reaper_excluded_kinds(settings), {"image_generation"})
+
+    async def test_image_worker_timeout_requeues_run_when_attempts_remain(self) -> None:
+        from app.image_generation import handle_image_generation_worker_timeout
+
+        class FakeRepo:
+            def __init__(self) -> None:
+                self.entities = {
+                    ("image_generation_run", "run_1"): {
+                        "id": "run_1",
+                        "jobId": "img_1",
+                        "status": "running",
+                        "ownerDept": "exec",
+                        "departmentId": "exec",
+                        "threadId": "executive",
+                        "messageId": "msg_img",
+                        "queuedAt": 100,
+                        "startedAt": 200,
+                        "lastAttemptStartedAt": 300,
+                        "attempts": 1,
+                        "maxAttempts": 3,
+                        "model": "gpt-image-2",
+                        "mode": "generate",
+                        "options": {},
+                        "prompt": "draw",
+                    }
+                }
+                self.messages = {
+                    "msg_img": {
+                        "id": "msg_img",
+                        "threadId": "executive",
+                        "text": "old",
+                        "ts": 100,
+                    }
+                }
+                self.activities: list[dict] = []
+
+            async def get_entity(self, etype, eid):
+                return dict(self.entities.get((etype, eid)) or {})
+
+            async def put_entity(self, etype, obj, **kwargs):
+                del kwargs
+                self.entities[(etype, obj["id"])] = dict(obj)
+                return obj
+
+            async def get_department(self, dept_id):
+                return {"id": dept_id, "name": "Executive", "agentName": "Executive AI"}
+
+            async def get_message(self, msg_id, *, thread_id=None):
+                msg = self.messages.get(msg_id)
+                if msg and (thread_id is None or msg.get("threadId") == thread_id):
+                    return dict(msg)
+                return None
+
+            async def update_message(self, msg):
+                self.messages[msg["id"]] = dict(msg)
+
+            async def add_message(self, msg):
+                self.messages[msg["id"]] = dict(msg)
+
+            async def add_activity(self, ev):
+                self.activities.append(dict(ev))
+
+        repo = FakeRepo()
+
+        result = await handle_image_generation_worker_timeout(
+            repo,
+            {"runId": "run_1", "jobId": "img_1", "departmentId": "exec"},
+            "TimeoutError: image job exceeded 1s",
+        )
+
+        run = repo.entities[("image_generation_run", "run_1")]
+        self.assertEqual(result["status"], "retry_queued")
+        self.assertEqual(result["delayMs"], 60_000)
+        self.assertEqual(run["status"], "queued")
+        self.assertEqual(run["attempts"], 1)
+        self.assertTrue(run["workerTimeoutRetry"])
+        self.assertGreater(run["retryAfter"], 0)
+        self.assertIn("timeout", run["lastError"].lower())
+        self.assertIn("จะลองใหม่", repo.messages["msg_img"]["text"])
+        self.assertEqual(repo.activities[0]["severity"], "warn")
+
+    async def test_image_worker_timeout_branch_requeues_job_instead_of_failing_when_retryable(self) -> None:
+        from app import engine
+
+        class FakeSessionScope:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                del exc_type, exc, tb
+                return False
+
+        fake_repo = SimpleNamespace(mark_job=mock.AsyncMock())
+
+        async def never_finishes(repo, job, now):
+            del repo, job, now
+            await asyncio.sleep(1)
+
+        with (
+            mock.patch.object(engine, "session_scope", return_value=FakeSessionScope()),
+            mock.patch.object(engine, "Repo", return_value=fake_repo),
+            mock.patch.object(engine, "_process_due_job", side_effect=never_finishes),
+            mock.patch.object(
+                engine,
+                "handle_image_generation_worker_timeout",
+                new=mock.AsyncMock(return_value={"status": "retry_queued", "delayMs": 12_000}),
+            ) as timeout_handler,
+        ):
+            processed = await engine._process_claimed_image_generation_record(
+                SimpleNamespace(id="job_1", kind="image_generation", payload={"runId": "run_1"}),
+                SimpleNamespace(image_generation_timeout_s=0.01),
+            )
+
+        self.assertEqual(processed, 0)
+        timeout_handler.assert_awaited_once()
+        self.assertEqual(fake_repo.mark_job.await_args.args[:2], ("job_1", "queued"))
+        self.assertGreaterEqual(fake_repo.mark_job.await_args.kwargs["run_after"], 0)
+        self.assertIn("TimeoutError", fake_repo.mark_job.await_args.kwargs["error"])
+
+    async def test_image_generation_job_skips_completed_run_without_regenerating(self) -> None:
+        from app import image_generation
+
+        artifact = {
+            "id": "artifact_img_1",
+            "name": "done.png",
+            "contentMime": "image/png",
+            "uri": "data:image/png;base64,AAAA",
+        }
+
+        class FakeRepo:
+            def __init__(self) -> None:
+                self.entities = {
+                    ("image_generation_run", "run_done"): {
+                        "id": "run_done",
+                        "jobId": "img_done",
+                        "status": "succeeded",
+                        "ownerDept": "exec",
+                        "projectId": None,
+                        "mode": "generate",
+                        "model": "gpt-image-2",
+                        "request": {"prompt": "draw"},
+                        "artifacts": [artifact],
+                        "artifactIds": ["artifact_img_1"],
+                        "locations": [{"artifactId": "artifact_img_1", "url": "/api/artifacts/artifact_img_1"}],
+                        "usage": {"provider": "chatgpt_account"},
+                        "requestId": "req_1",
+                        "summary": "already done",
+                        "idempotencySkipCount": 0,
+                    }
+                }
+                self.activities: list[dict] = []
+
+            async def get_entity(self, etype, eid):
+                return dict(self.entities.get((etype, eid)) or {})
+
+            async def put_entity(self, etype, obj, **kwargs):
+                del kwargs
+                self.entities[(etype, obj["id"])] = dict(obj)
+
+            async def add_activity(self, activity):
+                self.activities.append(dict(activity))
+
+        repo = FakeRepo()
+        with mock.patch.object(
+            image_generation,
+            "generate_image_assets",
+            new=mock.AsyncMock(side_effect=AssertionError("provider should not be called")),
+        ) as generate:
+            result = await image_generation.process_image_generation_job(
+                repo,
+                {"runId": "run_done", "jobId": "img_done", "departmentId": "exec"},
+                now=1234,
+            )
+
+        generate.assert_not_awaited()
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["idempotency"]["skippedCompletedRun"])
+        self.assertEqual(result["artifacts"], [artifact])
+        run = repo.entities[("image_generation_run", "run_done")]
+        self.assertEqual(run["status"], "succeeded")
+        self.assertEqual(run["idempotencySkipCount"], 1)
+        self.assertEqual(run["lastIdempotencySkipAt"], 1234)
+        self.assertIn("ข้ามการสร้างภาพซ้ำ", repo.activities[0]["detail"])
+
     async def test_general_engine_queue_excludes_dedicated_worker_jobs(self) -> None:
         from app import engine
 
@@ -23,7 +462,7 @@ class RuntimeJobStabilityTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(processed, 0)
         self.assertIsNone(seen["kind"])
-        self.assertEqual(seen["exclude_kinds"], {"image_generation", "trigger_run"})
+        self.assertEqual(seen["exclude_kinds"], {"chat_reply", "image_generation", "trigger_run"})
 
     async def test_trigger_scheduler_keeps_trigger_jobs_in_its_own_queue(self) -> None:
         from app import engine
@@ -42,6 +481,120 @@ class RuntimeJobStabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(processed, 0)
         self.assertEqual(seen["kind"], "trigger_run")
         self.assertIsNone(seen["exclude_kinds"])
+
+    async def test_objective_run_uses_deterministic_task_id_and_skips_duplicate_side_effects(self) -> None:
+        from app import engine
+
+        class FakeRepo:
+            def __init__(self) -> None:
+                self.tasks: dict[str, dict] = {}
+                self.activities: list[dict] = []
+                self.notifications: list[dict] = []
+
+            async def list_departments(self):
+                return []
+
+            async def get_department(self, dept_id):
+                return {"id": dept_id, "name": "Research", "agentName": "Research AI"}
+
+            async def get_task(self, task_id):
+                return self.tasks.get(task_id)
+
+            async def get_entity(self, etype, eid):
+                del etype, eid
+                return None
+
+            async def save_task(self, task):
+                self.tasks[task["id"]] = dict(task)
+
+            async def add_activity(self, activity):
+                self.activities.append(activity)
+
+            async def put_entity(self, type_, data, **kwargs):
+                del kwargs
+                if type_ == "notification":
+                    self.notifications.append(dict(data))
+
+        repo = FakeRepo()
+        job = SimpleNamespace(
+            kind="objective_run",
+            payload={
+                "objectiveId": "obj_1",
+                "title": "Daily research",
+                "departmentId": "research",
+                "cadence": "daily",
+                "scheduledFor": 123,
+            },
+        )
+
+        await engine._process_due_job(repo, job, 456)
+        await engine._process_due_job(repo, job, 789)
+
+        self.assertEqual(len(repo.tasks), 1)
+        task = next(iter(repo.tasks.values()))
+        self.assertEqual(task["id"], engine._scheduled_task_id("objective_run", source_id="obj_1", dept_id="research", scheduled_for=123))
+        self.assertIn(f"objective idempotencyKey={task['id']}", task["log"])
+        self.assertEqual(len(repo.activities), 1)
+        self.assertEqual(len(repo.notifications), 1)
+
+    async def test_trigger_run_uses_deterministic_task_id_per_assignee_and_skips_duplicates(self) -> None:
+        from app import engine
+
+        class FakeRepo:
+            def __init__(self) -> None:
+                self.departments = {
+                    "dept_a": {"id": "dept_a", "name": "A", "agentName": "A AI"},
+                    "dept_b": {"id": "dept_b", "name": "B", "agentName": "B AI"},
+                }
+                self.tasks: dict[str, dict] = {}
+                self.activities: list[dict] = []
+                self.notifications: list[dict] = []
+
+            async def list_departments(self):
+                return list(self.departments.values())
+
+            async def get_department(self, dept_id):
+                return self.departments.get(dept_id)
+
+            async def get_task(self, task_id):
+                return self.tasks.get(task_id)
+
+            async def get_entity(self, etype, eid):
+                del etype, eid
+                return None
+
+            async def save_task(self, task):
+                self.tasks[task["id"]] = dict(task)
+
+            async def add_activity(self, activity):
+                self.activities.append(activity)
+
+            async def put_entity(self, type_, data, **kwargs):
+                del kwargs
+                if type_ == "notification":
+                    self.notifications.append(dict(data))
+
+        repo = FakeRepo()
+        job = SimpleNamespace(
+            kind="trigger_run",
+            payload={
+                "triggerId": "trig_1",
+                "title": "Budget review",
+                "target": "dept:dept_a",
+                "event": "budget",
+                "scheduledFor": 321,
+            },
+        )
+
+        await engine._process_due_job(repo, job, 456)
+        await engine._process_due_job(repo, job, 789)
+
+        self.assertEqual(len(repo.tasks), 1)
+        task = next(iter(repo.tasks.values()))
+        self.assertEqual(task["id"], engine._scheduled_task_id("trigger_run", source_id="trig_1", dept_id="dept_a", scheduled_for=321, event="budget"))
+        self.assertIn(f"trigger idempotencyKey={task['id']}", task["log"])
+        self.assertEqual(len(repo.activities), 1)
+        self.assertEqual(len(repo.notifications), 1)
 
     async def test_claim_due_jobs_releases_connection_after_marking_running(self) -> None:
         from app import engine
@@ -144,6 +697,179 @@ class RuntimeJobStabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(started, 2)
         self.assertEqual(results, [1, 1])
         self.assertEqual(max_running, 2)
+
+    async def test_chat_reply_timeout_marks_pending_message_failed(self) -> None:
+        from app import engine
+
+        class FakeRepo:
+            def __init__(self) -> None:
+                self.messages = {
+                    "reply_1": {
+                        "id": "reply_1",
+                        "threadId": "thread_1",
+                        "role": "agent",
+                        "authorName": "Agent",
+                        "text": "",
+                        "pending": True,
+                        "status": "sending",
+                        "replyToMessageId": "user_1",
+                        "ts": 100,
+                    }
+                }
+
+            async def get_message(self, msg_id, *, thread_id=None):
+                msg = self.messages.get(msg_id)
+                if msg and (thread_id is None or msg.get("threadId") == thread_id):
+                    return dict(msg)
+                return None
+
+            async def update_message(self, msg):
+                self.messages[msg["id"]] = dict(msg)
+
+            async def add_message(self, msg):
+                self.messages[msg["id"]] = dict(msg)
+
+        repo = FakeRepo()
+        with mock.patch.object(engine.hub, "pulse") as pulse:
+            await engine._mark_chat_reply_timeout(
+                repo,
+                {"threadId": "thread_1", "replyMessageId": "reply_1", "userMessageId": "user_1"},
+                timeout_s=1.5,
+                now=123,
+            )
+
+        reply = repo.messages["reply_1"]
+        self.assertFalse(reply["pending"])
+        self.assertEqual(reply["status"], "failed")
+        self.assertEqual(reply["error"]["code"], "chat_reply_timeout")
+        self.assertTrue(reply["error"]["retryable"])
+        self.assertTrue(reply["text"])
+        pulse.assert_called_once()
+        self.assertEqual(pulse.call_args.args[0]["kind"], "msg_done")
+
+    async def test_non_chat_job_timeout_requeues_and_records_recovery(self) -> None:
+        from app import engine
+
+        job = SimpleNamespace(
+            id="job_timeout",
+            kind="compact_dept",
+            payload={"departmentId": "dept_a", "secret": "do-not-store"},
+        )
+
+        class FakeRepo:
+            def __init__(self) -> None:
+                self.s = object()
+                self.mark_job = mock.AsyncMock()
+                self.entities: list[dict] = []
+                self.activities: list[dict] = []
+
+            async def due_jobs(self, now, *, limit, kind=None, exclude_kinds=None):
+                del now, limit, kind, exclude_kinds
+                return [job]
+
+            async def put_entity(self, etype, data, **kwargs):
+                self.entities.append({"type": etype, "data": dict(data), "kwargs": dict(kwargs)})
+
+            async def add_activity(self, activity):
+                self.activities.append(dict(activity))
+
+        async def timeout_process(repo, claimed_job, now):
+            del repo, claimed_job, now
+            raise asyncio.TimeoutError()
+
+        repo = FakeRepo()
+        settings = SimpleNamespace(engine_job_timeout_s=1.0, engine_timeout_retry_delay_s=2.5)
+        with (
+            mock.patch.object(engine, "commit_and_release", new=mock.AsyncMock()),
+            mock.patch.object(engine, "_process_due_job", side_effect=timeout_process),
+            mock.patch.object(engine, "now_ms", return_value=10_000),
+        ):
+            processed = await engine._process_due_jobs(repo, 1000, settings, kind="compact_dept")
+
+        self.assertEqual(processed, 0)
+        self.assertEqual(repo.mark_job.await_args_list[0].args, ("job_timeout", "running"))
+        queued_call = repo.mark_job.await_args_list[-1]
+        self.assertEqual(queued_call.args[:2], ("job_timeout", "queued"))
+        self.assertEqual(queued_call.kwargs["run_after"], 12_500)
+        self.assertIn("TimeoutError", queued_call.kwargs["error"])
+        self.assertEqual(repo.entities[0]["type"], "job_timeout_recovery")
+        recovery = repo.entities[0]["data"]
+        self.assertEqual(recovery["jobStatusAfter"], "queued")
+        self.assertEqual(recovery["retryDelayMs"], 2500)
+        self.assertEqual(recovery["payload"], {"departmentId": "dept_a"})
+        self.assertTrue(recovery["fullAutonomyPreserved"])
+        self.assertEqual(repo.activities[0]["severity"], "warn")
+
+    async def test_chat_context_token_source_labels_provider_timeout(self) -> None:
+        from app import engine
+
+        class TimeoutProvider:
+            async def count_context_tokens(self, **kwargs):
+                del kwargs
+                raise asyncio.TimeoutError()
+
+        with mock.patch.object(engine, "get_provider", return_value=TimeoutProvider()):
+            tokens, source = await engine._chat_context_tokens_for_turn(
+                {"id": "dept_a", "providerId": "mock", "model": "mock-model"},
+                "system prompt",
+                [],
+                {"id": "msg_user", "role": "user", "text": "hello"},
+            )
+
+        self.assertGreater(tokens, 0)
+        self.assertEqual(source, "estimate:provider_timeout")
+
+    async def test_chat_context_token_source_labels_provider_error(self) -> None:
+        from app import engine
+
+        class ErrorProvider:
+            async def count_context_tokens(self, **kwargs):
+                del kwargs
+                raise RuntimeError("counter unavailable")
+
+        with mock.patch.object(engine, "get_provider", return_value=ErrorProvider()):
+            tokens, source = await engine._chat_context_tokens_for_turn(
+                {"id": "dept_a", "providerId": "mock", "model": "mock-model"},
+                "system prompt",
+                [],
+                {"id": "msg_user", "role": "user", "text": "hello"},
+            )
+
+        self.assertGreater(tokens, 0)
+        self.assertEqual(source, "estimate:provider_error:RuntimeError")
+
+    def test_json_object_parser_returns_visibility_metadata(self) -> None:
+        from app import engine
+
+        parsed, meta = engine._parse_json_object_with_meta("not json at all")
+        self.assertEqual(parsed, {})
+        self.assertFalse(meta["ok"])
+        self.assertEqual(meta["error"], "no_json_object")
+        self.assertIn("firstError", meta)
+
+        parsed, meta = engine._parse_json_object_with_meta("prefix\n{\"status\":\"ok\"}\n")
+        self.assertEqual(parsed, {"status": "ok"})
+        self.assertTrue(meta["ok"])
+        self.assertEqual(meta["source"], "object_substring")
+
+    async def test_suppressed_engine_error_records_activity(self) -> None:
+        from app import engine
+
+        class FakeRepo:
+            def __init__(self) -> None:
+                self.activities: list[dict] = []
+
+            async def add_activity(self, activity):
+                self.activities.append(activity)
+
+        repo = FakeRepo()
+        await engine._record_suppressed_engine_error(repo, "telegram_progress.test", RuntimeError("boom"), now=123)
+
+        self.assertEqual(len(repo.activities), 1)
+        activity = repo.activities[0]
+        self.assertEqual(activity["severity"], "warn")
+        self.assertIn("telegram_progress.test", activity["text"])
+        self.assertIn("RuntimeError", activity["text"])
 
     async def test_department_advancement_runs_distinct_departments_in_parallel(self) -> None:
         from app import engine
@@ -461,6 +1187,67 @@ class RuntimeJobStabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({message["threadId"] for message in repo.messages}, {"executive", "dept:source", "dept:target"})
         self.assertEqual({(message.get("flow") or {}).get("kind") for message in repo.messages}, {"department_work"})
 
+    async def test_work_status_notice_dedupes_after_thread_window_rolls_off(self) -> None:
+        from app.work_visibility import emit_work_status_notice
+
+        class FakeRepo:
+            def __init__(self) -> None:
+                self.messages: list[dict] = []
+                self.entities: dict[tuple[str, str], dict] = {}
+
+            async def add_message(self, message):
+                self.messages.append(message)
+
+            async def thread_messages(self, thread_id, limit=120):
+                matches = [message for message in self.messages if message.get("threadId") == thread_id]
+                return matches[-limit:]
+
+            async def get_entity(self, etype, eid):
+                return self.entities.get((etype, eid))
+
+            async def put_entity(self, etype, obj, **kwargs):
+                del kwargs
+                self.entities[(etype, obj["id"])] = dict(obj)
+
+        repo = FakeRepo()
+        source = {"id": "source", "name": "Source", "agentName": "Source Agent"}
+        task = {"id": "task_1", "title": "Visible task", "status": "in_progress", "progress": 0.5}
+
+        first = await emit_work_status_notice(
+            repo,
+            event="task_started",
+            summary="Source เริ่มงาน",
+            source_dept=source,
+            task=task,
+            dedupe_key="long-thread-key",
+            include_executive=False,
+            now=123,
+        )
+        for index in range(150):
+            repo.messages.append({
+                "id": f"msg_filler_{index}",
+                "threadId": "dept:source",
+                "text": "filler",
+                "input": {},
+            })
+        second = await emit_work_status_notice(
+            repo,
+            event="task_started",
+            summary="Source เริ่มงาน",
+            source_dept=source,
+            task=task,
+            dedupe_key="long-thread-key",
+            include_executive=False,
+            now=124,
+        )
+
+        self.assertEqual(len(first), 1)
+        self.assertEqual(len(second), 0)
+        self.assertEqual(
+            [message for message in repo.messages if (message.get("input") or {}).get("visibilityEventKey")],
+            first,
+        )
+
     async def test_idle_department_resumes_current_in_progress_task(self) -> None:
         from app import engine
 
@@ -518,6 +1305,112 @@ class RuntimeJobStabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(dept["currentTaskId"], "task_a")
         self.assertEqual(task["status"], "in_progress")
         self.assertIn("resume จาก currentTaskId", task["log"][-1])
+
+    async def test_department_work_step_preserves_concurrent_task_edits(self) -> None:
+        from app import engine
+
+        class FakeRepo:
+            def __init__(self, current_task: dict) -> None:
+                self.current_task = dict(current_task)
+                self.saved_tasks: list[dict] = []
+                self.saved_departments: list[dict] = []
+                self.activities: list[dict] = []
+
+            async def get_task_fresh(self, task_id):
+                if self.current_task.get("id") == task_id:
+                    return dict(self.current_task)
+                return None
+
+            async def save_task(self, task):
+                self.current_task = dict(task)
+                self.saved_tasks.append(dict(task))
+
+            async def save_department(self, dept):
+                self.saved_departments.append(dict(dept))
+
+            async def add_activity(self, activity):
+                self.activities.append(activity)
+
+        base_task = {
+            "id": "task_a",
+            "title": "Original title",
+            "detail": "old detail",
+            "status": "in_progress",
+            "departmentId": "dept_a",
+            "priority": "normal",
+            "progress": 0.2,
+            "createdAt": 100,
+            "updatedAt": 100,
+            "log": ["created"],
+            "handoffs": [],
+        }
+        current_task = {
+            **base_task,
+            "detail": "owner edited detail",
+            "priority": "urgent",
+            "progress": 0.55,
+            "updatedAt": 300,
+            "log": ["created", "owner edited task"],
+        }
+        repo = FakeRepo(current_task)
+        dept = {
+            "id": "dept_a",
+            "name": "Dept A",
+            "agentName": "Agent A",
+            "state": "working",
+            "currentTaskId": "task_a",
+            "mood": 0.5,
+        }
+
+        with (
+            mock.patch.object(
+                engine,
+                "_llm_work_step",
+                new=mock.AsyncMock(return_value={"status": "in_progress", "log": "engine progress", "progressDelta": 0.2}),
+            ),
+            mock.patch.object(engine, "_add_executive_watch_line", new=mock.AsyncMock()),
+        ):
+            changed = await engine._advance_department(repo, dept, [dict(base_task)], [dept], 456)
+
+        self.assertTrue(changed)
+        saved = repo.saved_tasks[-1]
+        self.assertEqual(saved["detail"], "owner edited detail")
+        self.assertEqual(saved["priority"], "urgent")
+        self.assertEqual(saved["progress"], 0.55)
+        self.assertEqual(saved["status"], "in_progress")
+        self.assertEqual(saved["log"], ["created", "owner edited task", "engine progress"])
+
+    async def test_engine_task_merge_preserves_concurrent_terminal_status(self) -> None:
+        from app import engine
+
+        base_task = {
+            "id": "task_a",
+            "title": "Task",
+            "status": "in_progress",
+            "progress": 0.4,
+            "updatedAt": 100,
+            "log": [],
+        }
+        proposed = {
+            **base_task,
+            "status": "review",
+            "progress": 0.9,
+            "updatedAt": 500,
+            "log": ["engine progress"],
+        }
+        current = {
+            **base_task,
+            "status": "cancelled",
+            "progress": 1,
+            "updatedAt": 300,
+            "log": ["owner cancelled"],
+        }
+
+        merged = engine._merge_engine_task_update(base_task, proposed, current)
+
+        self.assertEqual(merged["status"], "cancelled")
+        self.assertEqual(merged["progress"], 1)
+        self.assertEqual(merged["log"], ["owner cancelled", "engine progress"])
 
     async def test_blocked_retry_guard_freezes_repeated_stale_blockers(self) -> None:
         from app import engine

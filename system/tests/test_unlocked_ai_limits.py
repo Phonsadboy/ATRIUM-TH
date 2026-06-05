@@ -50,6 +50,20 @@ class UnlockedAiLimitsTest(unittest.TestCase):
 
         self.assertEqual([message.content for message in messages], ["first", "Agent: second", "third", "current"])
 
+    def test_engine_chat_history_zero_keeps_all_fetched_messages_in_prompt(self) -> None:
+        from app import engine
+
+        with mock.patch.dict(os.environ, {"ATRIUM_CHAT_HISTORY_MESSAGES": "0"}, clear=False):
+            get_settings.cache_clear()
+            history = [
+                {"role": "user", "text": "first", "attachments": []},
+                {"role": "assistant", "authorName": "Agent", "text": "second", "attachments": []},
+                {"role": "user", "text": "third", "attachments": []},
+            ]
+            messages = engine._llm_chat_history(history, {"text": "current", "attachments": []})
+
+        self.assertEqual([message.content for message in messages], ["first", "Agent: second", "third", "current"])
+
     def test_rate_limit_zero_is_disabled(self) -> None:
         history = [{"role": "user", "ts": 1_000, "status": "sent"} for _ in range(100)]
 

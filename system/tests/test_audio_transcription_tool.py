@@ -4,6 +4,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import httpx
+
 from app import audio_transcription
 from app.audio_transcription import AudioTranscriptionResult, execute_audio_transcription_tool
 from app.db.repo import TOOL_CATALOG
@@ -45,6 +47,17 @@ def _settings(tmp: str) -> SimpleNamespace:
         workspace_dir=Path(tmp) / "workspace",
         audio_transcription_enabled=True,
         audio_transcription_max_bytes=1024 * 1024,
+        audio_transcription_provider="openai",
+        audio_transcription_model="gpt-4o-transcribe",
+        audio_transcription_base_url="https://audio.test/v1",
+        audio_transcription_timeout_s=5.0,
+        audio_transcription_retry_attempts=3,
+        audio_transcription_retry_delay_s=0.0,
+        audio_transcription_auth_order="api_key",
+        audio_transcription_language="",
+        audio_transcription_prompt="",
+        openai_api_key="sk-test",
+        openai_base_url="",
     )
 
 
@@ -139,6 +152,74 @@ class AudioTranscriptionToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(row["externalSystem"])
         self.assertTrue(row["canUseCredentials"])
         self.assertIn("artifactId", row["inputSchema"])
+
+    async def test_transcribe_audio_bytes_retries_transient_http_error(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="atrium-audio-retry-") as tmp:
+            request = httpx.Request("POST", "https://audio.test/v1/audio/transcriptions")
+            responses = [
+                httpx.Response(500, request=request, text="server unavailable"),
+                httpx.Response(200, request=request, json={"text": "retry succeeded", "duration": 1.25}),
+            ]
+            calls: list[dict] = []
+
+            class FakeAsyncClient:
+                def __init__(self, timeout):
+                    self.timeout = timeout
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *_exc):
+                    return None
+
+                async def post(self, url, **kwargs):
+                    calls.append({"url": url, **kwargs})
+                    return responses.pop(0)
+
+            with mock.patch.object(audio_transcription.httpx, "AsyncClient", FakeAsyncClient):
+                result = await audio_transcription.transcribe_audio_bytes(
+                    b"RIFFfake-wave",
+                    filename="voice.wav",
+                    mime="audio/wav",
+                    settings=_settings(tmp),
+                )
+
+        self.assertEqual(result.text, "retry succeeded")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(result.raw["atriumRetry"]["attempts"], 2)
+        self.assertEqual(result.raw["atriumRetry"]["transientErrors"][0]["statusCode"], 500)
+
+    async def test_transcribe_audio_bytes_does_not_retry_non_transient_http_error(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="atrium-audio-no-retry-") as tmp:
+            request = httpx.Request("POST", "https://audio.test/v1/audio/transcriptions")
+            responses = [httpx.Response(400, request=request, text="bad request")]
+            calls: list[str] = []
+
+            class FakeAsyncClient:
+                def __init__(self, timeout):
+                    self.timeout = timeout
+
+                async def __aenter__(self):
+                    return self
+
+                async def __aexit__(self, *_exc):
+                    return None
+
+                async def post(self, url, **kwargs):
+                    del kwargs
+                    calls.append(url)
+                    return responses.pop(0)
+
+            with mock.patch.object(audio_transcription.httpx, "AsyncClient", FakeAsyncClient):
+                with self.assertRaisesRegex(audio_transcription.AudioTranscriptionError, "HTTP 400"):
+                    await audio_transcription.transcribe_audio_bytes(
+                        b"RIFFfake-wave",
+                        filename="voice.wav",
+                        mime="audio/wav",
+                        settings=_settings(tmp),
+                    )
+
+        self.assertEqual(len(calls), 1)
 
 
 if __name__ == "__main__":

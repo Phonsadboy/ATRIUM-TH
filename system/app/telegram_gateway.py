@@ -66,10 +66,25 @@ TELEGRAM_MEDIA_FIELDS = (
 TelegramFileLoader = Callable[[dict[str, Any], str, Settings], Awaitable[dict[str, Any]]]
 TelegramFileStore = Callable[..., Awaitable[dict[str, Any]]]
 TelegramSender = Callable[[str, dict[str, Any], Settings], Awaitable[dict[str, Any]]]
+_REGISTERED_FILE_STORE: TelegramFileStore | None = None
+
+
+def set_telegram_file_store(store_file: TelegramFileStore | None) -> None:
+    global _REGISTERED_FILE_STORE
+    _REGISTERED_FILE_STORE = store_file
 
 
 class TelegramGatewayError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_s: float | None = None,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_s = retry_after_s
+        self.status_code = status_code
 
 
 def _activity(text: str, *, department_id: str | None = None, severity: str = "info") -> dict[str, Any]:
@@ -501,6 +516,60 @@ def _media_items(message: dict[str, Any]) -> list[dict[str, Any]]:
     return items
 
 
+def _telegram_retry_after_s(parsed: Any) -> float | None:
+    if not isinstance(parsed, dict):
+        return None
+    parameters = parsed.get("parameters")
+    if not isinstance(parameters, dict) or parameters.get("retry_after") is None:
+        return None
+    try:
+        retry_after = float(parameters.get("retry_after"))
+    except (TypeError, ValueError):
+        return None
+    return retry_after if retry_after > 0 else None
+
+
+def _telegram_error_code(parsed: Any) -> int | None:
+    if not isinstance(parsed, dict):
+        return None
+    try:
+        return int(parsed.get("error_code"))
+    except (TypeError, ValueError):
+        return None
+
+
+def _telegram_api_error(method: str, raw: str, *, http_code: int | None = None) -> TelegramGatewayError:
+    parsed: Any
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = None
+    retry_after_s = _telegram_retry_after_s(parsed)
+    status_code = http_code or _telegram_error_code(parsed)
+    if isinstance(parsed, dict) and parsed.get("description"):
+        detail = str(parsed.get("description"))
+    else:
+        detail = raw
+    if http_code is not None:
+        return TelegramGatewayError(
+            f"Telegram API {method} returned {http_code}: {detail[:800]}",
+            retry_after_s=retry_after_s,
+            status_code=status_code,
+        )
+    return TelegramGatewayError(
+        f"Telegram API {method} failed: {detail[:800]}",
+        retry_after_s=retry_after_s,
+        status_code=status_code,
+    )
+
+
+def _telegram_next_update_offset(update: dict[str, Any]) -> int | None:
+    try:
+        return int(update.get("update_id")) + 1
+    except (TypeError, ValueError):
+        return None
+
+
 def _telegram_api_request(bot_token: str, method: str, payload: dict[str, Any] | None = None) -> dict[str, Any]:
     settings = get_settings()
     timeout = max(1.0, float(getattr(settings, "telegram_gateway_timeout_s", 20.0) or 20.0))
@@ -512,7 +581,7 @@ def _telegram_api_request(bot_token: str, method: str, payload: dict[str, Any] |
             body = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise TelegramGatewayError(f"Telegram API {method} returned {exc.code}: {body[:800]}") from exc
+        raise _telegram_api_error(method, body, http_code=exc.code) from exc
     except urllib.error.URLError as exc:
         raise TelegramGatewayError(f"Telegram API {method} failed: {exc}") from exc
     try:
@@ -520,7 +589,7 @@ def _telegram_api_request(bot_token: str, method: str, payload: dict[str, Any] |
     except json.JSONDecodeError as exc:
         raise TelegramGatewayError(f"Telegram API {method} returned invalid JSON") from exc
     if not parsed.get("ok"):
-        raise TelegramGatewayError(f"Telegram API {method} failed: {str(parsed.get('description') or parsed)[:800]}")
+        raise _telegram_api_error(method, body)
     return parsed
 
 
@@ -1184,11 +1253,24 @@ async def _repair_completed_telegram_progress_message(
     chunks = _split_text(str(reply.get("text") or ""), _telegram_outbound_chunk_chars(settings, auth))
     final_text = chunks[0] if chunks else "(empty reply)"
     edited = await _telegram_edit_message_text(bot_token, channel_reply, final_text)
+    receipts: list[dict[str, Any]] = [{"method": "editMessageText", "response": edited.get("result"), "progressFinal": True}]
+    target = _telegram_target(channel_reply)
+    for chunk in chunks[1:]:
+        message_payload = {
+            **target,
+            "text": chunk,
+            "disable_web_page_preview": False,
+        }
+        message_payload.pop("reply_parameters", None)
+        sent = await asyncio.to_thread(_telegram_api_request, bot_token, "sendMessage", message_payload)
+        receipts.append({"method": "sendMessage", "response": sent.get("result")})
     return {
         "ok": True,
         "status": "edited_progress_to_final",
         "method": "editMessageText",
         "response": edited.get("result"),
+        "receipts": receipts,
+        "chunkCount": len(chunks) or 1,
         **({"deleteError": edit_error} if edit_error else {}),
     }
 
@@ -1304,10 +1386,12 @@ def _telegram_api_multipart(bot_token: str, method: str, fields: dict[str, Any],
             raw = resp.read().decode("utf-8", errors="replace")
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="replace")
-        raise TelegramGatewayError(f"Telegram API {method} returned {exc.code}: {raw[:800]}") from exc
+        raise _telegram_api_error(method, raw, http_code=exc.code) from exc
+    except urllib.error.URLError as exc:
+        raise TelegramGatewayError(f"Telegram API {method} failed: {exc}") from exc
     parsed = json.loads(raw)
     if not parsed.get("ok"):
-        raise TelegramGatewayError(f"Telegram API {method} failed: {str(parsed.get('description') or parsed)[:800]}")
+        raise _telegram_api_error(method, raw)
     return parsed
 
 
@@ -1439,8 +1523,10 @@ async def maybe_deliver_telegram_reply_for_message(
         max_attempts = max(1, _telegram_outbound_retry_attempts(settings, auth))
         status = "failed"
         next_retry_at = None
+        retry_after_s = getattr(exc, "retry_after_s", None)
         if allow_retry and attempts < max_attempts:
-            delay_ms = int(max(1.0, _telegram_outbound_retry_delay_s(settings, auth)) * 1000)
+            delay_s = retry_after_s if isinstance(retry_after_s, (int, float)) and retry_after_s > 0 else None
+            delay_ms = int(max(1.0, delay_s or _telegram_outbound_retry_delay_s(settings, auth)) * 1000)
             next_retry_at = now_ms() + delay_ms
             await repo.enqueue(
                 uid("job"),
@@ -1464,6 +1550,7 @@ async def maybe_deliver_telegram_reply_for_message(
             "attempts": attempts,
             "error": f"{type(exc).__name__}: {exc}",
             "nextRetryAt": next_retry_at,
+            **({"retryAfterS": retry_after_s} if isinstance(retry_after_s, (int, float)) and retry_after_s > 0 else {}),
             "updatedAt": now_ms(),
         }
         await repo.put_entity("telegram_outbox_receipt", receipt, dept=dept_id_from_thread(str(reply.get("threadId") or "")), status=status, ts=receipt["updatedAt"])
@@ -1515,6 +1602,42 @@ async def process_telegram_outbound_job(repo: Repo, payload: dict[str, Any], now
     if not reply:
         raise TelegramGatewayError(f"telegram reply message not found: {reply_id}")
     return await maybe_deliver_telegram_reply_for_message(repo, reply, allow_retry=True)
+
+
+async def process_telegram_update_job(repo: Repo, payload: dict[str, Any], now: int) -> dict[str, Any]:
+    update = payload.get("update") if isinstance(payload.get("update"), dict) else None
+    if not update:
+        return {"ok": False, "status": "skipped", "reason": "missing_update"}
+    try:
+        return await handle_telegram_update(
+            repo,
+            update,
+            settings=get_settings(),
+            store_file=_REGISTERED_FILE_STORE,
+        )
+    except Exception as exc:
+        update_id = str(update.get("update_id") or uid("telegram_update_error"))
+        error = f"{type(exc).__name__}: {exc}"
+        await repo.put_entity(
+            "telegram_update_error",
+            {
+                "id": update_id,
+                "provider": "telegram",
+                "status": "failed",
+                "error": error,
+                "update": update,
+                "updatedAt": now_ms(),
+            },
+            dept=EXEC_ID,
+            status="failed",
+            ts=now,
+        )
+        await repo.add_activity(_activity(
+            f"Telegram webhook update {update_id} failed after async ingest: {error}",
+            department_id=EXEC_ID,
+            severity="warn",
+        ))
+        return {"ok": False, "status": "failed", "updateId": update_id, "error": error}
 
 
 async def process_telegram_progress_job(repo: Repo, payload: dict[str, Any], now: int) -> dict[str, Any]:
@@ -1689,10 +1812,36 @@ async def run_telegram_polling_loop(
             async with session_scope() as s:
                 repo = Repo(s)
                 for update in updates:
-                    if isinstance(update, dict):
+                    if not isinstance(update, dict):
+                        continue
+                    next_offset = _telegram_next_update_offset(update)
+                    try:
                         await handle_telegram_update(repo, update, settings=settings, store_file=store_file, file_loader=file_loader)
+                    except Exception as exc:
+                        update_id = update.get("update_id")
+                        update_error_id = str(update_id) if update_id is not None else uid("telegram_update_error")
+                        error_text = f"{type(exc).__name__}: {exc}"
+                        error_ts = now_ms()
                         with contextlib.suppress(Exception):
-                            offset = max(offset, int(update.get("update_id") or 0) + 1)
+                            await repo.put_entity(
+                                "telegram_update_error",
+                                {
+                                    "id": update_error_id,
+                                    "updateId": update_id,
+                                    "status": "error",
+                                    "error": error_text,
+                                    "update": update,
+                                    "updatedAt": error_ts,
+                                },
+                                dept=EXEC_ID,
+                                status="error",
+                                ts=error_ts,
+                            )
+                        with contextlib.suppress(Exception):
+                            await repo.add_activity(_activity(f"Telegram polling skipped failed update {update_error_id}: {error_text}", department_id=EXEC_ID, severity="warning"))
+                    finally:
+                        if next_offset is not None:
+                            offset = max(offset, next_offset)
                 await repo.put_entity(
                     "telegram_polling_state",
                     {"id": "default", "offset": offset, "updatedAt": now_ms()},

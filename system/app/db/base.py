@@ -10,11 +10,15 @@ dialect variant, so the same ORM works everywhere.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from sqlalchemy import JSON, event, text
+from sqlalchemy.dialects import sqlite as sqlite_dialect
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import (
@@ -37,6 +41,8 @@ class Base(DeclarativeBase):
 
 _engine: AsyncEngine | None = None
 _sessionmaker: async_sessionmaker[AsyncSession] | None = None
+SQLITE_SCHEMA_METADATA_TABLE = "atrium_schema_metadata"
+SQLITE_SCHEMA_STAMP_VERSION = 1
 
 _SQLITE_ADDITIVE_COLUMNS = {
     "tasks": {
@@ -102,9 +108,19 @@ _SQLITE_ADDITIVE_INDEXES = [
     ("ix_entities_status", "entities", ('"status"',)),
     ("ix_entities_ts", "entities", ('"ts"',)),
     ("ix_entities_type_ts", "entities", ('"type"', '"ts"')),
+    ("ix_entities_type_status_ts", "entities", ('"type"', '"status"', '"ts"')),
+    ("ix_entities_type_dept_ts", "entities", ('"type"', '"dept"', '"ts"')),
+    ("ix_entities_type_dept_status_ts", "entities", ('"type"', '"dept"', '"status"', '"ts"')),
+    (
+        "ix_entities_type_dept_project_status_ts",
+        "entities",
+        ('"type"', '"dept"', '"project"', '"status"', '"ts"'),
+    ),
     ("ix_cost_records_ts", "cost_records", ('"ts"',)),
     ("ix_cost_records_department_id", "cost_records", ('"department_id"',)),
     ("ix_cost_dept_ts", "cost_records", ('"department_id"', '"ts"')),
+    ("ix_cost_category_ts", "cost_records", ('"category"', '"ts"')),
+    ("ix_cost_dept_category_ts", "cost_records", ('"department_id"', '"category"', '"ts"')),
     ("ix_memory_archive_department_id", "memory_archive", ('"department_id"',)),
     ("ix_memory_archive_ts", "memory_archive", ('"ts"',)),
     ("ix_memory_knowledge_department_id", "memory_knowledge", ('"department_id"',)),
@@ -239,6 +255,7 @@ async def init_db() -> None:
     if not settings.is_postgres:
         async with engine.begin() as conn:
             await _ensure_sqlite_additive_schema(conn)
+            await _write_sqlite_schema_stamp(conn)
             await conn.execute(text("PRAGMA journal_mode=WAL"))
             await conn.execute(text("PRAGMA synchronous=NORMAL"))
             await conn.execute(text("PRAGMA busy_timeout=30000"))
@@ -291,6 +308,159 @@ async def _run_postgres_migrations() -> None:
 async def _sqlite_columns(conn, table_name: str) -> set[str]:
     rows = (await conn.execute(text(f'PRAGMA table_info("{table_name}")'))).all()
     return {str(row[1]) for row in rows}
+
+
+async def _sqlite_table_names(conn) -> set[str]:
+    rows = (await conn.execute(text("SELECT name FROM sqlite_master WHERE type='table'"))).all()
+    return {str(row[0]) for row in rows}
+
+
+async def _sqlite_index_names(conn, table_name: str) -> set[str]:
+    rows = (await conn.execute(text(f'PRAGMA index_list("{table_name}")'))).all()
+    return {str(row[1]) for row in rows}
+
+
+def _expected_sqlite_schema_payload() -> dict[str, Any]:
+    from . import tables  # noqa: F401  (register models on Base.metadata)
+
+    dialect = sqlite_dialect.dialect()
+    payload: dict[str, Any] = {"stampVersion": SQLITE_SCHEMA_STAMP_VERSION, "tables": {}}
+    for table in sorted(Base.metadata.tables.values(), key=lambda item: item.name):
+        payload["tables"][table.name] = {
+            "columns": [
+                {
+                    "name": column.name,
+                    "type": column.type.compile(dialect=dialect),
+                    "primaryKey": bool(column.primary_key),
+                }
+                for column in table.columns
+            ],
+            "indexes": sorted(
+                ({
+                    "name": index.name,
+                    "columns": [column.name for column in index.columns],
+                }
+                for index in table.indexes
+                if index.name
+                ),
+                key=lambda item: str(item["name"]),
+            ),
+        }
+    return payload
+
+
+def _schema_fingerprint(payload: dict[str, Any]) -> str:
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:24]
+
+
+async def _actual_sqlite_schema_payload(conn) -> dict[str, Any]:
+    expected = _expected_sqlite_schema_payload()
+    existing_tables = await _sqlite_table_names(conn)
+    payload: dict[str, Any] = {"stampVersion": SQLITE_SCHEMA_STAMP_VERSION, "tables": {}}
+    for table_name in expected["tables"]:
+        if table_name not in existing_tables:
+            continue
+        columns = []
+        for row in (await conn.execute(text(f'PRAGMA table_info("{table_name}")'))).all():
+            columns.append({
+                "name": str(row[1]),
+                "type": str(row[2] or ""),
+                "primaryKey": bool(row[5]),
+            })
+        index_names = await _sqlite_index_names(conn, table_name)
+        payload["tables"][table_name] = {
+            "columns": columns,
+            "indexes": sorted(name for name in index_names if not name.startswith("sqlite_autoindex_")),
+        }
+    return payload
+
+
+def _schema_missing_items(expected: dict[str, Any], actual: dict[str, Any]) -> tuple[list[str], list[dict[str, Any]], list[dict[str, Any]]]:
+    missing_tables: list[str] = []
+    missing_columns: list[dict[str, Any]] = []
+    missing_indexes: list[dict[str, Any]] = []
+    actual_tables = actual.get("tables") or {}
+    for table_name, expected_table in (expected.get("tables") or {}).items():
+        actual_table = actual_tables.get(table_name)
+        if not isinstance(actual_table, dict):
+            missing_tables.append(table_name)
+            continue
+        actual_columns = {str(column.get("name")) for column in actual_table.get("columns") or [] if isinstance(column, dict)}
+        for column in expected_table.get("columns") or []:
+            column_name = str(column.get("name"))
+            if column_name not in actual_columns:
+                missing_columns.append({"table": table_name, "column": column_name})
+        actual_indexes = {
+            str(index.get("name") if isinstance(index, dict) else index)
+            for index in actual_table.get("indexes") or []
+        }
+        for index in expected_table.get("indexes") or []:
+            index_name = str(index.get("name"))
+            if index_name not in actual_indexes:
+                missing_indexes.append({"table": table_name, "index": index_name})
+    return missing_tables, missing_columns, missing_indexes
+
+
+async def _ensure_sqlite_schema_metadata_table(conn) -> None:
+    await conn.execute(text(
+        f'CREATE TABLE IF NOT EXISTS "{SQLITE_SCHEMA_METADATA_TABLE}" ('
+        '"key" TEXT PRIMARY KEY, '
+        '"value" TEXT NOT NULL, '
+        '"updated_at" INTEGER NOT NULL'
+        ')'
+    ))
+
+
+async def _sqlite_schema_metadata(conn) -> dict[str, str]:
+    if SQLITE_SCHEMA_METADATA_TABLE not in await _sqlite_table_names(conn):
+        return {}
+    rows = (await conn.execute(text(f'SELECT "key", "value" FROM "{SQLITE_SCHEMA_METADATA_TABLE}"'))).all()
+    return {str(row[0]): str(row[1]) for row in rows}
+
+
+async def _write_sqlite_schema_stamp(conn) -> None:
+    await _ensure_sqlite_schema_metadata_table(conn)
+    status = await sqlite_schema_status(conn, include_metadata=False)
+    now = int(time.time() * 1000)
+    values = {
+        "stampVersion": str(SQLITE_SCHEMA_STAMP_VERSION),
+        "expectedFingerprint": status["expectedFingerprint"],
+        "actualFingerprint": status["actualFingerprint"],
+        "matchesExpected": "true" if status["matchesExpected"] else "false",
+    }
+    for key, value in values.items():
+        await conn.execute(
+            text(
+                f'INSERT INTO "{SQLITE_SCHEMA_METADATA_TABLE}" ("key", "value", "updated_at") '
+                'VALUES (:key, :value, :updated_at) '
+                'ON CONFLICT("key") DO UPDATE SET "value" = excluded."value", "updated_at" = excluded."updated_at"'
+            ),
+            {"key": key, "value": value, "updated_at": now},
+        )
+
+
+async def sqlite_schema_status(conn, *, include_metadata: bool = True) -> dict[str, Any]:
+    expected = _expected_sqlite_schema_payload()
+    actual = await _actual_sqlite_schema_payload(conn)
+    missing_tables, missing_columns, missing_indexes = _schema_missing_items(expected, actual)
+    expected_fingerprint = _schema_fingerprint(expected)
+    actual_fingerprint = _schema_fingerprint(actual)
+    metadata = await _sqlite_schema_metadata(conn) if include_metadata else {}
+    return {
+        "backend": "sqlite",
+        "stampVersion": SQLITE_SCHEMA_STAMP_VERSION,
+        "expectedFingerprint": expected_fingerprint,
+        "actualFingerprint": actual_fingerprint,
+        "matchesExpected": not missing_tables and not missing_columns and not missing_indexes,
+        "stampMatchesExpected": metadata.get("expectedFingerprint") == expected_fingerprint if metadata else False,
+        "stampedActualFingerprint": metadata.get("actualFingerprint"),
+        "stampedMatchesExpected": metadata.get("matchesExpected"),
+        "missingTables": missing_tables,
+        "missingColumns": missing_columns[:50],
+        "missingIndexes": missing_indexes[:50],
+        "limitation": "SQLite migrations remain additive-only; type, NOT NULL, rename, and drop changes require an explicit migration.",
+    }
 
 
 async def _ensure_sqlite_additive_schema(conn) -> None:

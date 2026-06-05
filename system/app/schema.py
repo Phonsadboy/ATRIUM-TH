@@ -451,6 +451,19 @@ class MessageAttachment(Schema):
     mime: Optional[str] = None
     uri: Optional[str] = None
     size_bytes: Optional[int] = None
+    source_path: Optional[str] = None
+    source_size_bytes: Optional[int] = None
+    sampled_bytes: Optional[int] = None
+    copy_status: Optional[str] = None
+    reference_kind: Optional[str] = None
+    context_max_chars: Optional[int] = Field(
+        default=None,
+        description="Optional per-message attachment text context limit. Use includeFullContext for full known-size text.",
+    )
+    include_full_context: Optional[bool] = Field(
+        default=None,
+        description="When true, include as much extracted attachment text as possible instead of the default preview limit.",
+    )
     project_id: Optional[str] = None
     video_project_id: Optional[str] = None
     asset_id: Optional[str] = None
@@ -689,6 +702,8 @@ class PermissionPolicy(Schema):
     mode: PermissionMode = "full_auto"
     agent_full_access: bool = True
     requested_mode: Optional[str] = None
+    requested_agent_full_access: Optional[bool] = None
+    full_autonomy_status: Optional[dict[str, Any]] = None
     allowed_tools: list[str] = Field(default_factory=list)
     denied_tools: list[str] = Field(default_factory=list)
     allowed_risk_classes: list[str] = Field(default_factory=list)
@@ -751,6 +766,7 @@ class ToolRun(Schema):
     executor_route: Optional[dict[str, Any]] = None
     checkpoint_id: Optional[str] = None
     checkpoint: Optional[dict[str, Any]] = None
+    full_autonomy: Optional[dict[str, Any]] = None
     created_at: int
     started_at: Optional[int] = None
     completed_at: Optional[int] = None
@@ -1097,6 +1113,11 @@ class Artifact(Schema):
     content_size_bytes: Optional[int] = None
     content_mime: Optional[str] = None
     content_status: Optional[str] = None
+    source_path: Optional[str] = None
+    source_size_bytes: Optional[int] = None
+    sampled_bytes: Optional[int] = None
+    copy_status: Optional[str] = None
+    reference_kind: Optional[str] = None
     tags: list[str] = Field(default_factory=list)
     links: list[str] = Field(default_factory=list)
     preview: Optional[ArtifactPreview] = None
@@ -1134,6 +1155,11 @@ class ArtifactVersion(Schema):
     content_size_bytes: Optional[int] = None
     content_mime: Optional[str] = None
     content_status: Optional[str] = None
+    source_path: Optional[str] = None
+    source_size_bytes: Optional[int] = None
+    sampled_bytes: Optional[int] = None
+    copy_status: Optional[str] = None
+    reference_kind: Optional[str] = None
     preview: Optional[ArtifactPreview] = None
 
 
@@ -1736,6 +1762,16 @@ class ImportFileInput(Schema):
     artifact_name: Optional[str] = None
     tags: list[str] = Field(default_factory=list)
     copy_to_workspace: bool = True
+
+
+class AttachmentReferenceInput(Schema):
+    source_path: str
+    thread_id: Optional[str] = None
+    target_dept: Optional[str] = None
+    project_id: Optional[str] = None
+    artifact_name: Optional[str] = None
+    tags: list[str] = Field(default_factory=list)
+    copy_to_workspace: bool = False
 
 
 class ImportFileResponse(Schema):

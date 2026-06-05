@@ -1,5 +1,7 @@
+import asyncio
 import hashlib
 import hmac
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -134,6 +136,36 @@ def _dm_update(text: str = "สรุปแผนวันนี้") -> dict:
 
 
 class TelegramChannelGatewayTest(unittest.IsolatedAsyncioTestCase):
+    def test_telegram_api_request_exposes_retry_after_from_http_429(self) -> None:
+        body = (
+            b'{"ok":false,"error_code":429,"description":"Too Many Requests",'
+            b'"parameters":{"retry_after":17}}'
+        )
+
+        def fake_urlopen(req, timeout):
+            del req, timeout
+            raise telegram_gateway.urllib.error.HTTPError(
+                "https://api.telegram.test",
+                429,
+                "Too Many Requests",
+                hdrs=None,
+                fp=io.BytesIO(body),
+            )
+
+        with (
+            mock.patch.object(
+                telegram_gateway,
+                "get_settings",
+                return_value=SimpleNamespace(telegram_gateway_timeout_s=1.0),
+            ),
+            mock.patch.object(telegram_gateway.urllib.request, "urlopen", side_effect=fake_urlopen),
+        ):
+            with self.assertRaises(telegram_gateway.TelegramGatewayError) as raised:
+                telegram_gateway._telegram_api_request("123:test-token", "sendMessage", {"chat_id": 555})
+
+        self.assertEqual(raised.exception.status_code, 429)
+        self.assertEqual(raised.exception.retry_after_s, 17)
+
     async def test_dm_owner_maps_to_executive_thread_and_chat_reply_job(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             repo = FakeRepo()
@@ -364,6 +396,173 @@ class TelegramChannelGatewayTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(repo.jobs[0]["kind"], "telegram_outbound")
             updated = repo.messages[reply["id"]]
             self.assertEqual(updated["channelReply"]["status"], "retry_queued")
+
+    async def test_outbound_retry_uses_telegram_retry_after(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FakeRepo()
+            settings = _settings(tmp, telegram_outbound_retry_attempts=2, telegram_outbound_retry_delay_s=1.0)
+            reply = {
+                "id": "msg_reply",
+                "threadId": "executive",
+                "role": "executive",
+                "authorName": "Executive AI",
+                "text": "พร้อมครับ",
+                "ts": 1,
+                "status": "sent",
+                "channelReply": {
+                    "provider": "telegram",
+                    "chatId": "555",
+                    "replyToTelegramMessageId": "42",
+                    "dedupeKey": "telegram:reply:555:42",
+                },
+            }
+            repo.messages[reply["id"]] = reply
+
+            async def rate_limited_sender(bot_token, payload, settings):
+                del bot_token, payload, settings
+                raise telegram_gateway.TelegramGatewayError(
+                    "Telegram API sendMessage returned 429: Too Many Requests",
+                    retry_after_s=13,
+                    status_code=429,
+                )
+
+            before = telegram_gateway.now_ms()
+            result = await telegram_gateway.maybe_deliver_telegram_reply_for_message(
+                repo,
+                reply,
+                settings=settings,
+                sender=rate_limited_sender,
+            )
+            after = telegram_gateway.now_ms()
+
+            self.assertEqual(result["status"], "retry_queued")
+            self.assertEqual(len(repo.jobs), 1)
+            self.assertGreaterEqual(repo.jobs[0]["runAfter"], before + 13_000)
+            self.assertLessEqual(repo.jobs[0]["runAfter"], after + 13_000)
+            receipt = repo.entities[("telegram_outbox_receipt", _outbox_receipt_id("telegram:reply:555:42"))]
+            self.assertEqual(receipt["retryAfterS"], 13)
+
+    async def test_polling_loop_isolates_failed_update_and_advances_offset(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FakeRepo()
+            settings = _settings(tmp)
+            updates = [
+                {"update_id": 100, "message": {"message_id": 1, "chat": {"id": 555}, "text": "bad"}},
+                {"update_id": 101, "message": {"message_id": 2, "chat": {"id": 555}, "text": "good"}},
+            ]
+            handled: list[int] = []
+            api_payloads: list[dict] = []
+            sleep_calls = 0
+
+            class FakeSessionScope:
+                async def __aenter__(self):
+                    return object()
+
+                async def __aexit__(self, exc_type, exc, tb):
+                    del exc_type, exc, tb
+                    return False
+
+            async def fake_sleep(delay):
+                nonlocal sleep_calls
+                del delay
+                sleep_calls += 1
+                if sleep_calls > 1:
+                    raise asyncio.CancelledError
+
+            def fake_api(bot_token, method, payload):
+                del bot_token
+                self.assertEqual(method, "getUpdates")
+                api_payloads.append(payload)
+                return {"ok": True, "result": updates}
+
+            async def fake_handle(repo_arg, update, **kwargs):
+                del kwargs
+                self.assertIs(repo_arg, repo)
+                handled.append(int(update["update_id"]))
+                if update["update_id"] == 100:
+                    raise RuntimeError("bad update")
+                return {"ok": True, "status": "queued"}
+
+            with (
+                mock.patch.object(telegram_gateway, "get_settings", return_value=settings),
+                mock.patch.object(
+                    telegram_gateway,
+                    "load_telegram_auth",
+                    return_value={
+                        "pollingEnabled": True,
+                        "botToken": "123:test-token",
+                        "pollingIntervalS": 1,
+                        "pollingBurstWindowS": 0,
+                    },
+                ),
+                mock.patch.object(telegram_gateway, "session_scope", return_value=FakeSessionScope()),
+                mock.patch.object(telegram_gateway, "Repo", return_value=repo),
+                mock.patch.object(telegram_gateway, "_telegram_api_request", side_effect=fake_api),
+                mock.patch.object(telegram_gateway, "handle_telegram_update", side_effect=fake_handle),
+                mock.patch.object(telegram_gateway.hub, "mark_dirty"),
+                mock.patch.object(telegram_gateway.asyncio, "sleep", side_effect=fake_sleep),
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await telegram_gateway.run_telegram_polling_loop(settings=settings)
+
+            self.assertEqual(handled, [100, 101])
+            self.assertNotIn("offset", api_payloads[0])
+            state = repo.entities[("telegram_polling_state", "default")]
+            self.assertEqual(state["offset"], 102)
+            error = repo.entities[("telegram_update_error", "100")]
+            self.assertIn("RuntimeError: bad update", error["error"])
+            self.assertEqual(error["updateId"], 100)
+
+    async def test_webhook_ingest_enqueues_update_without_synchronous_processing(self) -> None:
+        from app import main
+
+        class FakeSessionScope:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                del exc_type, exc, tb
+                return False
+
+        class FakeRequest:
+            headers: dict[str, str] = {}
+
+            async def json(self):
+                return {"update_id": 42, "message": {"message_id": 1}}
+
+        repo = FakeRepo()
+        with (
+            mock.patch.object(main, "session_scope", return_value=FakeSessionScope()),
+            mock.patch.object(main, "Repo", return_value=repo),
+            mock.patch.object(main, "telegram_webhook_secret", return_value=""),
+            mock.patch.object(main, "set_telegram_file_store"),
+            mock.patch.object(main.hub, "mark_dirty"),
+        ):
+            result = await main.telegram_webhook(FakeRequest())
+
+        self.assertEqual(result["status"], "queued")
+        self.assertTrue(result["webhookAsync"])
+        self.assertEqual(repo.jobs[0]["kind"], "telegram_update")
+        self.assertEqual(repo.jobs[0]["payload"]["update"]["update_id"], 42)
+
+    async def test_telegram_update_job_records_failure_without_raising(self) -> None:
+        repo = FakeRepo()
+        with mock.patch.object(
+            telegram_gateway,
+            "handle_telegram_update",
+            new=mock.AsyncMock(side_effect=telegram_gateway.TelegramGatewayError("media too large")),
+        ):
+            result = await telegram_gateway.process_telegram_update_job(
+                repo,
+                {"update": {"update_id": 77, "message": {"message_id": 5}}},
+                123,
+            )
+
+        self.assertEqual(result["status"], "failed")
+        error = repo.entities[("telegram_update_error", "77")]
+        self.assertIn("media too large", error["error"])
+        self.assertEqual(error["update"]["update_id"], 77)
+        self.assertTrue(any("failed after async ingest" in activity["text"] for activity in repo.activities))
 
     async def test_send_telegram_payload_chunks_text_and_sends_local_attachment(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -723,6 +922,62 @@ class TelegramChannelGatewayTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(api_calls[0][1]["message_id"], 100)
             self.assertEqual(api_calls[0][1]["text"], "คำตอบสุดท้าย")
             self.assertEqual(repo.messages[reply["id"]]["channelReply"]["progressMessageId"], "100")
+
+    async def test_completed_progress_job_sends_remaining_chunks_after_progress_final_edit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = FakeRepo()
+            settings = _settings(tmp, telegram_outbound_chunk_chars=500)
+            reply = {
+                "id": "msg_reply",
+                "threadId": "executive",
+                "pending": False,
+                "status": "sent",
+                "text": "x" * 1205,
+                "channelReply": {
+                    "provider": "telegram",
+                    "chatId": "555",
+                    "replyToTelegramMessageId": "42",
+                },
+            }
+            repo.messages[reply["id"]] = reply
+            await repo.put_entity(
+                "telegram_progress_message",
+                {
+                    "id": reply["id"],
+                    "replyMessageId": reply["id"],
+                    "threadId": "executive",
+                    "chatId": "555",
+                    "progressMessageId": "100",
+                    "updatedAt": 10_000,
+                },
+            )
+            api_calls: list[tuple[str, dict]] = []
+
+            def fake_api(bot_token, method, body):
+                del bot_token
+                api_calls.append((method, body))
+                return {"ok": True, "result": {"message_id": 100 + len(api_calls)}}
+
+            with (
+                mock.patch.object(telegram_gateway, "get_settings", return_value=settings),
+                mock.patch.object(telegram_gateway, "_telegram_api_request", side_effect=fake_api),
+            ):
+                result = await telegram_gateway.process_telegram_progress_job(
+                    repo,
+                    {
+                        "replyMessageId": reply["id"],
+                        "threadId": "executive",
+                    },
+                    12_000,
+                )
+
+            self.assertEqual(result["status"], "completed_finalized")
+            self.assertEqual(result["finalProgress"]["status"], "edited_progress_to_final")
+            self.assertEqual(result["finalProgress"]["chunkCount"], 3)
+            self.assertEqual([method for method, _ in api_calls], ["editMessageText", "sendMessage", "sendMessage"])
+            self.assertEqual([body["text"] for _, body in api_calls], ["x" * 500, "x" * 500, "x" * 205])
+            self.assertNotIn("reply_parameters", api_calls[1][1])
+            self.assertNotIn("reply_parameters", api_calls[2][1])
 
     async def test_completed_progress_job_leaves_already_edited_final_message_alone(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

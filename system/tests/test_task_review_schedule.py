@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 import unittest
 from unittest import mock
 
@@ -86,6 +87,212 @@ class ChatCreateTaskReviewScheduleTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repo.enqueued[0]["kind"], TASK_REVIEW_REMINDER_KIND)
         self.assertEqual(repo.enqueued[0]["runAt"], task["nextReviewAt"])
         self.assertEqual(repo.enqueued[0]["payload"]["reviewIntervalMs"], 3 * 60_000)
+
+
+class ApiAssignTaskCollisionTest(unittest.IsolatedAsyncioTestCase):
+    async def test_assign_task_rejects_empty_title(self) -> None:
+        from app import main
+        from app.schema import AssignTaskInput
+        from fastapi import HTTPException
+
+        repo = FakeRepo()
+
+        @asynccontextmanager
+        async def fake_session_scope():
+            yield object()
+
+        with (
+            mock.patch.object(main, "session_scope", fake_session_scope),
+            mock.patch.object(main, "Repo", lambda _session: repo),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await main.assign_task(
+                    AssignTaskInput(
+                        title="   ",
+                        department_id="research",
+                    )
+                )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.detail, "title cannot be empty")
+        self.assertEqual(repo.tasks, [])
+
+    async def test_assign_task_rejects_client_id_collision(self) -> None:
+        from app import main
+        from app.schema import AssignTaskInput
+        from fastapi import HTTPException
+
+        class CollisionRepo(FakeRepo):
+            async def get_task(self, task_id):
+                if task_id == "task_existing":
+                    return {"id": task_id, "title": "เดิม", "status": "assigned"}
+                return None
+
+        repo = CollisionRepo()
+
+        @asynccontextmanager
+        async def fake_session_scope():
+            yield object()
+
+        with (
+            mock.patch.object(main, "session_scope", fake_session_scope),
+            mock.patch.object(main, "Repo", lambda _session: repo),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await main.assign_task(
+                    AssignTaskInput(
+                        id="task_existing",
+                        title="งานใหม่",
+                        department_id="research",
+                    )
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.detail, "task id already exists")
+        self.assertEqual(repo.tasks, [])
+
+    async def test_assign_task_rejects_closed_parent_task(self) -> None:
+        from app import main
+        from app.schema import AssignTaskInput
+        from fastapi import HTTPException
+
+        class ParentRepo(FakeRepo):
+            async def get_task(self, task_id):
+                if task_id == "task_parent":
+                    return {"id": task_id, "title": "แม่", "status": "done", "projectId": None}
+                return None
+
+        repo = ParentRepo()
+
+        @asynccontextmanager
+        async def fake_session_scope():
+            yield object()
+
+        with (
+            mock.patch.object(main, "session_scope", fake_session_scope),
+            mock.patch.object(main, "Repo", lambda _session: repo),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await main.assign_task(
+                    AssignTaskInput(
+                        title="งานลูก",
+                        department_id="research",
+                        parent_task_id="task_parent",
+                    )
+                )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.detail, "parent task is closed")
+        self.assertEqual(repo.tasks, [])
+
+    async def test_assign_task_rejects_cross_project_parent_task(self) -> None:
+        from app import main
+        from app.schema import AssignTaskInput
+        from fastapi import HTTPException
+
+        class ParentRepo(FakeRepo):
+            async def get_task(self, task_id):
+                if task_id == "task_parent":
+                    return {"id": task_id, "title": "แม่", "status": "assigned", "projectId": "proj_a"}
+                return None
+
+            async def get_entity(self, type_, entity_id):
+                if type_ == "project" and entity_id == "proj_b":
+                    return {"id": entity_id, "departments": ["research"]}
+                return None
+
+        repo = ParentRepo()
+
+        @asynccontextmanager
+        async def fake_session_scope():
+            yield object()
+
+        with (
+            mock.patch.object(main, "session_scope", fake_session_scope),
+            mock.patch.object(main, "Repo", lambda _session: repo),
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await main.assign_task(
+                    AssignTaskInput(
+                        title="งานลูก",
+                        department_id="research",
+                        project_id="proj_b",
+                        parent_task_id="task_parent",
+                    )
+                )
+
+        self.assertEqual(raised.exception.status_code, 400)
+        self.assertEqual(raised.exception.detail, "parent task project mismatch")
+        self.assertEqual(repo.tasks, [])
+
+
+class TaskReviewReminderRescanTest(unittest.IsolatedAsyncioTestCase):
+    async def test_rescan_reenqueues_scheduled_task_without_active_reminder(self) -> None:
+        from app import engine
+        from app.task_review import TASK_REVIEW_REMINDER_KIND
+
+        class RescanRepo(FakeRepo):
+            def __init__(self) -> None:
+                super().__init__()
+                self.tasks = [{
+                    "id": "task_due",
+                    "title": "ตรวจงาน",
+                    "status": "in_progress",
+                    "departmentId": "research",
+                    "reviewIntervalMs": 5 * 60_000,
+                    "reviewScheduleToken": "rev_due",
+                    "nextReviewAt": 1_500_000,
+                }]
+
+            async def list_active_tasks(self, limit=None):
+                return self.tasks
+
+            async def active_jobs(self, limit=200):
+                return []
+
+        repo = RescanRepo()
+        count = await engine._rescan_task_review_reminders(repo, 1_000_000)
+
+        self.assertEqual(count, 1)
+        self.assertEqual(len(repo.enqueued), 1)
+        self.assertEqual(repo.enqueued[0]["kind"], TASK_REVIEW_REMINDER_KIND)
+        self.assertEqual(repo.enqueued[0]["payload"]["taskId"], "task_due")
+        self.assertEqual(repo.enqueued[0]["payload"]["reviewScheduleToken"], "rev_due")
+        self.assertEqual(repo.enqueued[0]["runAt"], 1_500_000)
+
+    async def test_rescan_does_not_duplicate_active_reminder_for_same_token(self) -> None:
+        from app import engine
+        from app.task_review import TASK_REVIEW_REMINDER_KIND
+
+        class RescanRepo(FakeRepo):
+            def __init__(self) -> None:
+                super().__init__()
+                self.tasks = [{
+                    "id": "task_due",
+                    "title": "ตรวจงาน",
+                    "status": "in_progress",
+                    "departmentId": "research",
+                    "reviewIntervalMs": 5 * 60_000,
+                    "reviewScheduleToken": "rev_due",
+                    "nextReviewAt": 1_500_000,
+                }]
+
+            async def list_active_tasks(self, limit=None):
+                return self.tasks
+
+            async def active_jobs(self, limit=200):
+                return [{
+                    "id": "job_existing",
+                    "kind": TASK_REVIEW_REMINDER_KIND,
+                    "status": "queued",
+                    "payload": {"taskId": "task_due", "reviewScheduleToken": "rev_due"},
+                }]
+
+        repo = RescanRepo()
+        count = await engine._rescan_task_review_reminders(repo, 1_000_000)
+
+        self.assertEqual(count, 0)
+        self.assertEqual(repo.enqueued, [])
 
 
 if __name__ == "__main__":
