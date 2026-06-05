@@ -257,7 +257,15 @@ class ChatMessageStreamSink:
         elif error:
             status = "failed"
             error_payload = {"code": "provider_error", "detail": error, "retryable": True}
-        message = {**self.message, "text": self.text, "pending": False, "status": status}
+        completed_at = now_ms()
+        message = {
+            **self.message,
+            "text": self.text,
+            "pending": False,
+            "status": status,
+            "ts": completed_at,
+            "completedAt": completed_at,
+        }
         if error_payload:
             message["error"] = error_payload
         else:

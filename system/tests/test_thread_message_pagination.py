@@ -97,6 +97,45 @@ class ThreadMessagePaginationTest(unittest.IsolatedAsyncioTestCase):
         combined = [*first, *second]
         self.assertEqual([m["id"] for m in combined], [f"msg_{i:03d}" for i in range(5, 65)])
 
+    async def test_reconciled_chat_reply_moves_to_completion_time_for_after_cursor(self) -> None:
+        async with self.sessionmaker() as session:
+            pending = {
+                "id": "reply_1",
+                "threadId": "executive",
+                "role": "executive",
+                "authorName": "ออตโต้",
+                "text": "กำลังคิดและทำงานต่อในคิวเบื้องหลัง...",
+                "ts": 1000,
+                "pending": True,
+                "status": "sending",
+                "replyToMessageId": "user_1",
+            }
+            session.add(T.Message(id="reply_1", thread_id="executive", ts=1000, data=pending))
+            session.add(T.Job(
+                id="job_1",
+                kind="chat_reply",
+                status="failed",
+                run_after=1000,
+                priority=1,
+                payload={"replyMessageId": "reply_1"},
+                attempts=1,
+                last_error="provider stopped",
+                created_at=1000,
+                updated_at=5000,
+            ))
+            await session.commit()
+
+        async with self.sessionmaker() as session:
+            repo = Repo(session)
+            repaired = await repo.reconcile_chat_reply_placeholders()
+            newer = await repo.thread_messages_after("executive", after_ts=3000, after_id="later", limit=30)
+
+        self.assertEqual(repaired, 1)
+        self.assertEqual([m["id"] for m in newer], ["reply_1"])
+        self.assertEqual(newer[0]["ts"], 5000)
+        self.assertEqual(newer[0]["completedAt"], 5000)
+        self.assertFalse(newer[0]["pending"])
+
     async def test_all_threads_limits_threads_preserves_preferred_and_batches_messages(self) -> None:
         await self._seed_thread_messages()
 

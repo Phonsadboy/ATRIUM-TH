@@ -1,4 +1,6 @@
 from contextlib import asynccontextmanager
+from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 
@@ -22,6 +24,13 @@ class TaskReviewScheduleHelperTest(unittest.TestCase):
 class FakeRepo:
     def __init__(self) -> None:
         self.departments = {
+            "exec": {
+                "id": "exec",
+                "name": "ผู้บริหาร",
+                "agentName": "ออตโต้",
+                "state": "working",
+                "currentTaskId": "task_exec_existing",
+            },
             "research": {
                 "id": "research",
                 "name": "วิจัย",
@@ -46,6 +55,9 @@ class FakeRepo:
     async def save_task(self, task):
         self.tasks.append(dict(task))
 
+    async def save_department(self, dept):
+        self.departments[dept["id"]] = dict(dept)
+
     async def add_activity(self, activity):
         self.activities.append(dict(activity))
 
@@ -60,6 +72,40 @@ class FakeRepo:
 
 
 class ChatCreateTaskReviewScheduleTest(unittest.IsolatedAsyncioTestCase):
+    def test_create_task_schema_includes_executive_target(self) -> None:
+        from app import chat_tools
+
+        definitions = chat_tools.chat_tool_definitions(
+            [
+                {"id": "exec", "name": "ผู้บริหาร"},
+                {"id": "research", "name": "วิจัย"},
+            ],
+            {"id": "exec", "name": "ผู้บริหาร"},
+        )
+        create_task = next(item for item in definitions if item["name"] == "create_task")
+
+        self.assertEqual(
+            create_task["input_schema"]["properties"]["departmentId"]["enum"],
+            ["exec", "research"],
+        )
+
+    def test_create_task_schema_excludes_executive_target_for_department_agent(self) -> None:
+        from app import chat_tools
+
+        definitions = chat_tools.chat_tool_definitions(
+            [
+                {"id": "exec", "name": "ผู้บริหาร"},
+                {"id": "research", "name": "วิจัย"},
+            ],
+            {"id": "research", "name": "วิจัย"},
+        )
+        create_task = next(item for item in definitions if item["name"] == "create_task")
+
+        self.assertEqual(
+            create_task["input_schema"]["properties"]["departmentId"]["enum"],
+            ["research"],
+        )
+
     async def test_create_task_defaults_review_schedule_and_enqueues_reminder(self) -> None:
         from app import chat_tools
         from app.task_review import TASK_REVIEW_REMINDER_KIND
@@ -87,6 +133,132 @@ class ChatCreateTaskReviewScheduleTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(repo.enqueued[0]["kind"], TASK_REVIEW_REMINDER_KIND)
         self.assertEqual(repo.enqueued[0]["runAt"], task["nextReviewAt"])
         self.assertEqual(repo.enqueued[0]["payload"]["reviewIntervalMs"], 3 * 60_000)
+
+    async def test_create_task_allows_executive_as_target_department(self) -> None:
+        from app import chat_tools
+
+        repo = FakeRepo()
+        active = {"id": "exec", "name": "ผู้บริหาร", "agentName": "ออตโต้"}
+
+        with (
+            mock.patch.object(chat_tools, "now_ms", return_value=1_000_000),
+            mock.patch.object(chat_tools, "emit_work_status_notice", new=mock.AsyncMock()),
+        ):
+            result = await chat_tools._create_task_tool(
+                repo,
+                {"title": "วาง policy โมเดล", "departmentId": "exec", "priority": "normal"},
+                active,
+            )
+
+        task = result["task"]
+        self.assertTrue(result["ok"])
+        self.assertEqual(task["departmentId"], "exec")
+        self.assertEqual(task["origin"], {"kind": "executive"})
+        self.assertEqual(task["watchers"], ["executive"])
+        self.assertEqual(task["reviewIntervalMs"], 5 * 60_000)
+        self.assertIn("ผู้บริหาร", repo.activities[-1]["text"])
+        self.assertNotIn("ฝ่ายผู้บริหาร", repo.activities[-1]["text"])
+
+
+class EngineExecutiveSelfCloseTest(unittest.IsolatedAsyncioTestCase):
+    async def test_executive_self_task_closes_directly_without_pending_approval(self) -> None:
+        from app import engine
+
+        class EngineRepo:
+            def __init__(self) -> None:
+                self.departments = {
+                    "exec": {
+                        "id": "exec",
+                        "name": "ผู้บริหาร",
+                        "agentName": "ออตโต้",
+                        "state": "review",
+                        "currentTaskId": "task_self",
+                    }
+                }
+                self.tasks = {
+                    "task_self": {
+                        "id": "task_self",
+                        "title": "วาง policy โมเดล",
+                        "detail": "จัดทำแนวทาง provider/model",
+                        "departmentId": "exec",
+                        "status": "review",
+                        "progress": 0.95,
+                        "updatedAt": 1,
+                        "log": ["เริ่มงาน", "พร้อมปิด"],
+                        "deliverables": [],
+                        "result": {},
+                    }
+                }
+                self.approvals = []
+                self.entities = {}
+                self.activities = []
+
+            async def list_approvals(self):
+                return [dict(item) for item in self.approvals]
+
+            async def get_entity(self, type_, entity_id):
+                return self.entities.get((type_, entity_id))
+
+            async def put_entity(self, type_, entity, **_kwargs):
+                self.entities[(type_, entity["id"])] = dict(entity)
+
+            async def get_task(self, task_id):
+                return self.tasks.get(task_id)
+
+            async def save_task(self, task):
+                self.tasks[task["id"]] = dict(task)
+
+            async def save_department(self, dept):
+                self.departments[dept["id"]] = dict(dept)
+
+            async def add_approval(self, approval):
+                self.approvals.append(dict(approval))
+
+            async def save_approval(self, approval):
+                self.approvals = [dict(approval) if item["id"] == approval["id"] else item for item in self.approvals]
+
+            async def add_activity(self, activity):
+                self.activities.append(dict(activity))
+
+        repo = EngineRepo()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            def artifact_path(dept_id, artifact_id, version):
+                path = Path(tmp_dir) / dept_id / artifact_id / f"v{version}.md"
+                path.parent.mkdir(parents=True, exist_ok=True)
+                return str(path)
+
+            with (
+                mock.patch.object(engine, "_artifact_content_path", side_effect=artifact_path),
+                mock.patch.object(engine, "emit_work_status_notice", new=mock.AsyncMock()),
+                mock.patch.object(engine, "_enqueue_task_done_reflection", new=mock.AsyncMock()),
+                mock.patch("app.eval.scoring.record_task_outcome", new=mock.AsyncMock()),
+            ):
+                approval = await engine.request_task_close_approval(
+                    repo,
+                    repo.departments["exec"],
+                    repo.tasks["task_self"],
+                    1_000_000,
+                    content="สรุป policy โมเดลพร้อมใช้งาน",
+                    decision={"rationale": "งานผู้บริหารตรวจเองได้"},
+                    source="engine_review",
+                )
+
+        task = repo.tasks["task_self"]
+        self.assertEqual(approval["status"], "approved")
+        self.assertEqual(approval["resolvedBy"], "exec")
+        self.assertEqual(approval["autoApprovedBy"], "executive_self_close")
+        self.assertEqual(approval["action"]["executedAt"], 1_000_000)
+        self.assertEqual(len(repo.approvals), 1)
+        self.assertEqual(repo.approvals[0]["status"], "approved")
+        self.assertEqual(task["status"], "done")
+        self.assertEqual(task["result"]["reviewStatus"], "closed_by_executive_self")
+        self.assertNotIn("waitingOn", task)
+        self.assertNotIn("pendingCloseApprovalId", task)
+        self.assertEqual(repo.departments["exec"]["state"], "idle")
+        self.assertIsNone(repo.departments["exec"]["currentTaskId"])
+        artifact_id = approval["action"]["artifactId"]
+        self.assertEqual(repo.entities[("artifact", artifact_id)]["status"], "approved")
 
 
 class ApiAssignTaskCollisionTest(unittest.IsolatedAsyncioTestCase):

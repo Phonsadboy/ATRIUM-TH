@@ -670,7 +670,7 @@ def chat_tool_definitions(departments: list[dict[str, Any]], active_dept: dict[s
                 "properties": {
                     "title": {"type": "string", "description": "Short task title."},
                     "detail": {"type": "string", "description": "Concrete task details and acceptance criteria."},
-                    "departmentId": dept_schema,
+                    "departmentId": any_dept_schema if is_exec(active_dept["id"]) else dept_schema,
                     "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"]},
                     "reviewIntervalMs": {
                         "type": "integer",
@@ -6568,8 +6568,16 @@ async def _create_department_tool(repo: Repo, args: dict[str, Any], active_dept:
     return {"ok": True, "tool": "create_department", "summary": f"created department {dept_id}", "department": dept}
 
 
-async def _resolve_department(repo: Repo, dept_id: Any, active_dept: dict[str, Any]) -> dict[str, Any]:
+async def _resolve_department(
+    repo: Repo,
+    dept_id: Any,
+    active_dept: dict[str, Any],
+    *,
+    allow_executive: bool = False,
+) -> dict[str, Any]:
     resolved = str(dept_id or "").strip()
+    if resolved in {"executive", "company"}:
+        resolved = EXEC_ID
     if not resolved and not is_exec(active_dept["id"]):
         resolved = active_dept["id"]
     if not resolved:
@@ -6579,7 +6587,7 @@ async def _resolve_department(repo: Repo, dept_id: Any, active_dept: dict[str, A
     dept = await repo.get_department(resolved)
     if not dept:
         raise ValueError(f"department not found: {resolved}")
-    if is_exec(dept["id"]):
+    if is_exec(dept["id"]) and not allow_executive:
         raise ValueError("executive is not a valid target department for this tool")
     return dept
 
@@ -6592,6 +6600,12 @@ async def _resolve_owner_tool_department(repo: Repo, dept_id: Any, active_dept: 
     if not dept:
         raise ValueError(f"department not found: {resolved}")
     return dept
+
+
+def _department_label(dept: dict[str, Any]) -> str:
+    if is_exec(str(dept.get("id") or "")):
+        return "ผู้บริหาร"
+    return f"ฝ่าย{dept.get('name', dept.get('id'))}"
 
 
 async def _resolve_any_agent_department(repo: Repo, dept_id: Any, active_dept: dict[str, Any]) -> dict[str, Any]:
@@ -6611,7 +6625,12 @@ def _can_read_department_knowledge(active_dept: dict[str, Any], target_dept: dic
 
 
 async def _create_task_tool(repo: Repo, args: dict[str, Any], active_dept: dict[str, Any]) -> dict[str, Any]:
-    target = await _resolve_department(repo, args.get("departmentId") or args.get("department_id"), active_dept)
+    target = await _resolve_department(
+        repo,
+        args.get("departmentId") or args.get("department_id"),
+        active_dept,
+        allow_executive=is_exec(active_dept["id"]),
+    )
     title = str(args.get("title") or "").strip()[:120]
     if not title:
         raise ValueError("title is required")
@@ -6658,7 +6677,7 @@ async def _create_task_tool(repo: Repo, args: dict[str, Any], active_dept: dict[
     await repo.save_task(task)
     await enqueue_task_review_reminder(repo, task, now=now)
     await repo.add_activity(_activity(
-        f"tool create_task: “{task['title']}” → ฝ่าย{target['name']}",
+        f"tool create_task: “{task['title']}” → {_department_label(target)}",
         type_="task_assigned" if is_exec(active_dept["id"]) else "task_created",
         department_id=target["id"],
         severity="good",
@@ -6666,7 +6685,7 @@ async def _create_task_tool(repo: Repo, args: dict[str, Any], active_dept: dict[
     await emit_work_status_notice(
         repo,
         event="task_assigned",
-        summary=f"{active_dept.get('agentName', active_dept['id'])} มอบหมายงาน “{task['title']}” ให้ฝ่าย{target.get('name', target['id'])}",
+        summary=f"{active_dept.get('agentName', active_dept['id'])} มอบหมายงาน “{task['title']}” ให้{_department_label(target)}",
         source_dept=active_dept,
         target_dept=target,
         task=task,
@@ -6725,7 +6744,7 @@ async def _wake_department_for_new_task(
     await emit_work_status_notice(
         repo,
         event="task_started",
-        summary=f"ฝ่าย{dept.get('name', dept['id'])}เริ่มงาน “{task['title']}” ทันทีหลังรับมอบหมาย",
+        summary=f"{_department_label(dept)}เริ่มงาน “{task['title']}” ทันทีหลังรับมอบหมาย",
         source_dept=dept,
         task=task,
         severity="good",
@@ -6734,13 +6753,14 @@ async def _wake_department_for_new_task(
         include_executive=False,
     )
     if (task.get("origin") or {}).get("kind") == "executive":
+        label = _department_label(dept)
         msg = system_chat_message(
             EXEC_THREAD,
-            f"ฝ่าย{dept.get('name', dept['id'])}เริ่มทำงานทันทีหลังรับมอบหมาย: “{task['title']}”",
+            f"{label}เริ่มทำงานทันทีหลังรับมอบหมาย: “{task['title']}”",
             department_id=dept["id"],
             flow={
                 "kind": "department_work",
-                "title": f"ฝ่าย{dept.get('name', dept.get('id'))}: {task.get('title')}",
+                "title": f"{label}: {task.get('title')}",
                 "steps": [{
                     "kind": "task_started",
                     "label": "task started",

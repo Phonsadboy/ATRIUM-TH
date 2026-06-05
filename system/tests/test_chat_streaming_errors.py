@@ -112,12 +112,18 @@ class ChatMessageStreamSinkTest(unittest.IsolatedAsyncioTestCase):
             repo=repo,
         )
 
-        with mock.patch("app.chat_streaming.hub.pulse", side_effect=lambda payload: pulses.append(payload)):
+        with (
+            mock.patch("app.chat_streaming.hub.pulse", side_effect=lambda payload: pulses.append(payload)),
+            mock.patch("app.chat_streaming.now_ms", return_value=12345),
+        ):
             await sink.handle(LLMStreamEvent(kind="text_delta", text="hello"))
             result = LLMResult(text="hello world", tokens_in=0, tokens_out=2)
             message = await sink.finish(result=result)
 
         self.assertEqual(message["text"], "hello world")
+        self.assertEqual(message["ts"], 12345)
+        self.assertEqual(message["completedAt"], 12345)
+        self.assertEqual(repo.messages["msg_reply"]["ts"], 12345)
         self.assertEqual(result.text, "hello world")
         self.assertEqual(message["streamReconcile"]["mode"], "appended_final_suffix")
         self.assertTrue(any(pulse.get("kind") == "msg_delta" and pulse.get("chunk") == " world" for pulse in pulses))

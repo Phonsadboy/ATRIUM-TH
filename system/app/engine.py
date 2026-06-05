@@ -1763,6 +1763,8 @@ async def _mark_chat_reply_timeout(repo: Repo, payload: dict[str, Any], *, timeo
         reply = {
             **existing,
             "text": text,
+            "ts": now,
+            "completedAt": now,
             "pending": False,
             "status": "failed",
             "error": {"code": "chat_reply_timeout", "detail": detail, "retryable": True},
@@ -1775,7 +1777,8 @@ async def _mark_chat_reply_timeout(repo: Repo, payload: dict[str, Any], *, timeo
             "role": "agent",
             "authorName": str(payload.get("departmentName") or payload.get("agentName") or "AI"),
             "text": fallback_text,
-            "ts": int(payload.get("replyTs") or now),
+            "ts": now,
+            "completedAt": now,
             "pending": False,
             "status": "failed",
             "replyToMessageId": user_message_id or None,
@@ -2043,6 +2046,8 @@ async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int)
         reply = {
             **existing_reply,
             "text": f"ยังไม่เรียกโมเดลเพราะ runtime dependency: {blocked}",
+            "ts": now,
+            "completedAt": now,
             "pending": False,
             "status": "blocked",
             "replyToMessageId": user_message_id,
@@ -5017,6 +5022,155 @@ def _pending_task_close_approval(approvals: list[dict[str, Any]], task_id: str) 
     return None
 
 
+def _department_label(dept: dict[str, Any]) -> str:
+    if is_exec(str(dept.get("id") or "")):
+        return "ผู้บริหาร"
+    return f"ฝ่าย{dept.get('name', dept.get('id'))}"
+
+
+def _is_executive_self_task(dept: dict[str, Any], task: dict[str, Any]) -> bool:
+    return is_exec(str(dept.get("id") or "")) and is_exec(str(task.get("departmentId") or ""))
+
+
+async def _close_executive_self_task_directly(
+    repo: Repo,
+    dept: dict[str, Any],
+    task: dict[str, Any],
+    now: int,
+    *,
+    content: str | None,
+    decision: dict[str, Any] | None,
+    source: str,
+) -> dict[str, Any]:
+    existing = _pending_task_close_approval(await repo.list_approvals(), task["id"])
+    decision_payload = {**(decision or {}), "approvedBy": EXEC_ID}
+    artifact_id = await _record_task_deliverable(
+        repo,
+        dept,
+        task,
+        now,
+        content=content,
+        decision=decision_payload,
+        artifact_status="approved",
+        decision_status="approved",
+        approved_by=EXEC_ID,
+    )
+    approval = existing or {
+        "id": uid("apr"),
+        "ts": now,
+        "kind": "task_close",
+        "title": f"ปิดงานโดยผู้บริหาร: {task['title']}",
+        "detail": f"ผู้บริหารปิดงานของตัวเอง “{task['title']}” โดยตรง ไม่ต้องรออนุมัติซ้ำ",
+        "departmentId": dept["id"],
+        "status": "approved",
+        "action": {"action": "close_task"},
+    }
+    action = approval.get("action") if isinstance(approval.get("action"), dict) else {}
+    action.update({
+        "action": "close_task",
+        "departmentId": dept["id"],
+        "projectId": task.get("projectId"),
+        "artifactId": artifact_id,
+        "taskId": task["id"],
+        "requestedBy": dept["id"],
+        "approvedBy": EXEC_ID,
+        "source": source,
+        "executedAt": now,
+    })
+    approval["action"] = action
+    approval["status"] = "approved"
+    approval["resolvedAt"] = now
+    approval["resolvedBy"] = EXEC_ID
+    approval["autoApprovedBy"] = "executive_self_close"
+
+    task["status"] = "done"
+    task["progress"] = 1
+    task["updatedAt"] = now
+    task.pop("pendingCloseApprovalId", None)
+    task.pop("waitingOn", None)
+    task["result"] = {
+        **(task.get("result") or {}),
+        "summary": "ผู้บริหารปิดงานของตัวเองโดยตรง",
+        "artifactId": artifact_id,
+        "approvalId": approval["id"],
+        "reviewStatus": "closed_by_executive_self",
+        "completedAt": now,
+    }
+    task["log"] = [*task.get("log", []), f"ผู้บริหารปิดงานของตัวเองโดยตรง approval={approval['id']}"]
+    if _is_project_final_task(task) and task.get("projectId"):
+        project = await repo.get_entity("project", task["projectId"])
+        if project:
+            project["status"] = "done"
+            project["deliverableArtifactId"] = artifact_id or project.get("deliverableArtifactId")
+            project["finalApprovalId"] = approval["id"]
+            project["reviewStatus"] = "closed_by_executive_self"
+            project["completedAt"] = now
+            project["resolvedBy"] = EXEC_ID
+            await repo.put_entity("project", project, project=task["projectId"], status="done", ts=now)
+    if dept.get("currentTaskId") == task["id"]:
+        dept["currentTaskId"] = None
+        if dept.get("state") not in {"offline", "blocked"}:
+            dept["state"] = "idle"
+    elif dept.get("state") == "review" and not dept.get("currentTaskId"):
+        dept["state"] = "idle"
+    await repo.save_task(task)
+    await repo.save_department(dept)
+    if existing:
+        await repo.save_approval(approval)
+    else:
+        await repo.add_approval(approval)
+
+    from .eval.scoring import record_task_outcome
+
+    revision_count = sum(1 for line in task.get("log", []) if "review ไม่ผ่าน" in str(line))
+    await record_task_outcome(
+        repo,
+        task_id=task["id"],
+        department_id=dept["id"],
+        outcome="done",
+        revision_count=revision_count,
+        accepted=True,
+        skill_ids=[str(item) for item in task.get("activeSkillIds", []) if item],
+    )
+    await _enqueue_task_done_reflection(
+        repo,
+        dept,
+        task,
+        artifact_id=artifact_id or None,
+        project_final=_is_project_final_task(task),
+    )
+    await repo.add_activity(_activity(
+        f"ผู้บริหารปิดงานของตัวเองโดยตรง “{task['title']}”",
+        type_="task_done",
+        department_id=dept["id"],
+        severity="good",
+        ts=now,
+    ))
+    await _add_executive_watch_line(
+        repo,
+        dept,
+        task,
+        f"{_department_label(dept)}ปิดงานสำเร็จโดยตรง: “{task['title']}”",
+        event="task_done",
+        severity="good",
+        now=now,
+    )
+    await emit_work_status_notice(
+        repo,
+        event="task_close_approved",
+        summary=f"ผู้บริหารปิดงาน “{task['title']}” โดยตรงแล้ว",
+        source_dept=dept,
+        task=task,
+        severity="good",
+        now=now,
+        dedupe_key=f"task_close_direct:{task['id']}:{approval['id']}",
+        include_executive=False,
+    )
+    hub.pulse({"kind": "done", "departmentId": dept["id"]})
+    hub.pulse({"kind": "approval", "departmentId": dept["id"], "approvalId": approval["id"]})
+    return approval
+
+
 async def request_task_close_approval(
     repo: Repo,
     dept: dict[str, Any],
@@ -5027,6 +5181,17 @@ async def request_task_close_approval(
     decision: dict[str, Any] | None = None,
     source: str = "department_review",
 ) -> dict[str, Any]:
+    if _is_executive_self_task(dept, task):
+        return await _close_executive_self_task_directly(
+            repo,
+            dept,
+            task,
+            now,
+            content=content,
+            decision=decision,
+            source=source,
+        )
+
     existing = _pending_task_close_approval(await repo.list_approvals(), task["id"])
     if existing:
         return existing

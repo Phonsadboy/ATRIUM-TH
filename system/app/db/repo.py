@@ -1366,12 +1366,16 @@ class Repo:
                 detail = job.last_error or "background chat generation ended without finalizing the reply"
                 fallback = "งานตอบกลับก่อนหน้าล้มเหลวในคิวเบื้องหลัง"
             text = str(data.get("text") or "").strip()
+            completed_at = int(job.updated_at or now_ms())
             data.update({
                 "pending": False,
                 "status": status,
+                "ts": completed_at,
+                "completedAt": completed_at,
                 "text": text if text not in generic_pending else fallback,
                 "error": {"code": code, "detail": detail, "retryable": True},
             })
+            row.ts = completed_at
             row.data = ensure_rendering_metadata(data)
             repaired += 1
         return repaired

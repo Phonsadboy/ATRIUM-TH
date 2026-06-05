@@ -741,6 +741,8 @@ class RuntimeJobStabilityTest(unittest.IsolatedAsyncioTestCase):
         reply = repo.messages["reply_1"]
         self.assertFalse(reply["pending"])
         self.assertEqual(reply["status"], "failed")
+        self.assertEqual(reply["ts"], 123)
+        self.assertEqual(reply["completedAt"], 123)
         self.assertEqual(reply["error"]["code"], "chat_reply_timeout")
         self.assertTrue(reply["error"]["retryable"])
         self.assertTrue(reply["text"])
