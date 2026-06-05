@@ -115,7 +115,7 @@ BLUEPRINTS: list[dict] = [
     {
         "id": EXEC_ID, "name": "ผู้บริหาร", "role": "วางแผน · มอบหมาย · ตรวจงาน",
         "charter": "รับโจทย์จากผู้ใช้ ตีโจทย์ แตกงานเป็นชิ้นเล็ก มอบหมายให้แผนกที่เหมาะสม สั่งส่งต่องาน ตรวจรับงาน และสรุปรายงานกลับ",
-        "emoji": "🦉", "accent": "amber", "providerId": "claude_code", "model": "claude-sonnet-4-6",
+        "emoji": "🦉", "accent": "amber", "providerId": "claude_code", "model": "claude-opus-4-8",
         "thinkingEffort": "high", "agentName": "ออตโต้", "state": "thinking", "mood": 0.82,
         "skills": ["วางกลยุทธ์", "แตกงาน", "ประสานแผนก", "ตรวจคุณภาพ"],
         "tools": ["มอบหมายงาน", "ส่งต่องาน", "สรุปรายงาน", "เปลี่ยนชื่อตัวเอง"], "autonomy": True,
