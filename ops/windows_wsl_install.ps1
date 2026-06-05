@@ -124,8 +124,15 @@ fi
 
 echo
 echo "== Enable pnpm =="
-corepack enable
-corepack prepare pnpm@latest --activate
+# `corepack enable` writes a /usr/bin/pnpm symlink and needs root.
+# `corepack prepare --activate` writes to ~/.cache/node/corepack and must run
+# as the actual user (so the activated version lives in *their* cache).
+# Running both under sudo activated pnpm only for root; the regular user
+# would then re-download `pnpm@latest`, which (as of 2026-06) is v11.5.2
+# and crashes on Node 20.x with
+# `ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING`. Pin to v10.x for compatibility.
+sudo corepack enable
+corepack prepare pnpm@10.15.0 --activate
 
 echo
 echo "== Check Docker Desktop WSL integration =="
