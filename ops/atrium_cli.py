@@ -511,8 +511,45 @@ def command_bootstrap(args: argparse.Namespace) -> int:
         assert_docker_ready()
     else:
         print("[DRY-RUN] docker info")
-    compose(["up", "-d", "postgres", "ollama"], dry_run=args.dry_run, timeout=600)
-    compose(["exec", "ollama", "ollama", "pull", "bge-m3"], dry_run=args.dry_run, timeout=1200)
+    # Detect external Ollama (e.g. host machine, separate VM). When
+    # `ATRIUM_OLLAMA_BASE_URL` resolves to something other than the in-stack
+    # container we skip both the `ollama` compose service and the
+    # `ollama pull bge-m3` step. This is the recommended path on Windows
+    # where the corporate certificate store can break in-container TLS to
+    # registry.ollama.ai (`x509: certificate signed by unknown authority`).
+    env_values = parse_env_file(SYSTEM_ENV)
+    ollama_url = (
+        os.environ.get("ATRIUM_OLLAMA_BASE_URL")
+        or env_values.get("ATRIUM_OLLAMA_BASE_URL")
+        or ""
+    ).strip()
+    external_ollama = bool(ollama_url) and not any(
+        marker in ollama_url for marker in ("://127.0.0.1", "://localhost", "://ollama:")
+    )
+    if external_ollama:
+        print(f"[INFO] Using external Ollama at {ollama_url} — skipping container + model pull.")
+        compose(["up", "-d", "postgres"], dry_run=args.dry_run, timeout=600)
+    else:
+        compose(["up", "-d", "postgres", "ollama"], dry_run=args.dry_run, timeout=600)
+        # The bge-m3 pull is best-effort. On some networks the in-container
+        # TLS handshake to registry.ollama.ai fails with
+        # `x509: certificate signed by unknown authority` (corporate proxy,
+        # outdated CA bundle, etc.). Treat this as a warning rather than a
+        # hard failure so the rest of bootstrap can finish — the user can
+        # either retry the pull manually or point at an external Ollama.
+        try:
+            compose(["exec", "ollama", "ollama", "pull", "bge-m3"], dry_run=args.dry_run, timeout=1200)
+        except StepFailure as exc:
+            print()
+            print("[WARN] Could not pull bge-m3 in the Ollama container.")
+            reason = str(exc).strip()
+            if reason:
+                print(f"       Reason: {reason[:200]}")
+            print("       Continuing — embeddings will not work until the model is available.")
+            print("       Resolve with either of:")
+            print("         1) docker compose exec ollama ollama pull bge-m3   (retry after fixing the network)")
+            print("         2) Set ATRIUM_OLLAMA_BASE_URL to an Ollama that already has bge-m3,")
+            print("            then re-run ./atrium bootstrap --full")
 
     print_header("Database")
     run_or_plan(["uv", "run", "--extra", "postgres", "alembic", "-c", "alembic.ini", "upgrade", "head"], cwd=SYSTEM_DIR, dry_run=args.dry_run, timeout=600)
@@ -543,7 +580,17 @@ def command_start(args: argparse.Namespace) -> int:
     print_header("Start Docker")
     if command_path("docker") and docker_compose_cmd():
         if run(["docker", "info"], timeout=10).returncode == 0:
-            compose(["up", "-d", "postgres", "ollama"], timeout=300)
+            env_values = parse_env_file(SYSTEM_ENV)
+            ollama_url = (
+                os.environ.get("ATRIUM_OLLAMA_BASE_URL")
+                or env_values.get("ATRIUM_OLLAMA_BASE_URL")
+                or ""
+            ).strip()
+            external_ollama = bool(ollama_url) and not any(
+                marker in ollama_url for marker in ("://127.0.0.1", "://localhost", "://ollama:")
+            )
+            services = ["postgres"] if external_ollama else ["postgres", "ollama"]
+            compose(["up", "-d", *services], timeout=300)
         else:
             print_check(False, "Docker", "not running; open Docker Desktop if full stack services are missing")
 

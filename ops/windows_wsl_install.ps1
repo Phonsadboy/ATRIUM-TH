@@ -124,8 +124,15 @@ fi
 
 echo
 echo "== Enable pnpm =="
-corepack enable
-corepack prepare pnpm@latest --activate
+# `corepack enable` writes a /usr/bin/pnpm symlink and needs root.
+# `corepack prepare --activate` writes to ~/.cache/node/corepack and must run
+# as the actual user (so the activated version lives in *their* cache).
+# Running both under sudo activated pnpm only for root; the regular user
+# would then re-download `pnpm@latest`, which (as of 2026-06) is v11.5.2
+# and crashes on Node 20.x with
+# `ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING`. Pin to v10.x for compatibility.
+sudo corepack enable
+corepack prepare pnpm@10.15.0 --activate
 
 echo
 echo "== Check Docker Desktop WSL integration =="
@@ -140,7 +147,12 @@ case "$INSTALL_PATH" in
     INSTALL_DIR="$HOME"
     ;;
   "~/"*)
-    INSTALL_DIR="$HOME/${INSTALL_PATH#~/}"
+    # `${INSTALL_PATH#~/}` triggers bash tilde expansion on the `~/` pattern
+    # (bash expands `~/` to `$HOME/` before doing the prefix removal), so the
+    # substitution silently fails and INSTALL_DIR ends up as
+    # `$HOME/~/Ailab/atrium` (with a literal `~` directory). Use substring
+    # extraction (`${VAR:2}` = skip 2 chars) to strip `~/` without expansion.
+    INSTALL_DIR="$HOME/${INSTALL_PATH:2}"
     ;;
   *)
     INSTALL_DIR="$INSTALL_PATH"
@@ -189,8 +201,17 @@ Set-Content -Path $tempScript -Value $bashScript -Encoding ascii
 
 try {
     Write-Step "Run ATRIUM setup inside WSL"
-    $wslScriptPath = ((& wsl -d $Distro -- wslpath -a $tempScript) | Select-Object -Last 1).Trim()
-    & wsl -d $Distro -- bash $wslScriptPath
+    # Pipe the bash script to WSL via stdin instead of translating a Windows path
+    # to a WSL path. `wsl wslpath -a $tempScript` can return $null on some Windows
+    # configurations (PowerShell argument passing eats backslashes), which then
+    # caused `((... ) | Select-Object -Last 1).Trim()` to throw
+    # "You cannot call a method on a null-valued expression".
+    # Reading via stdin avoids any path translation; CRLF is normalised to LF so
+    # `set -e` style scripts do not break on Windows line endings.
+    $bashScript -replace "`r`n", "`n" | & wsl -d $Distro -- bash -s
+    if ($LASTEXITCODE -ne 0) {
+        throw "WSL bash script exited with code $LASTEXITCODE"
+    }
 }
 finally {
     Remove-Item -Path $tempScript -ErrorAction SilentlyContinue
