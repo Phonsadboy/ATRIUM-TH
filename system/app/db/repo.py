@@ -71,6 +71,8 @@ def normalize_cost_category(category: Any) -> tuple[str, str | None]:
         return normalized, None if normalized == raw else raw
     return "tool", raw or None
 EXECUTIVE_QUEUE_KINDS = {"chat_reply", TASK_REVIEW_REMINDER_KIND, "objective_run", "trigger_run"}
+AGENT_NAME_UPDATED_AT_KEY = "agentNameUpdatedAt"
+DEFAULT_EXEC_AGENT_NAME = "ออตโต้"
 
 
 def _canonical_chat_thread_id(thread_id: str) -> str:
@@ -278,6 +280,41 @@ def _normalize_department_for_snapshot(dept: dict[str, Any]) -> dict[str, Any]:
             "artifacts": visibility.get("artifacts") or "company",
         }
     return data
+
+
+def _agent_name_update_ts(dept: dict[str, Any]) -> int:
+    try:
+        return int(dept.get(AGENT_NAME_UPDATED_AT_KEY) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _merge_department_agent_name_for_save(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    """Preserve a newer durable display name when stale runtime state is saved."""
+    if str(current.get("id") or "") != str(incoming.get("id") or ""):
+        return incoming
+    current_name = str(current.get("agentName") or "").strip()
+    incoming_name = str(incoming.get("agentName") or "").strip()
+    if not current_name or not incoming_name or current_name == incoming_name:
+        return incoming
+
+    current_ts = _agent_name_update_ts(current)
+    incoming_ts = _agent_name_update_ts(incoming)
+    stale_marker = bool(current_ts and (not incoming_ts or incoming_ts < current_ts))
+    stale_exec_default = (
+        str(current.get("id") or "") == EXEC_ID
+        and current_name != DEFAULT_EXEC_AGENT_NAME
+        and incoming_name == DEFAULT_EXEC_AGENT_NAME
+        and not incoming_ts
+    )
+    if not (stale_marker or stale_exec_default):
+        return incoming
+
+    merged = dict(incoming)
+    merged["agentName"] = current_name
+    if current_ts:
+        merged[AGENT_NAME_UPDATED_AT_KEY] = current_ts
+    return merged
 
 
 def _office_room_index(value: Any) -> int:
@@ -952,6 +989,7 @@ class Repo:
             row = T.Department(id=dept["id"], created_at=dept.get("createdAt", now_ms()), data=dept)
             self.s.add(row)
         else:
+            dept = _merge_department_agent_name_for_save(dict(row.data or {}), dept)
             row.data = dept
             row.created_at = dept.get("createdAt", row.created_at)
 

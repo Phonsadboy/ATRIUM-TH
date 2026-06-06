@@ -9,10 +9,16 @@ class TaskReviewScheduleHelperTest(unittest.TestCase):
     def test_new_task_review_interval_defaults_by_priority(self) -> None:
         from app.task_review import review_interval_for_new_task
 
-        self.assertEqual(review_interval_for_new_task(None, priority="urgent"), 2 * 60_000)
-        self.assertEqual(review_interval_for_new_task(None, priority="high"), 3 * 60_000)
-        self.assertEqual(review_interval_for_new_task(None, priority="normal"), 5 * 60_000)
+        self.assertEqual(review_interval_for_new_task(None, priority="urgent"), 10 * 60_000)
+        self.assertEqual(review_interval_for_new_task(None, priority="high"), 10 * 60_000)
+        self.assertEqual(review_interval_for_new_task(None, priority="normal"), 10 * 60_000)
         self.assertEqual(review_interval_for_new_task(None, priority="low"), 10 * 60_000)
+
+    def test_review_interval_minimum_is_ten_minutes(self) -> None:
+        from app.task_review import normalize_review_interval_ms, review_interval_for_new_task
+
+        self.assertEqual(normalize_review_interval_ms(60_000), 10 * 60_000)
+        self.assertEqual(review_interval_for_new_task(3 * 60_000, priority="urgent"), 10 * 60_000)
 
     def test_new_task_review_interval_allows_explicit_disable(self) -> None:
         from app.task_review import review_interval_for_new_task
@@ -125,14 +131,14 @@ class ChatCreateTaskReviewScheduleTest(unittest.IsolatedAsyncioTestCase):
 
         task = result["task"]
         self.assertTrue(result["ok"])
-        self.assertEqual(task["reviewIntervalMs"], 3 * 60_000)
-        self.assertEqual(task["nextReviewAt"], 1_000_000 + 3 * 60_000)
+        self.assertEqual(task["reviewIntervalMs"], 10 * 60_000)
+        self.assertEqual(task["nextReviewAt"], 1_000_000 + 10 * 60_000)
         self.assertTrue(task["reviewScheduleToken"].startswith("rev_"))
-        self.assertIn("3 นาที", "\n".join(task["log"]))
+        self.assertIn("10 นาที", "\n".join(task["log"]))
         self.assertEqual(len(repo.enqueued), 1)
         self.assertEqual(repo.enqueued[0]["kind"], TASK_REVIEW_REMINDER_KIND)
         self.assertEqual(repo.enqueued[0]["runAt"], task["nextReviewAt"])
-        self.assertEqual(repo.enqueued[0]["payload"]["reviewIntervalMs"], 3 * 60_000)
+        self.assertEqual(repo.enqueued[0]["payload"]["reviewIntervalMs"], 10 * 60_000)
 
     async def test_create_task_allows_executive_as_target_department(self) -> None:
         from app import chat_tools
@@ -155,7 +161,7 @@ class ChatCreateTaskReviewScheduleTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task["departmentId"], "exec")
         self.assertEqual(task["origin"], {"kind": "executive"})
         self.assertEqual(task["watchers"], ["executive"])
-        self.assertEqual(task["reviewIntervalMs"], 5 * 60_000)
+        self.assertEqual(task["reviewIntervalMs"], 10 * 60_000)
         self.assertIn("ผู้บริหาร", repo.activities[-1]["text"])
         self.assertNotIn("ฝ่ายผู้บริหาร", repo.activities[-1]["text"])
 
@@ -411,7 +417,7 @@ class TaskReviewReminderRescanTest(unittest.IsolatedAsyncioTestCase):
                     "title": "ตรวจงาน",
                     "status": "in_progress",
                     "departmentId": "research",
-                    "reviewIntervalMs": 5 * 60_000,
+                    "reviewIntervalMs": 10 * 60_000,
                     "reviewScheduleToken": "rev_due",
                     "nextReviewAt": 1_500_000,
                 }]
@@ -444,7 +450,7 @@ class TaskReviewReminderRescanTest(unittest.IsolatedAsyncioTestCase):
                     "title": "ตรวจงาน",
                     "status": "in_progress",
                     "departmentId": "research",
-                    "reviewIntervalMs": 5 * 60_000,
+                    "reviewIntervalMs": 10 * 60_000,
                     "reviewScheduleToken": "rev_due",
                     "nextReviewAt": 1_500_000,
                 }]

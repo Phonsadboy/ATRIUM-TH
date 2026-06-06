@@ -955,14 +955,14 @@ class AssignTaskInput(Schema):
     deadline_at: Optional[int] = None
     review_interval_ms: Optional[int] = Field(
         default=None,
-        description="Owner review reminder interval in milliseconds. Omit for the priority-based default; pass 0 to disable.",
+        description="Owner review reminder interval in milliseconds. Omit for the 10-minute default; positive values below 10 minutes are raised to 10 minutes; pass 0 to disable.",
     )
 
 
 class UpdateTaskReviewScheduleInput(Schema):
     review_interval_ms: Optional[int] = Field(
         default=None,
-        description="Owner review reminder interval in milliseconds. Null, 0, or negative disables reminders.",
+        description="Owner review reminder interval in milliseconds. Positive values below 10 minutes are raised to 10 minutes. Null, 0, or negative disables reminders.",
     )
 
 

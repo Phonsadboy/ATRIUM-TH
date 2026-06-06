@@ -345,6 +345,9 @@ _DEPARTMENT_WORKER_RUNTIME: dict[str, Any] = {
     "lastFinishedAt": None,
     "lastBatchStarted": 0,
 }
+WORKER_CONCURRENCY_DEFAULT = 8
+WORKER_CONCURRENCY_MIN = 8
+WORKER_CONCURRENCY_MAX = 50
 
 
 def _runtime_degraded_reason(health: dict[str, Any]) -> str:
@@ -418,21 +421,18 @@ def engine_runtime_snapshot(settings: Settings | None = None) -> dict[str, Any]:
         "stale": bool(age_ms is not None and age_ms > stale_after_ms),
         "tickSeconds": settings.tick_seconds,
         "jobTimeoutS": settings.engine_job_timeout_s,
+        "chatReplyTimeoutS": _job_timeout_s_for_kind("chat_reply", settings),
         "tickTimeoutS": settings.engine_tick_timeout_s,
         "chatReplyWorker": {
             **_CHAT_REPLY_WORKER_RUNTIME,
             "configuredConcurrency": _bounded_worker_concurrency(
-                getattr(settings, "chat_reply_worker_concurrency", 1),
-                default=1,
-                ceiling=20,
+                getattr(settings, "chat_reply_worker_concurrency", WORKER_CONCURRENCY_DEFAULT),
             ),
         },
         "departmentWorker": {
             **_DEPARTMENT_WORKER_RUNTIME,
             "configuredConcurrency": _bounded_worker_concurrency(
-                getattr(settings, "department_worker_concurrency", 1),
-                default=1,
-                ceiling=20,
+                getattr(settings, "department_worker_concurrency", WORKER_CONCURRENCY_DEFAULT),
             ),
         },
     }
@@ -1293,8 +1293,8 @@ def _chat_system_prompt(dept: dict[str, Any], memory_context: str = "") -> str:
         base = (
             f"คุณคือ {dept['agentName']} ผู้บริหารของบริษัท AI ATRIUM. "
             "หน้าที่คือรับโจทย์จากผู้ใช้ แตกงาน มอบหมายงาน ตรวจคุณภาพ และสรุปกลับเป็นภาษาไทยที่ชัดเจน. "
-            "เมื่อมอบหมายงานให้ออตโต้/แผนกผ่าน create_task ให้ตั้งรอบปลุกตรวจงานเสมอ: urgent 2 นาที, high 3 นาที, normal 5 นาที, low 10 นาที; "
-            "ถ้าเลือกต่างจากนี้ให้มีเหตุผลจากความเสี่ยงหรือเวลารองาน. "
+            "เมื่อมอบหมายงานให้ออตโต้/แผนกผ่าน create_task ให้ตั้งรอบปลุกตรวจงานทุก 10 นาทีเป็นค่าเริ่มต้น และห้ามตั้งรอบที่เปิดอยู่ต่ำกว่า 10 นาที. "
+            "ถ้าเลือกนานกว่านี้ให้มีเหตุผลจากความเสี่ยงหรือเวลารองาน. "
             "ตอบให้กระชับ มีเหตุผล และพร้อมนำไปปฏิบัติ. "
             "ในการคุยจริงครั้งแรกกับเจ้าของ ให้ถามว่าอยากให้ผู้บริหารคนนี้ชื่ออะไร; "
             "เมื่อเจ้าของบอกชื่อ ให้ใช้ tool rename_self เพื่อบันทึกชื่อนั้นเป็นชื่อของตัวเองก่อนทำงานต่อ."
@@ -3191,12 +3191,23 @@ async def _claim_due_jobs(
         return jobs
 
 
-def _bounded_worker_concurrency(value: Any, *, default: int, ceiling: int) -> int:
+def _bounded_worker_concurrency(
+    value: Any,
+    *,
+    default: int = WORKER_CONCURRENCY_DEFAULT,
+    floor: int = WORKER_CONCURRENCY_MIN,
+    ceiling: int = WORKER_CONCURRENCY_MAX,
+) -> int:
+    lower = max(1, int(floor))
+    upper = max(lower, int(ceiling))
+    fallback = min(upper, max(lower, int(default or lower)))
     try:
         raw = int(value)
     except (TypeError, ValueError):
-        raw = default
-    return max(1, min(ceiling, raw or default))
+        raw = fallback
+    if raw <= 0:
+        raw = fallback
+    return min(upper, max(lower, raw))
 
 
 def _job_record(job: Any) -> SimpleNamespace:
@@ -3265,9 +3276,28 @@ async def _running_chat_reply_department_ids() -> set[str]:
     }
 
 
+def _positive_timeout_s(value: Any, *, default: float) -> float:
+    try:
+        raw = float(value)
+    except (TypeError, ValueError):
+        raw = default
+    if raw <= 0:
+        raw = default
+    return max(1.0, raw)
+
+
+def _job_timeout_s_for_kind(kind: str, settings: Settings) -> float:
+    if kind == "chat_reply":
+        return _positive_timeout_s(
+            getattr(settings, "chat_reply_timeout_s", None),
+            default=_positive_timeout_s(getattr(settings, "engine_job_timeout_s", None), default=1800.0),
+        )
+    return _positive_timeout_s(getattr(settings, "engine_job_timeout_s", None), default=1800.0)
+
+
 async def _process_claimed_job_record(job: SimpleNamespace, settings: Settings | None = None) -> int:
     settings = settings or get_settings()
-    timeout_s = max(1.0, float(settings.engine_job_timeout_s))
+    timeout_s = _job_timeout_s_for_kind(str(getattr(job, "kind", "") or ""), settings)
     async with session_scope() as s:
         repo = Repo(s)
         try:
@@ -3299,9 +3329,7 @@ async def _start_available_chat_reply_jobs(
     settings: Settings,
 ) -> int:
     concurrency = _bounded_worker_concurrency(
-        getattr(settings, "chat_reply_worker_concurrency", 1),
-        default=1,
-        ceiling=20,
+        getattr(settings, "chat_reply_worker_concurrency", WORKER_CONCURRENCY_DEFAULT),
     )
     available = max(0, concurrency - len(in_flight))
     started = 0
@@ -6732,18 +6760,14 @@ async def _advance_departments_parallel(
     if not targets:
         _DEPARTMENT_WORKER_RUNTIME.update({
             "concurrency": _bounded_worker_concurrency(
-                getattr(settings, "department_worker_concurrency", 1),
-                default=1,
-                ceiling=20,
+                getattr(settings, "department_worker_concurrency", WORKER_CONCURRENCY_DEFAULT),
             ),
             "inFlight": 0,
             "lastBatchStarted": 0,
         })
         return 0
     concurrency = _bounded_worker_concurrency(
-        getattr(settings, "department_worker_concurrency", 1),
-        default=1,
-        ceiling=20,
+        getattr(settings, "department_worker_concurrency", WORKER_CONCURRENCY_DEFAULT),
     )
     semaphore = asyncio.Semaphore(concurrency)
 

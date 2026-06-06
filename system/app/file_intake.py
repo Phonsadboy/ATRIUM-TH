@@ -406,13 +406,35 @@ def _strip_rtf(text: str) -> str:
 def _extract_delimited(data: bytes, *, delimiter: str) -> str:
     text = _decode_text(data)
     reader = csv.reader(StringIO(text), delimiter=delimiter)
-    rows = []
+    rows: list[list[str]] = []
     for idx, row in enumerate(reader):
         if idx >= 200:
             rows.append(["..."])
             break
         rows.append([cell.strip()[:300] for cell in row[:30]])
-    return "\n".join("\t".join(row) for row in rows)
+    return _rows_to_gfm_table(rows)
+
+
+def _rows_to_gfm_table(rows: list[list[str]]) -> str:
+    rows = [row for row in rows if any(cell.strip() for cell in row)]
+    if not rows:
+        return ""
+    width = min(max(len(row) for row in rows), 30)
+    normalized = [(row + [""] * width)[:width] for row in rows]
+    header, body = normalized[0], normalized[1:]
+    if not body:
+        body = [[""] * width]
+    return "\n".join(
+        [
+            "| " + " | ".join(_escape_table_cell(cell) for cell in header) + " |",
+            "| " + " | ".join("---" for _ in range(width)) + " |",
+            *("| " + " | ".join(_escape_table_cell(cell) for cell in row) + " |" for row in body),
+        ]
+    )
+
+
+def _escape_table_cell(value: str) -> str:
+    return re.sub(r"\s+", " ", value.replace("|", r"\|")).strip()
 
 
 def _extract_jsonl(data: bytes, limit: int) -> str:
@@ -502,7 +524,7 @@ def _extract_xlsx(data: bytes, limit: int) -> str:
         for idx, name in enumerate(sheet_names[:20], start=1):
             rows = _xlsx_rows(zf.read(name), shared)
             if rows:
-                rendered = "\n".join("\t".join(cell for cell in row) for row in rows[:200])
+                rendered = _rows_to_gfm_table(rows[:200])
                 sections.append(f"Sheet {idx}:\n{rendered}")
             if sum(len(x) for x in sections) > limit:
                 break

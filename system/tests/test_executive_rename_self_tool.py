@@ -34,7 +34,9 @@ class ExecutiveRenameSelfToolTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["previousName"], "ออตโต้")
         self.assertEqual(result["newName"], "นีโอ")
         self.assertEqual(repo.saved_department["agentName"], "นีโอ")
+        self.assertIsInstance(repo.saved_department.get("agentNameUpdatedAt"), int)
         self.assertEqual(active["agentName"], "นีโอ")
+        self.assertEqual(active["agentNameUpdatedAt"], repo.saved_department["agentNameUpdatedAt"])
         self.assertIn("นีโอ", repo.activities[0]["text"])
 
     async def test_rename_self_rejects_non_executive_department(self) -> None:

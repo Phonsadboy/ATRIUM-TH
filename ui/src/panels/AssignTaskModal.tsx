@@ -8,9 +8,9 @@ import type { Priority } from '../contract/types'
 
 const PRIORITIES: Priority[] = ['low', 'normal', 'high', 'urgent']
 const REVIEW_MINUTES_BY_PRIORITY: Record<Priority, string> = {
-  urgent: '2',
-  high: '3',
-  normal: '5',
+  urgent: '10',
+  high: '10',
+  normal: '10',
   low: '10',
 }
 
@@ -70,7 +70,7 @@ function AssignTaskForm({
   const [deptId, setDeptId] = useState(initialDeptId)
   const [priority, setPriority] = useState<Priority>('normal')
   const [byExec, setByExec] = useState(initialByExec)
-  const [reviewMinutes, setReviewMinutes] = useState('5')
+  const [reviewMinutes, setReviewMinutes] = useState('10')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const submittingRef = useRef(false)
@@ -92,8 +92,8 @@ function AssignTaskForm({
     const parsedReviewMinutes = Number(trimmedReviewMinutes)
     const reviewIntervalMs = (
       trimmedReviewMinutes === '' || !Number.isFinite(parsedReviewMinutes)
-        ? 5
-        : Math.max(0, parsedReviewMinutes)
+        ? 10
+        : Math.max(10, parsedReviewMinutes)
     ) * 60_000
     submittingRef.current = true
     setSubmitting(true)
@@ -186,7 +186,7 @@ function AssignTaskForm({
             className={inputClass}
             style={{ borderColor: 'var(--color-line-soft)' }}
             type="number"
-            min={0}
+            min={10}
             step={1}
             value={reviewMinutes}
             onChange={(e) => setReviewMinutes(e.target.value)}

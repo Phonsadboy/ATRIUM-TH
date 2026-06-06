@@ -652,6 +652,16 @@ class RuntimeJobStabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([job.id for job in runnable], ["job_b1"])
         self.assertEqual([job.id for job in deferred], ["job_a1", "job_a2"])
 
+    def test_worker_concurrency_defaults_and_bounds(self) -> None:
+        from app import engine
+
+        self.assertEqual(engine._bounded_worker_concurrency(None), 8)
+        self.assertEqual(engine._bounded_worker_concurrency(0), 8)
+        self.assertEqual(engine._bounded_worker_concurrency(5), 8)
+        self.assertEqual(engine._bounded_worker_concurrency("12"), 12)
+        self.assertEqual(engine._bounded_worker_concurrency(50), 50)
+        self.assertEqual(engine._bounded_worker_concurrency(99), 50)
+
     async def test_chat_reply_starter_runs_distinct_departments_in_parallel(self) -> None:
         from app import engine
 
@@ -748,6 +758,46 @@ class RuntimeJobStabilityTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(reply["text"])
         pulse.assert_called_once()
         self.assertEqual(pulse.call_args.args[0]["kind"], "msg_done")
+
+    async def test_claimed_chat_reply_uses_short_chat_timeout(self) -> None:
+        from contextlib import asynccontextmanager
+        from app import engine
+
+        job = SimpleNamespace(
+            id="job_chat_timeout",
+            kind="chat_reply",
+            payload={"threadId": "thread_1", "replyMessageId": "reply_1"},
+        )
+
+        class FakeRepo:
+            def __init__(self) -> None:
+                self.mark_job = mock.AsyncMock()
+
+        repo = FakeRepo()
+
+        @asynccontextmanager
+        async def fake_session_scope():
+            yield object()
+
+        async def fake_wait_for(awaitable, timeout):
+            awaitable.close()
+            self.assertEqual(timeout, 2.5)
+            raise asyncio.TimeoutError()
+
+        settings = SimpleNamespace(engine_job_timeout_s=99.0, chat_reply_timeout_s=2.5)
+        with (
+            mock.patch.object(engine, "session_scope", fake_session_scope),
+            mock.patch.object(engine, "Repo", return_value=repo),
+            mock.patch.object(engine.asyncio, "wait_for", side_effect=fake_wait_for),
+            mock.patch.object(engine, "_handle_job_timeout", new=mock.AsyncMock(return_value={"action": "fail"})) as timeout_handler,
+            mock.patch.object(engine, "now_ms", return_value=123),
+        ):
+            processed = await engine._process_claimed_job_record(job, settings)
+
+        self.assertEqual(processed, 0)
+        timeout_handler.assert_awaited_once()
+        self.assertEqual(timeout_handler.await_args.kwargs["timeout_s"], 2.5)
+        repo.mark_job.assert_awaited_with("job_chat_timeout", "failed", error="TimeoutError: job exceeded 2.5s")
 
     async def test_non_chat_job_timeout_requeues_and_records_recovery(self) -> None:
         from app import engine

@@ -12,6 +12,7 @@ import type {
   MessageAttachment,
   MessageCitation,
   PromptStarter,
+  PreviewKind,
   ThinkingEffort,
   ThreadCostSummary,
   TurnSegment,
@@ -343,13 +344,17 @@ function attachmentIcon(item: MessageAttachment): string {
 
 function previewSnippet(text: string): string {
   const normalized = text.replace(/\r\n/g, '\n').trim()
-  return normalized.length > 900 ? `${normalized.slice(0, 900).trimEnd()}\n…` : normalized
+  return normalized.length > 2400 ? `${normalized.slice(0, 2400).trimEnd()}\n...` : normalized
+}
+
+function isFormattedPreview(kind?: PreviewKind | null): boolean {
+  return kind === 'md' || kind === 'sheet'
 }
 
 type PreviewState =
   | { status: 'idle' }
   | { status: 'loading' }
-  | { status: 'ready'; content: string }
+  | { status: 'ready'; content: string; kind?: PreviewKind }
   | { status: 'empty' }
   | { status: 'error' }
 
@@ -484,7 +489,7 @@ function AttachmentCard({
       .then((res) => {
         if (!live) return
         const content = typeof res.content === 'string' ? previewSnippet(res.content) : ''
-        setPreview(content ? { status: 'ready', content } : { status: 'empty' })
+        setPreview(content ? { status: 'ready', content, kind: res.preview?.kind } : { status: 'empty' })
       })
       .catch(() => {
         if (!live) return
@@ -672,7 +677,11 @@ function AttachmentCard({
   }
 
   return (
-    <div className="min-w-[180px] max-w-[280px] rounded-lg px-2.5 py-2 text-[12px]" style={shellStyle} title={meta || label}>
+    <div
+      className={`min-w-[180px] rounded-lg px-2.5 py-2 text-[12px] ${expanded ? 'max-w-[min(620px,100%)]' : 'max-w-[280px]'}`}
+      style={shellStyle}
+      title={meta || label}
+    >
       <div className="flex min-w-0 items-start gap-2">
         <span className="mt-0.5 w-8 shrink-0 text-[10px] font-semibold" style={{ color: hex }}>{attachmentIcon(item)}</span>
         <div className="min-w-0 flex-1">
@@ -690,16 +699,20 @@ function AttachmentCard({
         {downloadHref && <a href={downloadHref} download className={actionCls}>ดาวน์โหลด</a>}
       </div>
       {expanded && (
-        <div className="mt-2 max-h-36 overflow-y-auto rounded-md px-2 py-1.5 text-[11px] leading-relaxed whitespace-pre-wrap" style={{ background: 'rgba(0,0,0,0.18)' }}>
-          {preview.status === 'loading'
-            ? 'กำลังโหลดพรีวิว…'
-            : preview.status === 'ready'
-              ? preview.content
-              : preview.status === 'empty'
-                ? 'ไม่มีเนื้อหาพรีวิว'
-                : preview.status === 'error'
-                  ? 'พรีวิวไฟล์นี้ไม่ได้'
-                  : null}
+        <div
+          className="mt-2 max-h-80 overflow-y-auto rounded-md px-2.5 py-2 text-[12px] leading-relaxed"
+          style={{ background: 'rgba(0,0,0,0.18)', border: '1px solid var(--color-line-soft)' }}
+        >
+          {preview.status === 'loading' && 'กำลังโหลดพรีวิว...'}
+          {preview.status === 'ready' && (
+            isFormattedPreview(preview.kind) ? (
+              <Markdown text={preview.content} />
+            ) : (
+              <pre className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{preview.content}</pre>
+            )
+          )}
+          {preview.status === 'empty' && 'ไม่มีเนื้อหาพรีวิว'}
+          {preview.status === 'error' && 'พรีวิวไฟล์นี้ไม่ได้'}
         </div>
       )}
     </div>

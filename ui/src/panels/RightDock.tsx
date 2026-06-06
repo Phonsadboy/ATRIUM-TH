@@ -78,7 +78,7 @@ export function RightDock() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [providerAuth, setProviderAuth] = useState<ProviderAuthStatusResponse | null>(null)
   const [providerReference, setProviderReference] = useState<ProviderAuthReferenceResponse | null>(null)
-  const [authBusy, setAuthBusy] = useState<'chatgpt' | 'claude' | null>(null)
+  const [authBusy, setAuthBusy] = useState<'chatgpt' | 'claude' | 'chatgptLogout' | 'claudeLogout' | null>(null)
   const [authError, setAuthError] = useState<string | null>(null)
 
   const targetId = selectedDeptId ?? EXEC_ID
@@ -161,6 +161,36 @@ export function RightDock() {
     }
   }
 
+  const disconnectChatGPT = async () => {
+    if (!confirm('ออกจากบัญชี ChatGPT Account ใน ATRIUM?')) return
+    setAuthBusy('chatgptLogout')
+    setAuthError(null)
+    try {
+      const result = await client.disconnectChatGPTAccount()
+      await refreshProviderAuth()
+      const warning = typeof result.warning === 'string' ? result.warning : ''
+      if (warning) setAuthError(warning)
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setAuthBusy(null)
+    }
+  }
+
+  const disconnectClaudeCode = async () => {
+    if (!confirm('ออกจากบัญชี Claude Code Account บนเครื่องนี้?')) return
+    setAuthBusy('claudeLogout')
+    setAuthError(null)
+    try {
+      await client.disconnectClaudeCode()
+      await refreshProviderAuth(true)
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setAuthBusy(null)
+    }
+  }
+
   const targetIsExec = isExec(targetId)
   useEffect(() => {
     if (!targetIsExec && rightTab === 'watch') setRightTab('chat')
@@ -203,8 +233,10 @@ export function RightDock() {
   const chatgptLogin = chatgptAuth?.login as Record<string, unknown> | null | undefined
   const chatgptReady = authBool(chatgptAuth, 'ready')
   const chatgptPending = authText(chatgptLogin ?? undefined, 'status') === 'pending'
+  const chatgptBusy = authBusy === 'chatgpt' || authBusy === 'chatgptLogout'
   const claudeAuth = providerAuth?.claudeCode
   const claudeReady = authBool(claudeAuth, 'ready')
+  const claudeBusy = authBusy === 'claude' || authBusy === 'claudeLogout'
   const claudeStale = authBool(claudeAuth, 'stale')
   const claudeState = authText(claudeAuth, 'state')
   const claudeProbeStatus = authText(claudeAuth, 'probeStatus')
@@ -400,18 +432,35 @@ export function RightDock() {
                           : 'not connected'}
                     </div>
                   </div>
-                  <button
-                    type="button"
-                    onClick={connectChatGPT}
-                    disabled={authBusy === 'chatgpt'}
-                    className="rounded-lg border px-2.5 py-1.5 text-[12px] transition-colors disabled:opacity-50"
-                    style={{
-                      borderColor: chatgptReady ? withAlpha(ACCENT_HEX.teal, 0.45) : withAlpha(ACCENT_HEX.sky, 0.45),
-                      color: chatgptReady ? ACCENT_HEX.teal : ACCENT_HEX.sky,
-                    }}
-                  >
-                    {authBusy === 'chatgpt' ? 'กำลังเปิด…' : chatgptReady ? 'เชื่อมแล้ว' : chatgptPending ? 'เปิดอีกครั้ง' : 'เชื่อม'}
-                  </button>
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={connectChatGPT}
+                      disabled={chatgptBusy}
+                      className="rounded-lg border px-2.5 py-1.5 text-[12px] transition-colors disabled:opacity-50"
+                      style={{
+                        borderColor: chatgptReady ? withAlpha(ACCENT_HEX.teal, 0.45) : withAlpha(ACCENT_HEX.sky, 0.45),
+                        color: chatgptReady ? ACCENT_HEX.teal : ACCENT_HEX.sky,
+                      }}
+                    >
+                      {authBusy === 'chatgpt' ? 'กำลังเปิด…' : chatgptReady ? 'เชื่อมแล้ว' : chatgptPending ? 'เปิดอีกครั้ง' : 'เชื่อม'}
+                    </button>
+                    {(chatgptReady || chatgptPending) && (
+                      <button
+                        type="button"
+                        onClick={disconnectChatGPT}
+                        disabled={chatgptBusy}
+                        className="rounded-lg border px-2 py-1.5 text-[12px] transition-colors disabled:opacity-50"
+                        style={{
+                          borderColor: withAlpha(STATE_HEX.blocked, 0.38),
+                          color: STATE_HEX.blocked,
+                        }}
+                        title="ออกจากบัญชี ChatGPT Account เพื่อเปลี่ยนบัญชี"
+                      >
+                        {authBusy === 'chatgptLogout' ? 'กำลังออก…' : 'ออก'}
+                      </button>
+                    )}
+                  </div>
                 </div>
 
                 <div className="flex flex-wrap items-center justify-between gap-2">
@@ -421,19 +470,36 @@ export function RightDock() {
                       {claudeReady ? claudeStatus || 'connected' : claudeStatus || 'not connected'}
                     </div>
                   </div>
-                  <button
-                    type="button"
-                    onClick={connectClaudeCode}
-                    disabled={authBusy === 'claude'}
-                    className="rounded-lg border px-2.5 py-1.5 text-[12px] transition-colors disabled:opacity-50"
-                    style={{
-                      borderColor: claudeReady ? withAlpha(ACCENT_HEX.teal, 0.45) : withAlpha(ACCENT_HEX.lavender, 0.45),
-                      color: claudeReady ? ACCENT_HEX.teal : ACCENT_HEX.lavender,
-                    }}
-                    title={claudeReady ? 'ตรวจสอบสถานะ Claude Code อีกครั้ง' : 'เปิด Claude Code login หรือตรวจสอบบัญชี'}
-                  >
-                    {authBusy === 'claude' ? 'กำลังตรวจ…' : claudeReady ? 'ตรวจอีกครั้ง' : 'เชื่อม'}
-                  </button>
+                  <div className="flex shrink-0 items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={connectClaudeCode}
+                      disabled={claudeBusy}
+                      className="rounded-lg border px-2.5 py-1.5 text-[12px] transition-colors disabled:opacity-50"
+                      style={{
+                        borderColor: claudeReady ? withAlpha(ACCENT_HEX.teal, 0.45) : withAlpha(ACCENT_HEX.lavender, 0.45),
+                        color: claudeReady ? ACCENT_HEX.teal : ACCENT_HEX.lavender,
+                      }}
+                      title={claudeReady ? 'ตรวจสอบสถานะ Claude Code อีกครั้ง' : 'เปิด Claude Code login หรือตรวจสอบบัญชี'}
+                    >
+                      {authBusy === 'claude' ? 'กำลังตรวจ…' : claudeReady ? 'ตรวจอีกครั้ง' : 'เชื่อม'}
+                    </button>
+                    {claudeReady && (
+                      <button
+                        type="button"
+                        onClick={disconnectClaudeCode}
+                        disabled={claudeBusy}
+                        className="rounded-lg border px-2 py-1.5 text-[12px] transition-colors disabled:opacity-50"
+                        style={{
+                          borderColor: withAlpha(STATE_HEX.blocked, 0.38),
+                          color: STATE_HEX.blocked,
+                        }}
+                        title="ออกจากบัญชี Claude Code เพื่อเปลี่ยนบัญชี"
+                      >
+                        {authBusy === 'claudeLogout' ? 'กำลังออก…' : 'ออก'}
+                      </button>
+                    )}
+                  </div>
                 </div>
 
                 {authError && <div className="text-[10px] text-[var(--color-coral)]">{authError}</div>}

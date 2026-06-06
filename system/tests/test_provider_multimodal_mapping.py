@@ -17,11 +17,12 @@ from app.provider.claude_code_provider import (
     _AUTH_STATUS_CACHE,
     _AUTH_STATUS_TIMEOUT_S,
     _ClaudeCodeImageContext,
+    disconnect_claude_code,
     _extract_tool_calls,
     claude_code_auth_status,
     _messages_prompt,
 )
-from app.provider.chatgpt_oauth import ChatGPTAccountResponsesProvider
+from app.provider.chatgpt_oauth import ChatGPTAccountResponsesProvider, disconnect_chatgpt_oauth
 from app.provider.openai_provider import OpenAIResponsesProvider
 from app.runtime.turns import _content_to_text
 
@@ -278,6 +279,45 @@ class ProviderMultimodalMappingTest(unittest.TestCase):
         self.assertEqual(status["state"], "unknown")
         self.assertEqual(status["status"], "probe_failed:TimeoutExpired")
         self.assertTrue(status["probeFailed"])
+
+    def test_disconnect_claude_code_invokes_cli_logout_and_clears_cache(self) -> None:
+        logout_result = mock.Mock(returncode=0, stdout="logged out", stderr="")
+        status_result = mock.Mock(
+            returncode=0,
+            stdout=json.dumps({"loggedIn": False}),
+            stderr="not logged in",
+        )
+        _AUTH_STATUS_CACHE["/usr/local/bin/claude"] = (1000.0, {"ready": True})
+
+        with mock.patch("app.provider.claude_code_provider.shutil.which", return_value="/usr/local/bin/claude"):
+            with mock.patch(
+                "app.provider.claude_code_provider.subprocess.run",
+                side_effect=[logout_result, status_result],
+            ) as run:
+                result = disconnect_claude_code("claude")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(run.call_args_list[0].args[0], ["/usr/local/bin/claude", "auth", "logout"])
+        self.assertEqual(result["status"]["state"], "not_logged_in")
+        self.assertIn("/usr/local/bin/claude", _AUTH_STATUS_CACHE)
+
+    def test_disconnect_chatgpt_oauth_removes_store_file(self) -> None:
+        with tempfile.TemporaryDirectory(prefix="atrium-chatgpt-oauth-test-") as tmp:
+            store = Path(tmp) / "chatgpt-account.json"
+            store.write_text(json.dumps({"access": "header.payload.signature"}), encoding="utf-8")
+            settings = mock.Mock(
+                chatgpt_account_oauth_store=store,
+                chatgpt_account_access_token="",
+                chatgpt_account_refresh_token="",
+                chatgpt_account_expires_at="",
+                chatgpt_account_base_url="https://chatgpt.com/backend-api/codex",
+            )
+
+            result = disconnect_chatgpt_oauth(settings)
+
+            self.assertTrue(result["removedStore"])
+            self.assertFalse(store.exists())
+            self.assertFalse(result["status"]["ready"])
 
     def test_responses_provider_retries_empty_visible_output_once(self) -> None:
         class FakeResponse:

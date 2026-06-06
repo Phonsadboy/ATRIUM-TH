@@ -32,7 +32,7 @@ from .catalog import DEFAULT_MODEL, MODELS, PROVIDERS, THINKING_EFFORTS, coerce_
 from .chat_input import resolve_department_mentions
 from .config import get_settings
 from .db import commit_and_release, session_scope
-from .db.repo import Repo, TOOL_CATALOG
+from .db.repo import AGENT_NAME_UPDATED_AT_KEY, Repo, TOOL_CATALOG
 from .events import hub
 from .file_intake import (
     artifact_kind_for_file,
@@ -442,7 +442,7 @@ def chat_tool_system_instructions(departments: list[dict[str, Any]], active_dept
         "use tools before answering. Do not claim that a task, artifact, meeting, finance check, or escalation "
         "was done unless the matching tool result says it succeeded. If a tool fails, explain the failure and "
         "the safest next step. For executive delegation, use create_task instead of guessing silently. "
-        "When using create_task, set reviewIntervalMs so the owner is reminded to inspect progress: urgent 2 minutes, high 3 minutes, normal 5 minutes, low 10 minutes; "
+        "When using create_task, set reviewIntervalMs so the owner is reminded to inspect progress every 10 minutes by default; do not set a lower active interval. "
         "only choose a different interval when the task risk or expected wait time clearly justifies it. "
         "When creating departments or org plans, providerId is required; never omit it or rely on an implicit default. "
         f"{_account_provider_recommendation()}"
@@ -674,7 +674,7 @@ def chat_tool_definitions(departments: list[dict[str, Any]], active_dept: dict[s
                     "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"]},
                     "reviewIntervalMs": {
                         "type": "integer",
-                        "description": "Owner review reminder interval in milliseconds. Recommended: urgent=120000, high=180000, normal=300000, low=600000. Omit to use the priority default; pass 0 to disable only when the owner explicitly asks.",
+                        "description": "Owner review reminder interval in milliseconds. Recommended/default: 600000 (10 minutes) for all priorities. Positive values below 600000 are raised to 600000; pass 0 to disable only when the owner explicitly asks.",
                     },
                     "projectId": project_schema,
                     "watchers": {"type": "array", "items": {"type": "string"}},
@@ -6472,7 +6472,9 @@ async def _rename_self_tool(repo: Repo, args: dict[str, Any], active_dept: dict[
             "department": dept,
         }
     dept["agentName"] = new_name
+    dept[AGENT_NAME_UPDATED_AT_KEY] = now_ms()
     active_dept["agentName"] = new_name
+    active_dept[AGENT_NAME_UPDATED_AT_KEY] = dept[AGENT_NAME_UPDATED_AT_KEY]
     await repo.save_department(dept)
     await repo.add_activity(_activity(
         f"tool rename_self: ผู้บริหารเปลี่ยนชื่อจาก {previous_name} เป็น {new_name}",

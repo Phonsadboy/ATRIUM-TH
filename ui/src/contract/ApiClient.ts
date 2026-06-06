@@ -84,6 +84,7 @@ import type {
   Preference,
   Project,
   ProviderAuthReferenceResponse,
+  ProviderAuthDisconnectResponse,
   ProviderAuthStartResponse,
   ProviderEnvSettingsResponse,
   ProviderEnvUpdate,
@@ -1045,8 +1046,12 @@ export class ApiClient implements CompanyClient {
     this.request('/api/provider-auth/env', 'PATCH', { updates })
   startChatGPTAccountLogin = (): Promise<ProviderAuthStartResponse> =>
     this.request('/api/provider-auth/chatgpt/start', 'POST', { timeoutS: 300 })
+  disconnectChatGPTAccount = (): Promise<ProviderAuthDisconnectResponse> =>
+    this.request('/api/provider-auth/chatgpt/disconnect', 'POST')
   startClaudeCodeLogin = (): Promise<ProviderAuthStartResponse> =>
     this.request('/api/provider-auth/claude-code/start', 'POST')
+  disconnectClaudeCode = (): Promise<ProviderAuthDisconnectResponse> =>
+    this.request('/api/provider-auth/claude-code/disconnect', 'POST')
 
   // ----- Decisions (create/edit) -----
   createDecision = (input: CreateDecisionInput): Promise<Decision> =>

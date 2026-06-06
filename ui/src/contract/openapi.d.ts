@@ -1548,6 +1548,24 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/office-layout": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Office Layout */
+        get: operations["get_office_layout_api_office_layout_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Update Office Layout */
+        patch: operations["update_office_layout_api_office_layout_patch"];
+        trace?: never;
+    };
     "/api/onboarding/org-plans": {
         parameters: {
             query?: never;
@@ -1886,6 +1904,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/provider-auth/chatgpt/disconnect": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Disconnect Chatgpt Provider Auth */
+        post: operations["disconnect_chatgpt_provider_auth_api_provider_auth_chatgpt_disconnect_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/provider-auth/chatgpt/start": {
         parameters: {
             query?: never;
@@ -1897,6 +1932,23 @@ export interface paths {
         put?: never;
         /** Start Chatgpt Provider Auth */
         post: operations["start_chatgpt_provider_auth_api_provider_auth_chatgpt_start_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/provider-auth/claude-code/disconnect": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Disconnect Claude Code Provider Auth */
+        post: operations["disconnect_claude_code_provider_auth_api_provider_auth_claude_code_disconnect_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2087,6 +2139,23 @@ export interface paths {
         get: operations["get_task_api_tasks__task_id__get"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{task_id}/control": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Control Task */
+        post: operations["control_task_api_tasks__task_id__control_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -3107,7 +3176,7 @@ export interface components {
             projectId?: string | null;
             /**
              * Reviewintervalms
-             * @description Owner review reminder interval in milliseconds. Omit for the priority-based default; pass 0 to disable.
+             * @description Owner review reminder interval in milliseconds. Omit for the 10-minute default; positive values below 10 minutes are raised to 10 minutes; pass 0 to disable.
              */
             reviewIntervalMs?: number | null;
             /** Title */
@@ -3566,6 +3635,7 @@ export interface components {
             now: number;
             /** Objectives */
             objectives: components["schemas"]["ScheduledObjective"][];
+            officeLayout?: components["schemas"]["OfficeLayout"];
             permissionPolicy: components["schemas"]["PermissionPolicy"];
             /** Running */
             running: boolean;
@@ -5421,6 +5491,27 @@ export interface components {
              */
             read: boolean;
         };
+        /** OfficeLayout */
+        OfficeLayout: {
+            /** Departmentrooms */
+            departmentRooms?: {
+                [key: string]: number;
+            };
+            /**
+             * Roomcount
+             * @default 1
+             */
+            roomCount: number;
+            /** Roomnames */
+            roomNames?: {
+                [key: string]: string;
+            };
+            /**
+             * Updatedat
+             * @default 0
+             */
+            updatedAt: number;
+        };
         /** OkResponse */
         OkResponse: {
             /** Ok */
@@ -6045,6 +6136,8 @@ export interface components {
         };
         /** Task */
         Task: {
+            /** Blockedlastreason */
+            blockedLastReason?: string | null;
             /** Blockedretrycount */
             blockedRetryCount?: number | null;
             /** Blockedretryguard */
@@ -6114,6 +6207,8 @@ export interface components {
              * @enum {string}
              */
             status: "backlog" | "assigned" | "in_progress" | "review" | "revising" | "waiting" | "done" | "blocked" | "cancelled";
+            /** Statusreason */
+            statusReason?: string | null;
             /** Subtaskids */
             subTaskIds?: string[];
             /** Title */
@@ -6126,6 +6221,38 @@ export interface components {
             } | null;
             /** Watchers */
             watchers?: string[];
+        };
+        /** TaskControlInput */
+        TaskControlInput: {
+            /**
+             * Action
+             * @enum {string}
+             */
+            action: "cancel" | "pause" | "resume" | "submit_partial" | "close";
+            /** Reason */
+            reason?: string | null;
+            /**
+             * Requestedby
+             * @default user
+             * @constant
+             */
+            requestedBy: "user";
+        };
+        /** TaskControlResponse */
+        TaskControlResponse: {
+            /** Approval */
+            approval?: {
+                [key: string]: unknown;
+            } | null;
+            /** Artifact */
+            artifact?: {
+                [key: string]: unknown;
+            } | null;
+            /** Executed */
+            executed: boolean;
+            /** Ok */
+            ok: boolean;
+            task: components["schemas"]["Task"];
         };
         /** ThinkingInput */
         ThinkingInput: {
@@ -6512,6 +6639,19 @@ export interface components {
             /** Title */
             title?: string | null;
         };
+        /** UpdateOfficeLayoutInput */
+        UpdateOfficeLayoutInput: {
+            /** Departmentrooms */
+            departmentRooms?: {
+                [key: string]: number;
+            } | null;
+            /** Roomcount */
+            roomCount?: number | null;
+            /** Roomnames */
+            roomNames?: {
+                [key: string]: string;
+            } | null;
+        };
         /** UpdateOrgPlanInput */
         UpdateOrgPlanInput: {
             /** Departments */
@@ -6577,7 +6717,7 @@ export interface components {
         UpdateTaskReviewScheduleInput: {
             /**
              * Reviewintervalms
-             * @description Owner review reminder interval in milliseconds. Null, 0, or negative disables reminders.
+             * @description Owner review reminder interval in milliseconds. Positive values below 10 minutes are raised to 10 minutes. Null, 0, or negative disables reminders.
              */
             reviewIntervalMs?: number | null;
         };
@@ -10325,6 +10465,59 @@ export interface operations {
             };
         };
     };
+    get_office_layout_api_office_layout_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OfficeLayout"];
+                };
+            };
+        };
+    };
+    update_office_layout_api_office_layout_patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["UpdateOfficeLayoutInput"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["OfficeLayout"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     list_org_plans_api_onboarding_org_plans_get: {
         parameters: {
             query?: {
@@ -11195,6 +11388,28 @@ export interface operations {
             };
         };
     };
+    disconnect_chatgpt_provider_auth_api_provider_auth_chatgpt_disconnect_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+        };
+    };
     start_chatgpt_provider_auth_api_provider_auth_chatgpt_start_post: {
         parameters: {
             query?: never;
@@ -11228,6 +11443,28 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    disconnect_claude_code_provider_auth_api_provider_auth_claude_code_disconnect_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
                 };
             };
         };
@@ -11628,6 +11865,41 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["Task"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    control_task_api_tasks__task_id__control_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskControlInput"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskControlResponse"];
                 };
             };
             /** @description Validation Error */

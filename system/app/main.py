@@ -126,7 +126,7 @@ from .clock import day_key, now_ms
 from .config import get_settings
 from .context_budget import estimate_llm_context_tokens, model_auto_compact_context_tokens
 from .db.base import commit_and_release, dispose_db, init_db, session_scope
-from .db.repo import Repo, TOOL_CATALOG, full_autonomy_status, office_layout_context
+from .db.repo import AGENT_NAME_UPDATED_AT_KEY, Repo, TOOL_CATALOG, full_autonomy_status, office_layout_context
 from .events import hub
 from .file_intake import (
     FilePreview,
@@ -6982,6 +6982,8 @@ async def _patch_department(repo: Repo, dept_id: str, patch: dict[str, Any]) -> 
     if not dept:
         raise HTTPException(status_code=404, detail="department not found")
     clean_patch = {k: v for k, v in patch.items() if v is not None}
+    if "agentName" in clean_patch and str(clean_patch.get("agentName") or "").strip() != str(dept.get("agentName") or "").strip():
+        clean_patch[AGENT_NAME_UPDATED_AT_KEY] = now_ms()
     next_dept = {**dept, **clean_patch}
     raw_model = next_dept.get("model", DEFAULT_MODEL)
     raw_effort = next_dept.get("thinkingEffort", "high")
@@ -7268,8 +7270,8 @@ def _system_prompt(dept: dict[str, Any], memory_context: str = "") -> str:
         base = (
             f"คุณคือ {dept['agentName']} ผู้บริหารของบริษัท AI ATRIUM. "
             "หน้าที่คือรับโจทย์จากผู้ใช้ แตกงาน มอบหมายงาน ตรวจคุณภาพ และสรุปกลับเป็นภาษาไทยที่ชัดเจน. "
-            "เมื่อมอบหมายงานให้ออตโต้/แผนกผ่าน create_task ให้ตั้งรอบปลุกตรวจงานเสมอ: urgent 2 นาที, high 3 นาที, normal 5 นาที, low 10 นาที; "
-            "ถ้าเลือกต่างจากนี้ให้มีเหตุผลจากความเสี่ยงหรือเวลารองาน. "
+            "เมื่อมอบหมายงานให้ออตโต้/แผนกผ่าน create_task ให้ตั้งรอบปลุกตรวจงานทุก 10 นาทีเป็นค่าเริ่มต้น และห้ามตั้งรอบที่เปิดอยู่ต่ำกว่า 10 นาที. "
+            "ถ้าเลือกนานกว่านี้ให้มีเหตุผลจากความเสี่ยงหรือเวลารองาน. "
             "ตอบให้กระชับ มีเหตุผล และพร้อมนำไปปฏิบัติ. "
             "ในการคุยจริงครั้งแรกกับเจ้าของ ให้ถามว่าอยากให้ผู้บริหารคนนี้ชื่ออะไร; "
             "เมื่อเจ้าของบอกชื่อ ให้ใช้ tool rename_self เพื่อบันทึกชื่อนั้นเป็นชื่อของตัวเองก่อนทำงานต่อ."
@@ -8983,11 +8985,35 @@ async def start_chatgpt_provider_auth(input: dict[str, Any] | None = Body(defaul
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
+@app.post("/api/provider-auth/chatgpt/disconnect")
+async def disconnect_chatgpt_provider_auth() -> dict[str, Any]:
+    from .provider.chatgpt_oauth import ChatGPTAccountOAuthError, disconnect_chatgpt_oauth
+
+    try:
+        result = disconnect_chatgpt_oauth(get_settings())
+    except ChatGPTAccountOAuthError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    hub.mark_dirty()
+    return result
+
+
 @app.post("/api/provider-auth/claude-code/start")
 async def start_claude_code_provider_auth() -> dict[str, Any]:
     from .provider.claude_code_provider import start_claude_code_login
 
     return start_claude_code_login(get_settings().claude_code_command)
+
+
+@app.post("/api/provider-auth/claude-code/disconnect")
+async def disconnect_claude_code_provider_auth() -> dict[str, Any]:
+    from .provider.claude_code_provider import disconnect_claude_code
+
+    try:
+        result = await asyncio.to_thread(disconnect_claude_code, get_settings().claude_code_command)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    hub.mark_dirty()
+    return result
 
 
 @app.post("/api/runtime/checkpoints/{department_id}")

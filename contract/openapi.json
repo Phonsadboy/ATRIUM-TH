@@ -1365,7 +1365,7 @@
                 "type": "null"
               }
             ],
-            "description": "Owner review reminder interval in milliseconds. Omit for the priority-based default; pass 0 to disable.",
+            "description": "Owner review reminder interval in milliseconds. Omit for the 10-minute default; positive values below 10 minutes are raised to 10 minutes; pass 0 to disable.",
             "title": "Reviewintervalms"
           },
           "title": {
@@ -2943,6 +2943,9 @@
             },
             "title": "Objectives",
             "type": "array"
+          },
+          "officeLayout": {
+            "$ref": "#/components/schemas/OfficeLayout"
           },
           "permissionPolicy": {
             "$ref": "#/components/schemas/PermissionPolicy"
@@ -8631,6 +8634,36 @@
         "title": "NotificationReadInput",
         "type": "object"
       },
+      "OfficeLayout": {
+        "properties": {
+          "departmentRooms": {
+            "additionalProperties": {
+              "type": "integer"
+            },
+            "title": "Departmentrooms",
+            "type": "object"
+          },
+          "roomCount": {
+            "default": 1,
+            "title": "Roomcount",
+            "type": "integer"
+          },
+          "roomNames": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Roomnames",
+            "type": "object"
+          },
+          "updatedAt": {
+            "default": 0,
+            "title": "Updatedat",
+            "type": "integer"
+          }
+        },
+        "title": "OfficeLayout",
+        "type": "object"
+      },
       "OkResponse": {
         "properties": {
           "ok": {
@@ -10533,6 +10566,17 @@
       },
       "Task": {
         "properties": {
+          "blockedLastReason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Blockedlastreason"
+          },
           "blockedRetryCount": {
             "anyOf": [
               {
@@ -10773,6 +10817,17 @@
             "title": "Status",
             "type": "string"
           },
+          "statusReason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Statusreason"
+          },
           "subTaskIds": {
             "items": {
               "type": "string"
@@ -10820,6 +10875,89 @@
           "updatedAt"
         ],
         "title": "Task",
+        "type": "object"
+      },
+      "TaskControlInput": {
+        "properties": {
+          "action": {
+            "enum": [
+              "cancel",
+              "pause",
+              "resume",
+              "submit_partial",
+              "close"
+            ],
+            "title": "Action",
+            "type": "string"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "requestedBy": {
+            "const": "user",
+            "default": "user",
+            "title": "Requestedby",
+            "type": "string"
+          }
+        },
+        "required": [
+          "action"
+        ],
+        "title": "TaskControlInput",
+        "type": "object"
+      },
+      "TaskControlResponse": {
+        "properties": {
+          "approval": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Approval"
+          },
+          "artifact": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Artifact"
+          },
+          "executed": {
+            "title": "Executed",
+            "type": "boolean"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          },
+          "task": {
+            "$ref": "#/components/schemas/Task"
+          }
+        },
+        "required": [
+          "ok",
+          "task",
+          "executed"
+        ],
+        "title": "TaskControlResponse",
         "type": "object"
       },
       "ThinkingInput": {
@@ -12036,6 +12174,51 @@
         "title": "UpdateObjectiveInput",
         "type": "object"
       },
+      "UpdateOfficeLayoutInput": {
+        "properties": {
+          "departmentRooms": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "integer"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Departmentrooms"
+          },
+          "roomCount": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Roomcount"
+          },
+          "roomNames": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Roomnames"
+          }
+        },
+        "title": "UpdateOfficeLayoutInput",
+        "type": "object"
+      },
       "UpdateOrgPlanInput": {
         "properties": {
           "departments": {
@@ -12350,7 +12533,7 @@
                 "type": "null"
               }
             ],
-            "description": "Owner review reminder interval in milliseconds. Null, 0, or negative disables reminders.",
+            "description": "Owner review reminder interval in milliseconds. Positive values below 10 minutes are raised to 10 minutes. Null, 0, or negative disables reminders.",
             "title": "Reviewintervalms"
           }
         },
@@ -18760,6 +18943,60 @@
         "summary": "Toggle Objective"
       }
     },
+    "/api/office-layout": {
+      "get": {
+        "operationId": "get_office_layout_api_office_layout_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfficeLayout"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Office Layout"
+      },
+      "patch": {
+        "operationId": "update_office_layout_api_office_layout_patch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateOfficeLayoutInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OfficeLayout"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Office Layout"
+      }
+    },
     "/api/onboarding/org-plans": {
       "get": {
         "operationId": "list_org_plans_api_onboarding_org_plans_get",
@@ -19871,6 +20108,26 @@
         "summary": "Resolve Project"
       }
     },
+    "/api/provider-auth/chatgpt/disconnect": {
+      "post": {
+        "operationId": "disconnect_chatgpt_provider_auth_api_provider_auth_chatgpt_disconnect_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Disconnect Chatgpt Provider Auth Api Provider Auth Chatgpt Disconnect Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Disconnect Chatgpt Provider Auth"
+      }
+    },
     "/api/provider-auth/chatgpt/start": {
       "post": {
         "operationId": "start_chatgpt_provider_auth_api_provider_auth_chatgpt_start_post",
@@ -19917,6 +20174,26 @@
           }
         },
         "summary": "Start Chatgpt Provider Auth"
+      }
+    },
+    "/api/provider-auth/claude-code/disconnect": {
+      "post": {
+        "operationId": "disconnect_claude_code_provider_auth_api_provider_auth_claude_code_disconnect_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Disconnect Claude Code Provider Auth Api Provider Auth Claude Code Disconnect Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Disconnect Claude Code Provider Auth"
       }
     },
     "/api/provider-auth/claude-code/start": {
@@ -20453,6 +20730,55 @@
           }
         },
         "summary": "Get Task"
+      }
+    },
+    "/api/tasks/{task_id}/control": {
+      "post": {
+        "operationId": "control_task_api_tasks__task_id__control_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "task_id",
+            "required": true,
+            "schema": {
+              "title": "Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TaskControlInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TaskControlResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Control Task"
       }
     },
     "/api/tasks/{task_id}/reassign": {

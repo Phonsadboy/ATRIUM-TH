@@ -367,6 +367,12 @@ class Settings(BaseSettings):
     # forever. Long model turns can still run for many minutes; exceeding this
     # marks the job failed so the next tick can continue with other work.
     engine_job_timeout_s: float = 1800.0
+    # Chat replies are user-visible and serialize per department, so keep their
+    # timeout shorter than long-running background work.
+    chat_reply_timeout_s: float = Field(
+        default=300.0,
+        validation_alias=AliasChoices("ATRIUM_CHAT_REPLY_TIMEOUT_S", "CHAT_REPLY_TIMEOUT_S"),
+    )
     engine_tick_timeout_s: float = 1800.0
     engine_stale_after_s: float = 600.0
     # Visibility-only threshold for surfacing active jobs that have retried often.
@@ -375,11 +381,11 @@ class Settings(BaseSettings):
     # Timeout recovery delay before non-chat jobs are retried. This is not a cap.
     engine_timeout_retry_delay_s: float = 60.0
     chat_reply_worker_concurrency: int = Field(
-        default=5,
+        default=8,
         validation_alias=AliasChoices("ATRIUM_CHAT_REPLY_WORKER_CONCURRENCY", "CHAT_REPLY_WORKER_CONCURRENCY"),
     )
     department_worker_concurrency: int = Field(
-        default=5,
+        default=8,
         validation_alias=AliasChoices("ATRIUM_DEPARTMENT_WORKER_CONCURRENCY", "DEPARTMENT_WORKER_CONCURRENCY"),
     )
     max_handoff_depth: int = 5

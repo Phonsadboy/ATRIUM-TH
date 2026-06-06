@@ -235,6 +235,52 @@ def start_claude_code_login(command: str = "claude") -> dict[str, Any]:
     return {"started": False, "mode": "manual", "command": login_command, "status": status}
 
 
+def disconnect_claude_code(command: str = "claude", timeout_s: float = 30.0) -> dict[str, Any]:
+    resolved = shutil.which(command) if "/" not in command else command if Path(command).exists() else None
+    logout_command = f"{command} auth logout"
+    if not resolved:
+        return {
+            "ok": True,
+            "provider": "claude_code",
+            "started": False,
+            "mode": "missing",
+            "command": logout_command,
+            "status": claude_code_auth_status(command),
+        }
+    with _AUTH_STATUS_LOCK:
+        _AUTH_STATUS_CACHE.pop(resolved, None)
+    try:
+        proc = subprocess.run(
+            [resolved, "auth", "logout"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=max(float(timeout_s or 30.0), 1.0),
+        )
+    except Exception as exc:
+        with _AUTH_STATUS_LOCK:
+            _AUTH_STATUS_CACHE.pop(resolved, None)
+        raise RuntimeError(f"Claude Code logout failed: {type(exc).__name__}: {exc}") from exc
+    with _AUTH_STATUS_LOCK:
+        _AUTH_STATUS_CACHE.pop(resolved, None)
+    status = claude_code_auth_status(command)
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or f"exit {proc.returncode}").strip()
+        raise RuntimeError(f"Claude Code logout failed: {detail[:400]}")
+    return {
+        "ok": not bool(status.get("ready")),
+        "provider": "claude_code",
+        "started": True,
+        "mode": "cli",
+        "command": logout_command,
+        "returnCode": proc.returncode,
+        "stdout": (proc.stdout or "")[:400],
+        "stderr": (proc.stderr or "")[:400],
+        "status": status,
+    }
+
+
 def _image_extension(mime: str) -> str:
     return _IMAGE_EXTENSIONS.get(mime.lower(), ".img")
 

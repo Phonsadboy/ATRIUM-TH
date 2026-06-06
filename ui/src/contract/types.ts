@@ -1818,6 +1818,14 @@ export interface ProviderAuthStartResponse {
   statusDetail?: Record<string, unknown>
 }
 
+export interface ProviderAuthDisconnectResponse {
+  ok?: boolean
+  provider?: string
+  warning?: string | null
+  status?: Record<string, unknown>
+  [key: string]: unknown
+}
+
 export type ProviderEnvFieldKind = 'text' | 'secret' | 'number' | 'boolean' | 'select'
 
 export interface ProviderEnvField {

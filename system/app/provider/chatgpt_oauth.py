@@ -313,6 +313,42 @@ def chatgpt_oauth_status(settings: Settings) -> dict[str, Any]:
     }
 
 
+def disconnect_chatgpt_oauth(settings: Settings) -> dict[str, Any]:
+    """Remove ATRIUM's app-scoped ChatGPT OAuth store and cancel pending UI login."""
+    global _ACTIVE_LOGIN
+    store_path = _resolve_store_path(settings)
+    before = chatgpt_oauth_status(settings)
+    removed = False
+    with _credential_file_lock(store_path):
+        if store_path.exists():
+            store_path.unlink()
+            removed = True
+    with _ACTIVE_LOGIN_LOCK:
+        if _ACTIVE_LOGIN and _ACTIVE_LOGIN.get("status") == "pending":
+            _ACTIVE_LOGIN.update({
+                "status": "cancelled",
+                "error": "ChatGPT OAuth login cancelled by logout",
+                "completedAt": _now_ms(),
+            })
+    after = chatgpt_oauth_status(settings)
+    env_backed = after.get("source") == "env"
+    return {
+        "ok": not after.get("ready"),
+        "provider": "chatgpt_account",
+        "removedStore": removed,
+        "storePath": str(store_path),
+        "sourceBefore": before.get("source"),
+        "sourceAfter": after.get("source"),
+        "envBacked": env_backed,
+        "warning": (
+            "ChatGPT account auth is still supplied by ATRIUM_CHATGPT_ACCOUNT_ACCESS_TOKEN or CHATGPT_ACCOUNT_ACCESS_TOKEN"
+            if env_backed
+            else None
+        ),
+        "status": after,
+    }
+
+
 class ChatGPTCodexOAuthTokenProvider:
     def __init__(self, settings: Settings):
         self.settings = settings
