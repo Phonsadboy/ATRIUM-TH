@@ -124,15 +124,35 @@ fi
 
 echo
 echo "== Enable pnpm =="
-corepack enable
-corepack prepare pnpm@latest --activate
+# `corepack enable` writes a /usr/bin/pnpm symlink and needs root.
+# `corepack prepare --activate` writes to the current user's cache and must run
+# without sudo so later pnpm calls do not fall back to the latest release.
+sudo corepack enable
+corepack prepare pnpm@10.15.0 --activate
 
 echo
 echo "== Check Docker Desktop WSL integration =="
-if ! docker version >/dev/null 2>&1; then
+docker_ready=0
+for _ in $(seq 1 60); do
+  if docker version >/dev/null 2>&1; then
+    docker_ready=1
+    break
+  fi
+  echo "Waiting for Docker Desktop WSL integration..."
+  sleep 5
+done
+if [ "$docker_ready" != "1" ]; then
   echo "Docker is not reachable from WSL."
-  echo "Open Docker Desktop on Windows, enable Settings > Resources > WSL Integration for this Ubuntu distro, then rerun this script."
-  exit 2
+  echo "Open Docker Desktop on Windows and enable Settings > Resources > WSL Integration for this Ubuntu distro."
+  if [ -r /dev/tty ]; then
+    read -r -p "Press Enter after Docker Desktop is running and WSL integration is enabled..." _ </dev/tty || true
+  else
+    echo "Rerun this script after Docker Desktop is running and WSL integration is enabled."
+  fi
+  if ! docker version >/dev/null 2>&1; then
+    echo "Docker is still not reachable from WSL. Finish Docker Desktop setup, then rerun this script."
+    exit 2
+  fi
 fi
 
 case "$INSTALL_PATH" in
@@ -140,7 +160,9 @@ case "$INSTALL_PATH" in
     INSTALL_DIR="$HOME"
     ;;
   "~/"*)
-    INSTALL_DIR="$HOME/${INSTALL_PATH#~/}"
+    # Avoid `${INSTALL_PATH#~/}` here. Bash can expand the `~/` pattern before
+    # prefix removal, leaving a literal `$HOME/~/...` install path.
+    INSTALL_DIR="$HOME/${INSTALL_PATH:2}"
     ;;
   *)
     INSTALL_DIR="$INSTALL_PATH"
@@ -164,15 +186,11 @@ else
 fi
 
 echo
-echo "== Bootstrap ATRIUM =="
-./atrium doctor
-./atrium bootstrap --full
-
+echo "== Run ATRIUM guided setup =="
 if [ "$START_STACK" = "1" ]; then
-  echo
-  echo "== Start ATRIUM =="
-  ./atrium start
-  ./atrium status
+  ./atrium setup --yes
+else
+  ./atrium setup --yes --no-start
 fi
 
 echo
@@ -184,14 +202,11 @@ $bashScript = $bashScript.Replace("__ATRIUM_REPO_URL__", $repoUrlQuoted)
 $bashScript = $bashScript.Replace("__ATRIUM_INSTALL_PATH__", $installPathQuoted)
 $bashScript = $bashScript.Replace("__ATRIUM_START_STACK__", $startStack)
 
-$tempScript = Join-Path $env:TEMP ("atrium-wsl-install-" + [Guid]::NewGuid().ToString("N") + ".sh")
-Set-Content -Path $tempScript -Value $bashScript -Encoding ascii
-
-try {
-    Write-Step "Run ATRIUM setup inside WSL"
-    $wslScriptPath = ((& wsl -d $Distro -- wslpath -a $tempScript) | Select-Object -Last 1).Trim()
-    & wsl -d $Distro -- bash $wslScriptPath
-}
-finally {
-    Remove-Item -Path $tempScript -ErrorAction SilentlyContinue
+Write-Step "Run ATRIUM setup inside WSL"
+# Pipe the bash script through stdin instead of translating a Windows temp path
+# with `wslpath`. Some Windows/PowerShell combinations mangle backslashes and
+# make `wslpath -a` return no usable path.
+$bashScript -replace "`r`n", "`n" | & wsl -d $Distro -- bash -s
+if ($LASTEXITCODE -ne 0) {
+    throw "WSL bash script exited with code $LASTEXITCODE"
 }

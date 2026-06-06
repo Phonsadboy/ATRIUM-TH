@@ -62,6 +62,24 @@ FULL_STACK_DEFAULTS = {
 UI_DEFAULTS = {"VITE_ATRIUM_API_URL": BACKEND_URL}
 
 
+def ensure_common_paths() -> None:
+    candidates = [
+        str(Path.home() / ".local" / "bin"),
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/Applications/Docker.app/Contents/Resources/bin",
+    ]
+    current = os.environ.get("PATH", "")
+    parts = current.split(os.pathsep) if current else []
+    changed = False
+    for candidate in reversed(candidates):
+        if Path(candidate).exists() and candidate not in parts:
+            parts.insert(0, candidate)
+            changed = True
+    if changed:
+        os.environ["PATH"] = os.pathsep.join(parts)
+
+
 @dataclass
 class CommandResult:
     returncode: int
@@ -157,7 +175,35 @@ def run(
     return result
 
 
+def run_interactive(
+    args: Sequence[str],
+    *,
+    cwd: Path = ROOT,
+    dry_run: bool = False,
+    env: dict[str, str] | None = None,
+) -> CommandResult:
+    if dry_run:
+        print(f"[DRY-RUN] {' '.join(args)}")
+        return CommandResult(0, "", "")
+    print(f"$ {' '.join(args)}")
+    try:
+        completed = subprocess.run(list(args), cwd=str(cwd), env=env)
+    except FileNotFoundError:
+        raise StepFailure(f"{args[0]} not found") from None
+    if completed.returncode != 0:
+        raise StepFailure(f"{' '.join(args)} failed with exit code {completed.returncode}")
+    return CommandResult(completed.returncode, "", "")
+
+
 def command_path(name: str) -> str | None:
+    if name == "brew":
+        for candidate in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew"):
+            if Path(candidate).exists():
+                return candidate
+    if name == "docker":
+        candidate = "/Applications/Docker.app/Contents/Resources/bin/docker"
+        if Path(candidate).exists():
+            return candidate
     return shutil.which(name)
 
 
@@ -165,13 +211,118 @@ def docker_compose_cmd() -> list[str] | None:
     docker = command_path("docker")
     if not docker:
         return None
-    compose = run(["docker", "compose", "version"], timeout=10)
+    compose = run([docker, "compose", "version"], timeout=10)
     if compose.returncode == 0:
-        return ["docker", "compose"]
+        return [docker, "compose"]
     legacy = command_path("docker-compose")
     if legacy:
         return [legacy]
     return None
+
+
+def running_in_wsl() -> bool:
+    marker = Path("/proc/sys/kernel/osrelease")
+    if not marker.exists():
+        return False
+    try:
+        return "microsoft" in marker.read_text(encoding="utf-8", errors="ignore").lower()
+    except OSError:
+        return False
+
+
+def prompt_enter(message: str, *, assume_yes: bool = False, always: bool = False) -> None:
+    if assume_yes and not always:
+        return
+    if not sys.stdin.isatty():
+        print_info("manual step", message)
+        return
+    print(message)
+    input("Press Enter when ready...")
+
+
+def install_homebrew(*, dry_run: bool = False) -> None:
+    if platform.system() != "Darwin":
+        raise StepFailure(
+            "Homebrew auto-install is only supported on macOS",
+            next_step="Install the missing tools for this OS, then rerun ./atrium setup.",
+        )
+    if command_path("brew"):
+        return
+    print_header("Install Homebrew")
+    env = os.environ.copy()
+    env.setdefault("NONINTERACTIVE", "1")
+    run_interactive(
+        [
+            "/bin/bash",
+            "-c",
+            '/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"',
+        ],
+        dry_run=dry_run,
+        env=env,
+    )
+    ensure_common_paths()
+    if not command_path("brew"):
+        raise StepFailure(
+            "Homebrew installed but brew is not on PATH yet",
+            next_step='Restart Terminal, or run: eval "$(/opt/homebrew/bin/brew shellenv)"',
+        )
+
+
+def open_docker_desktop() -> bool:
+    if platform.system() == "Darwin" and Path("/Applications/Docker.app").exists():
+        run(["open", "-a", "Docker"], timeout=10)
+        return True
+    if running_in_wsl() and command_path("powershell.exe"):
+        run(
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-Command",
+                "Start-Process 'Docker Desktop'",
+            ],
+            timeout=20,
+        )
+        return True
+    return False
+
+
+def docker_ready() -> bool:
+    docker = command_path("docker")
+    if not docker:
+        return False
+    return run([docker, "info"], timeout=15).returncode == 0
+
+
+def wait_for_docker_ready(*, seconds: int = 240, assume_yes: bool = False) -> bool:
+    if docker_ready():
+        return True
+    opened = open_docker_desktop()
+    if opened:
+        print_info("Docker Desktop", f"opened; waiting up to {seconds}s")
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        if docker_ready():
+            print_check(True, "Docker", "running")
+            return True
+        time.sleep(3)
+    prompt_enter(
+        "Open Docker Desktop and finish any first-run, license, password, or WSL integration prompt.",
+        assume_yes=assume_yes,
+        always=True,
+    )
+    return docker_ready()
+
+
+def open_frontend_url() -> None:
+    if platform.system() == "Darwin":
+        run(["open", FRONTEND_URL], timeout=10)
+        return
+    if running_in_wsl() and command_path("cmd.exe"):
+        run(["cmd.exe", "/C", "start", "", FRONTEND_URL], timeout=10)
+        return
+    opener = command_path("xdg-open")
+    if opener:
+        run([opener, FRONTEND_URL], timeout=10)
 
 
 def ensure_repo_root() -> None:
@@ -273,6 +424,25 @@ def parse_env_file(path: Path) -> dict[str, str]:
     return values
 
 
+def configured_ollama_url() -> str:
+    values = parse_env_file(SYSTEM_ENV)
+    return (
+        os.environ.get("ATRIUM_OLLAMA_BASE_URL")
+        or values.get("ATRIUM_OLLAMA_BASE_URL")
+        or ""
+    ).strip()
+
+
+def uses_external_ollama(url: str | None = None) -> bool:
+    value = (url if url is not None else configured_ollama_url()).strip().lower()
+    if not value:
+        return False
+    return not any(
+        marker in value
+        for marker in ("://127.0.0.1", "://localhost", "://ollama:")
+    )
+
+
 def render_env_status(path: Path, keys: Iterable[str]) -> list[str]:
     values = parse_env_file(path)
     return [f"{key}={redact_value(key, values.get(key))}" for key in keys]
@@ -341,36 +511,72 @@ def run_or_plan(args: Sequence[str], *, cwd: Path = ROOT, dry_run: bool = False,
     return result
 
 
-def install_missing_tools(dry_run: bool) -> None:
+def install_missing_tools(
+    dry_run: bool,
+    *,
+    auto_homebrew: bool = False,
+    wait_docker: bool = False,
+    assume_yes: bool = False,
+) -> None:
     required = ["git", "node", "pnpm", "uv"]
     missing = [tool for tool in required if not command_path(tool)]
     brew = command_path("brew")
     if missing:
         if not brew:
-            raise StepFailure(
-                f"missing tools: {', '.join(missing)}",
-                next_step="Install Homebrew from https://brew.sh, then run ./atrium bootstrap --full again.",
-            )
-        run_or_plan(["brew", "install", *missing], dry_run=dry_run, timeout=900)
+            if auto_homebrew and platform.system() == "Darwin":
+                install_homebrew(dry_run=dry_run)
+                brew = command_path("brew")
+            if not brew:
+                next_step = "Install Homebrew from https://brew.sh, then run ./atrium setup again."
+                if running_in_wsl():
+                    next_step = "Run the Windows installer from Administrator PowerShell so it can prepare WSL dependencies."
+                raise StepFailure(
+                    f"missing tools: {', '.join(missing)}",
+                    next_step=next_step,
+                )
+        assert brew is not None
+        run_interactive([brew, "install", *missing], dry_run=dry_run)
+        ensure_common_paths()
     if not command_path("docker"):
         if not brew:
+            if auto_homebrew and platform.system() == "Darwin":
+                install_homebrew(dry_run=dry_run)
+                brew = command_path("brew")
+            if not brew:
+                next_step = "Install Docker Desktop, open it once, then run ./atrium setup again."
+                if running_in_wsl():
+                    next_step = "Open Docker Desktop on Windows, enable WSL integration for Ubuntu, then rerun ./atrium setup."
+                raise StepFailure(
+                    "Docker is missing",
+                    next_step=next_step,
+                )
+        assert brew is not None
+        run_interactive([brew, "install", "--cask", "docker"], dry_run=dry_run)
+        ensure_common_paths()
+        if dry_run:
+            return
+        if wait_docker and not dry_run:
+            if wait_for_docker_ready(assume_yes=assume_yes):
+                pass
+            else:
+                raise StepFailure(
+                    "Docker Desktop is installed but not ready",
+                    next_step="Open Docker Desktop, finish first-run setup, then run ./atrium setup again.",
+                )
+        else:
             raise StepFailure(
-                "Docker is missing",
-                next_step="Install Docker Desktop, open it once, then run ./atrium bootstrap --full again.",
+                "Docker Desktop may need a GUI start after installation",
+                next_step="Open Docker Desktop and wait until it says it is running, then run ./atrium setup again.",
             )
-        run_or_plan(["brew", "install", "--cask", "docker"], dry_run=dry_run, timeout=900)
-        raise StepFailure(
-            "Docker Desktop may need a GUI start after installation",
-            next_step="Open Docker Desktop and wait until it says it is running, then run ./atrium bootstrap --full again.",
-        )
     if not chrome_installed() and brew:
-        run_or_plan(["brew", "install", "--cask", "google-chrome"], dry_run=dry_run, timeout=900)
+        run_interactive([brew, "install", "--cask", "google-chrome"], dry_run=dry_run)
 
 
 def assert_docker_ready() -> None:
-    if not command_path("docker"):
+    docker = command_path("docker")
+    if not docker:
         raise StepFailure("Docker is not installed", next_step="Install Docker Desktop and run ./atrium bootstrap --full again.")
-    result = run(["docker", "info"], timeout=15)
+    result = run([docker, "info"], timeout=15)
     if result.returncode != 0:
         raise StepFailure(
             "Docker is not running",
@@ -423,7 +629,7 @@ def command_doctor(_args: argparse.Namespace) -> int:
     ensure_repo_root()
     print_header("Machine")
     print_info("repo", str(ROOT))
-    print_info("macOS", platform.platform())
+    print_info("OS", platform.platform())
     print_info("CPU", platform.machine() or "unknown")
     print_info("RAM", memory_gb())
     risky, detail = is_i_cloud_risky(ROOT)
@@ -500,7 +706,12 @@ def command_bootstrap(args: argparse.Namespace) -> int:
             print_info("filled", ", ".join(update.changed_keys))
 
     print_header("Install Tools")
-    install_missing_tools(args.dry_run)
+    install_missing_tools(
+        args.dry_run,
+        auto_homebrew=bool(getattr(args, "auto_homebrew", False)),
+        wait_docker=bool(getattr(args, "wait_docker", False)),
+        assume_yes=bool(getattr(args, "yes", False)),
+    )
 
     print_header("Install Dependencies")
     run_or_plan(["uv", "sync", "--extra", "live", "--extra", "postgres", "--extra", "graph"], cwd=SYSTEM_DIR, dry_run=args.dry_run, timeout=1200)
@@ -508,11 +719,34 @@ def command_bootstrap(args: argparse.Namespace) -> int:
 
     print_header("Docker Stack")
     if not args.dry_run:
-        assert_docker_ready()
+        if bool(getattr(args, "wait_docker", False)):
+            if not wait_for_docker_ready(assume_yes=bool(getattr(args, "yes", False))):
+                raise StepFailure(
+                    "Docker is not running",
+                    next_step="Open Docker Desktop, wait until Docker is ready, then run ./atrium setup again.",
+                )
+        else:
+            assert_docker_ready()
     else:
         print("[DRY-RUN] docker info")
-    compose(["up", "-d", "postgres", "ollama"], dry_run=args.dry_run, timeout=600)
-    compose(["exec", "ollama", "ollama", "pull", "bge-m3"], dry_run=args.dry_run, timeout=1200)
+    ollama_url = configured_ollama_url()
+    if uses_external_ollama(ollama_url):
+        print_info("Ollama", f"using external service at {ollama_url}; skipping container and model pull")
+        compose(["up", "-d", "postgres"], dry_run=args.dry_run, timeout=600)
+    else:
+        compose(["up", "-d", "postgres", "ollama"], dry_run=args.dry_run, timeout=600)
+        try:
+            compose(["exec", "ollama", "ollama", "pull", "bge-m3"], dry_run=args.dry_run, timeout=1200)
+        except StepFailure as exc:
+            print()
+            print("[WARN] Could not pull bge-m3 in the Ollama container.")
+            reason = str(exc).strip()
+            if reason:
+                print(f"       Reason: {reason[:200]}")
+            print("       Continuing; embeddings will not work until the model is available.")
+            print("       Resolve with either of:")
+            print("         1) docker compose exec ollama ollama pull bge-m3")
+            print("         2) set ATRIUM_OLLAMA_BASE_URL to an Ollama service that already has bge-m3")
 
     print_header("Database")
     run_or_plan(["uv", "run", "--extra", "postgres", "alembic", "-c", "alembic.ini", "upgrade", "head"], cwd=SYSTEM_DIR, dry_run=args.dry_run, timeout=600)
@@ -530,11 +764,70 @@ def assert_port_available_for_start(port: int, label: str) -> None:
     )
 
 
+def atrium_services_running() -> bool:
+    health, _, _ = http_get_json(f"{BACKEND_URL}/health", timeout=2.0)
+    return health and port_open(5173)
+
+
+def command_setup(args: argparse.Namespace) -> int:
+    ensure_repo_root()
+    print_header("ATRIUM Guided Setup")
+    print_info("goal", f"install, start, verify, then open {FRONTEND_URL}")
+    print_info("repo", str(ROOT))
+    if args.dry_run:
+        print_info("mode", "dry-run; no files, services, or installs will be changed")
+    elif not args.yes:
+        prompt_enter(
+            "This setup can install Homebrew packages, Docker Desktop, Python/Node dependencies, and start local services.",
+            assume_yes=args.yes,
+        )
+
+    print_header("Preflight")
+    command_doctor(args)
+
+    print_header("Bootstrap")
+    bootstrap_args = argparse.Namespace(
+        full=True,
+        dry_run=args.dry_run,
+        auto_homebrew=True,
+        wait_docker=True,
+        yes=args.yes,
+    )
+    command_bootstrap(bootstrap_args)
+
+    if args.no_start:
+        print("\nSetup prepared ATRIUM without starting services.")
+        return 0
+    if args.dry_run:
+        print("\n[DRY-RUN] ./atrium start")
+        print("[DRY-RUN] ./atrium status")
+        return 0
+
+    print_header("Start")
+    start_args = argparse.Namespace(force=args.force, wait_seconds=args.wait_seconds)
+    command_start(start_args)
+
+    print_header("Verify")
+    command_status(args)
+
+    if not args.no_open:
+        print_header("Open")
+        open_frontend_url()
+        print_info("frontend", FRONTEND_URL)
+    return 0
+
+
 def command_start(args: argparse.Namespace) -> int:
     ensure_repo_root()
     if not command_path("screen"):
         raise StepFailure("screen is unavailable", next_step="Install screen or start backend/frontend in separate terminals.")
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not args.force and atrium_services_running():
+        print_info("ATRIUM", "backend and frontend already look reachable")
+        print(f"\nFrontend: {FRONTEND_URL}")
+        print(f"Backend:  {BACKEND_URL}")
+        return 0
 
     if not args.force:
         assert_port_available_for_start(8787, "backend")
@@ -542,8 +835,15 @@ def command_start(args: argparse.Namespace) -> int:
 
     print_header("Start Docker")
     if command_path("docker") and docker_compose_cmd():
-        if run(["docker", "info"], timeout=10).returncode == 0:
-            compose(["up", "-d", "postgres", "ollama"], timeout=300)
+        docker = command_path("docker")
+        assert docker is not None
+        if run([docker, "info"], timeout=10).returncode == 0:
+            ollama_url = configured_ollama_url()
+            if uses_external_ollama(ollama_url):
+                print_info("Ollama", f"using external service at {ollama_url}; skipping container")
+                compose(["up", "-d", "postgres"], timeout=300)
+            else:
+                compose(["up", "-d", "postgres", "ollama"], timeout=300)
         else:
             print_check(False, "Docker", "not running; open Docker Desktop if full stack services are missing")
 
@@ -620,8 +920,9 @@ def command_status(_args: argparse.Namespace) -> int:
         print_info(f"{label} :{port}", port_owner(port) if port_open(port) else "free")
 
     print_header("Docker")
-    if command_path("docker") and docker_compose_cmd():
-        if run(["docker", "info"], timeout=10).returncode == 0:
+    docker = command_path("docker")
+    if docker and docker_compose_cmd():
+        if run([docker, "info"], timeout=10).returncode == 0:
             cmd = docker_compose_cmd()
             assert cmd is not None
             result = run([*cmd, "ps"], timeout=30)
@@ -748,7 +1049,19 @@ def build_parser() -> argparse.ArgumentParser:
     bootstrap = sub.add_parser("bootstrap", help="prepare the full local stack")
     bootstrap.add_argument("--full", action="store_true", help="prepare Postgres/Ollama/backend/frontend")
     bootstrap.add_argument("--dry-run", action="store_true", help="print planned actions without changing files or services")
+    bootstrap.add_argument("--auto-homebrew", action="store_true", help=argparse.SUPPRESS)
+    bootstrap.add_argument("--wait-docker", action="store_true", help=argparse.SUPPRESS)
+    bootstrap.add_argument("-y", "--yes", action="store_true", help=argparse.SUPPRESS)
     bootstrap.set_defaults(func=command_bootstrap)
+
+    setup = sub.add_parser("setup", help="guided one-command install, start, verify, and open")
+    setup.add_argument("-y", "--yes", action="store_true", help="accept default installer choices")
+    setup.add_argument("--dry-run", action="store_true", help="print planned actions without changing files or services")
+    setup.add_argument("--no-start", action="store_true", help="install/bootstrap without starting services")
+    setup.add_argument("--no-open", action="store_true", help="do not open the browser after setup")
+    setup.add_argument("--force", action="store_true", help="skip port availability guard when starting")
+    setup.add_argument("--wait-seconds", type=int, default=30, help="wait for backend/frontend readiness after starting")
+    setup.set_defaults(func=command_setup)
 
     start = sub.add_parser("start", help="start backend and frontend in detached screen sessions")
     start.add_argument("--force", action="store_true", help="skip port availability guard")
@@ -773,6 +1086,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    ensure_common_paths()
     parser = build_parser()
     args = parser.parse_args(argv)
     try:

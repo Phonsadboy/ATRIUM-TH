@@ -59,6 +59,16 @@ class AtriumCliEnvTests(unittest.TestCase):
         self.assertIn("ATRIUM_PORT=8787", text)
         self.assertNotIn("sk-live-secret", text)
 
+    def test_external_ollama_detection_keeps_in_stack_urls_local(self) -> None:
+        self.assertFalse(atrium_cli.uses_external_ollama(""))
+        self.assertFalse(atrium_cli.uses_external_ollama("http://127.0.0.1:11434"))
+        self.assertFalse(atrium_cli.uses_external_ollama("http://localhost:11434"))
+        self.assertFalse(atrium_cli.uses_external_ollama("http://ollama:11434"))
+
+    def test_external_ollama_detection_accepts_non_loopback_urls(self) -> None:
+        self.assertTrue(atrium_cli.uses_external_ollama("http://172.26.96.1:11434"))
+        self.assertTrue(atrium_cli.uses_external_ollama("https://ollama.example.com"))
+
 
 if __name__ == "__main__":
     unittest.main()

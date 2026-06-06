@@ -7,6 +7,8 @@ database maintenance.
 ## Included
 
 - `chatgpt_account_oauth_login.py` - local ChatGPT account OAuth login helper
+- `install_macos.sh` - macOS one-command installer that checks Command Line
+  Tools, clones ATRIUM, and hands off to `./atrium setup --yes`
 - `macos_host_bridge_probe.py` - macOS HostBridge parity probe for shell,
   browser, desktop, notification, and Calculator Accessibility checks
 - `windows_host_bridge_probe.py` - Windows HostBridge parity probe for shell,

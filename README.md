@@ -30,76 +30,98 @@ CrewAI, LangGraph, AutoGen/Microsoft Agent Framework และ MetaGPT ให้
 
 ATRIUM จึงโฟกัสอีกด้านหนึ่ง: ทำให้ multi-agent กลายเป็น workspace ที่คนทั่วไปลองใช้ได้เร็วขึ้น มี UI มี runtime truth มี setup script มีสถานะตรวจสอบได้ และออกแบบจากบริบทผู้ใช้ไทยตั้งแต่แรก โปรเจ็กนี้ยังไม่ใช่ระบบวิเศษที่ทำงานแทนคนได้ทุกเรื่อง คุณยังต้องมีบัญชี AI, เปิด Docker, ให้ permission และตรวจงานสำคัญเอง แต่เป้าหมายคือทำให้เส้นทางจาก “อยากลองบริษัท AI” ไปถึง “เปิดใช้งานจริงบนเครื่องตัวเอง” สั้นและชัดที่สุด
 
-## ภาษาไทย: เริ่มใช้งานเร็วที่สุด
+## ภาษาไทย: วิธีติดตั้ง
 
-เหมาะกับผู้ใช้ใหม่: เปิด Codex หรือ Claude Code แล้วส่ง prompt สั้นนี้ให้ agent ทำต่อ เลือก prompt ให้ตรงกับระบบปฏิบัติการ
+เลือกตามระบบปฏิบัติการก่อน แล้วเลือกวิธีติดตั้ง:
+
+- **ทำเอง**: ผู้ใช้คัดลอกคำสั่งไปรันเอง เหมาะกับคนที่คุ้น Terminal/PowerShell
+- **ให้ Codex/Claude ทำให้**: เปิด Codex หรือ Claude Code แล้วสั่งให้ agent ติดตั้ง ผู้ใช้รอและกดอนุญาตเฉพาะหน้าต่างที่ระบบปฏิบัติการถาม
+
+ก่อนใช้วิธี Codex/Claude ให้ตั้งค่า agent ให้เหมาะกับงานติดตั้ง:
+
+- ใช้ Codex หรือ Claude Code ใน **Coding / Code mode**
+- เปิดสิทธิ์เป็น **Full Access** หรือเทียบเท่า ให้ agent อ่าน/แก้ไฟล์, รัน terminal command, ใช้ network และเปิด browser ได้
+- เปิด agent ในเครื่องที่จะติดตั้งจริง ไม่ใช่เครื่องอื่น
+- ห้ามส่ง password, API key, OAuth token หรือ secret ลงในแชต ให้ผู้ใช้กรอกเองในหน้าต่างของระบบหรือ provider
+- ถ้า macOS/Windows ขอ password, restart, permission, firewall, Docker Desktop, WSL integration หรือ provider login ให้ผู้ใช้ทำเอง แล้วบอก agent ว่าเสร็จแล้ว
 
 ### macOS
 
-```text
-ติดตั้ง ATRIUM จาก https://github.com/Phonsadboy/ATRIUM-TH.git ที่ ~/Projects/ai-company
-ห้ามวาง repo ใน iCloud Drive, Desktop หรือ Documents ที่ sync กับ iCloud
-หลัง clone แล้วให้รัน:
-  ./atrium doctor
-  ./atrium bootstrap --full
-  ./atrium start
-  ./atrium status
-เป้าหมายคือเปิด http://127.0.0.1:5173 ให้ใช้งานได้จริง
-ห้ามพิมพ์ secret, API key, OAuth token หรือ password ลงในแชต
-ถ้าต้องให้ผู้ใช้ login, เปิด Docker Desktop, ใส่ API key หรือกด macOS permission ให้บอกชัดเจนแล้วรอผู้ใช้ทำเสร็จ
-```
+macOS แนะนำให้ติดตั้งที่ `~/Projects/ai-company` และหลีกเลี่ยง iCloud Drive, Desktop หรือ Documents ที่ sync กับ iCloud
 
-ถ้าต้องรันเองแบบไม่ใช้ agent บน macOS:
+#### วิธีที่ 1: ทำเอง
+
+เปิด Terminal แล้วรัน:
 
 ```bash
-mkdir -p ~/Projects
-git clone https://github.com/Phonsadboy/ATRIUM-TH.git ~/Projects/ai-company
+curl -fsSL https://raw.githubusercontent.com/Phonsadboy/ATRIUM-TH/main/ops/install_macos.sh -o /tmp/atrium-install-macos.sh && bash /tmp/atrium-install-macos.sh
+```
+
+ถ้า clone repo ไว้แล้ว:
+
+```bash
 cd ~/Projects/ai-company
-./atrium doctor
-./atrium bootstrap --full
-./atrium start
-./atrium status
+./atrium setup
+```
+
+สคริปต์จะเตรียมเครื่อง, ติดตั้ง dependency ที่ขาด, bootstrap full stack, start backend/frontend, ตรวจสถานะ และเปิด browser ไปที่ `http://127.0.0.1:5173`
+
+#### วิธีที่ 2: ให้ Codex/Claude ทำให้
+
+เปิด Codex หรือ Claude Code ใน Coding/Code mode พร้อม Full Access แล้วส่งข้อความนี้:
+
+```text
+ติดตั้ง ATRIUM บน macOS จาก https://github.com/Phonsadboy/ATRIUM-TH.git
+ใช้ path ~/Projects/ai-company
+ห้ามวาง repo ใน iCloud Drive, Desktop หรือ Documents ที่ sync กับ iCloud
+ให้ clone repo ถ้ายังไม่มี แล้วรัน ./atrium setup --yes
+ตรวจสอบให้จบด้วย ./atrium status
+เป้าหมายคือเปิด http://127.0.0.1:5173 ให้ใช้งานได้จริง
+ห้ามขอหรือพิมพ์ password, API key, OAuth token หรือ secret ในแชต
+ถ้าต้องเปิด Docker Desktop, ใส่รหัสเครื่อง, login provider หรือกด macOS permission ให้บอกฉันชัดเจนแล้วรอ
 ```
 
 ### Windows ผ่าน WSL2/Ubuntu
 
-เส้นทาง Windows ที่แนะนำคือ WSL2 + Ubuntu + Docker Desktop with WSL integration ไม่แนะนำให้ clone repo ไว้ใน OneDrive, Desktop, Documents หรือ `/mnt/c/...` เพราะ Docker volume, database, `node_modules`, virtualenv และ runtime files ควรอยู่ใน filesystem ของ WSL เอง
+Windows ต้องใช้ WSL2 + Ubuntu + Docker Desktop with WSL integration เป็นทางหลัก อย่า clone repo ไว้ใน OneDrive, Desktop, Documents หรือ `/mnt/c/...` เพราะ Docker volume, database, `node_modules`, virtualenv และ runtime files ควรอยู่ใน filesystem ของ WSL เอง
 
-เหมาะกับผู้ใช้ใหม่: เปิด Codex หรือ Claude Code บน Windows แล้วส่ง prompt นี้ให้ agent ทำต่อ
+#### วิธีที่ 1: ทำเอง
 
-```text
-ติดตั้ง ATRIUM บน Windows ผ่าน WSL2/Ubuntu จาก https://github.com/Phonsadboy/ATRIUM-TH.git
-ใช้สคริปต์ทางลัด atrium-windows.ps1 เป็นหลัก
-ให้ติดตั้ง/เปิด Docker Desktop และเปิด WSL integration ให้ Ubuntu ถ้าจำเป็น
-ให้ clone repo ไว้ใน WSL ที่ ~/Projects/ai-company เท่านั้น ห้ามวางใน OneDrive, Desktop, Documents หรือ /mnt/c/...
-หลังติดตั้งให้รัน ./atrium doctor, ./atrium bootstrap --full, ./atrium start และ ./atrium status
-เป้าหมายคือเปิด http://127.0.0.1:5173 จาก Windows browser ให้ใช้งานได้จริง
-ห้ามพิมพ์ secret, API key, OAuth token หรือ password ลงในแชต
-ถ้าต้องให้ผู้ใช้ login, เปิด Docker Desktop, ใส่ API key, เปิด firewall/UAC หรือเปิด WSL integration ให้บอกชัดเจนแล้วรอผู้ใช้ทำเสร็จ
-```
-
-ถ้าต้องรันเองแบบไม่ใช้ agent ให้เปิด PowerShell แบบ Administrator แล้วรันสคริปต์ทางลัดจาก repo:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\atrium-windows.ps1
-```
-
-สคริปต์นี้จะติดตั้ง/ตรวจ WSL Ubuntu, ติดตั้ง Docker Desktop ผ่าน `winget` ถ้ายังไม่มี, เตรียม dependency ใน Ubuntu, clone repo ไปที่ `~/Projects/ai-company`, bootstrap full stack แล้ว start ระบบให้ ถ้า Windows ขอ restart หรือ Ubuntu ขอสร้าง UNIX user ให้ทำขั้นตอนนั้นให้เสร็จแล้วรันคำสั่งเดิมซ้ำ
-
-ถ้าต้องการรันจาก one-liner โดยยังไม่ได้ clone repo:
+เปิด PowerShell แบบ Administrator แล้วรัน:
 
 ```powershell
 $script="$env:TEMP\atrium-windows-install.ps1"; Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/Phonsadboy/ATRIUM-TH/main/ops/windows_wsl_install.ps1" -OutFile $script; powershell -ExecutionPolicy Bypass -File $script
 ```
 
-ถ้า raw GitHub เข้าไม่ได้เพราะ repo/private permission ให้ clone repo ชั่วคราวเพื่อเอาสคริปต์ก่อน แล้วรัน `.\atrium-windows.ps1` จาก repo นั้น ตัว runtime จริงยังควรอยู่ใน WSL ที่ `~/Projects/ai-company`
+สคริปต์นี้จะติดตั้ง/ตรวจ WSL Ubuntu, ติดตั้ง Docker Desktop ผ่าน `winget` ถ้ายังไม่มี, เตรียม dependency ใน Ubuntu, clone repo ไปที่ `~/Projects/ai-company`, รัน `./atrium setup --yes` แล้วเปิดระบบให้ ถ้า Windows ขอ restart หรือ Ubuntu ขอสร้าง UNIX user ให้ทำขั้นตอนนั้นให้เสร็จแล้วรันคำสั่งเดิมซ้ำ
 
-หลังสคริปต์ติดตั้งเสร็จ ถ้าต้อง start เองใน WSL ให้ใช้:
+ถ้า clone repo ฝั่ง Windows ไว้แล้ว ให้รันจาก PowerShell ใน repo นั้น:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\atrium-windows.ps1
+```
+
+หลังติดตั้งเสร็จ ถ้าต้อง setup/start ซ้ำเองใน WSL ให้ใช้:
 
 ```bash
 cd ~/Projects/ai-company
-./atrium start
-./atrium status
+./atrium setup
+```
+
+#### วิธีที่ 2: ให้ Codex/Claude ทำให้
+
+เปิด Codex หรือ Claude Code บนเครื่อง Windows ใน Coding/Code mode พร้อม Full Access แล้วส่งข้อความนี้:
+
+```text
+ติดตั้ง ATRIUM บน Windows ผ่าน WSL2/Ubuntu จาก https://github.com/Phonsadboy/ATRIUM-TH.git
+ใช้สคริปต์ PowerShell/WSL installer ของ repo เป็นหลัก
+เตรียม Docker Desktop และเปิด WSL integration ให้ Ubuntu ถ้าจำเป็น
+clone repo ไว้ใน WSL ที่ ~/Projects/ai-company เท่านั้น
+ห้ามวาง repo ใน OneDrive, Desktop, Documents หรือ /mnt/c/...
+หลังติดตั้งให้รัน ./atrium setup --yes และตรวจสอบด้วย ./atrium status
+เป้าหมายคือเปิด http://127.0.0.1:5173 จาก Windows browser ให้ใช้งานได้จริง
+ห้ามขอหรือพิมพ์ password, API key, OAuth token หรือ secret ในแชต
+ถ้าต้อง restart Windows, สร้าง Ubuntu user, เปิด Docker Desktop, เปิด WSL integration, กด UAC/firewall หรือ login provider ให้บอกฉันชัดเจนแล้วรอ
 ```
 
 เมื่อพร้อม ให้เปิด:
@@ -115,9 +137,9 @@ http://127.0.0.1:5173
 - Windows: แนะนำ Windows 11, WSL2 + Ubuntu, Docker Desktop with WSL integration และ RAM อย่างน้อย 16GB
 - พื้นที่ว่างอย่างน้อย 20GB
 - สิทธิ์เข้า GitHub repo `Phonsadboy/ATRIUM-TH`
-- Docker Desktop
-- Git, Python 3.11+, `uv`, Node.js 20+, `pnpm`
 - บัญชี Claude หรือ ChatGPT อย่างน้อย 1 บัญชี หรือ API key ของ OpenAI/Anthropic
+
+ตัว installer จะพยายามติดตั้ง Docker Desktop, Git, Python/uv, Node.js และ `pnpm` ให้เองถ้ายังไม่มี แต่บางขั้นตอนอาจต้องให้ผู้ใช้ใส่รหัสเครื่องหรือกดยืนยันตามหน้าต่างของ macOS/Windows
 
 ตำแหน่งติดตั้งที่แนะนำ:
 
@@ -131,6 +153,12 @@ Windows WSL2: ~/Projects/ai-company
 บน Windows ให้ clone repo ใน filesystem ของ WSL เช่น `/home/<user>/Projects/ai-company` ไม่ใช่ `/mnt/c/Users/...`, OneDrive, Desktop หรือ Documents
 
 ## คำสั่งหลัก
+
+```bash
+./atrium setup
+```
+
+คำสั่งหลักสำหรับผู้ใช้ทั่วไป: ตรวจเครื่อง, ติดตั้ง dependency ที่ขาด, เตรียม Postgres/Ollama/backend/frontend, start ระบบ, ตรวจสถานะ และเปิด browser
 
 ```bash
 ./atrium doctor
@@ -190,10 +218,7 @@ Windows WSL2: ~/Projects/ai-company
 หลังแก้ blocker แล้วให้รัน:
 
 ```bash
-./atrium doctor
-./atrium bootstrap --full
-./atrium start
-./atrium status
+./atrium setup
 ```
 
 บน Windows/WSL ถ้า `./atrium start` ติด `screen` หรือ `zsh` ให้เปิด backend และ frontend แยก 2 terminal ตามตัวอย่าง Windows ด้านบนแทน
@@ -226,76 +251,88 @@ CrewAI, LangGraph, AutoGen/Microsoft Agent Framework, and MetaGPT show important
 
 ATRIUM focuses on the product side of that problem: turning a multi-agent idea into a local workspace with a UI, setup script, runtime checks, provider readiness, and Thai-first onboarding. It is not magic autopilot. You still need AI accounts, Docker, permissions, and human review for important work. The goal is to make the path from “I want to try an AI company” to “it is running on my own machine” as short and concrete as possible.
 
-## English Quick Start
+## English Installation
 
-Open Codex or Claude Code and send the prompt that matches your machine.
+Choose your OS first, then choose an installation style:
+
+- **Manual**: copy and run the commands yourself.
+- **Codex/Claude assisted**: let Codex or Claude Code run the installation while you wait and handle only OS/provider prompts.
+
+For the assisted path, use Codex or Claude Code in **Coding / Code mode** with **Full Access** or equivalent permissions: file read/write, terminal commands, network access, and browser access. Do not paste passwords, API keys, OAuth tokens, or secrets into chat.
 
 ### macOS
 
-```text
-Install ATRIUM from https://github.com/Phonsadboy/ATRIUM-TH.git at ~/Projects/ai-company.
-Do not place the repo in iCloud Drive, Desktop, or Documents if those folders sync with iCloud.
-After cloning, run:
-  ./atrium doctor
-  ./atrium bootstrap --full
-  ./atrium start
-  ./atrium status
-The goal is to open http://127.0.0.1:5173 and make the full stack usable.
-Never print secrets, API keys, OAuth tokens, or passwords in chat.
-If login, Docker Desktop, API key entry, or macOS permission approval is needed, tell the user exactly what to do and wait.
-```
+Use `~/Projects/ai-company`. Avoid iCloud Drive, Desktop, or Documents if those folders sync with iCloud.
 
-Manual macOS install:
+#### Option 1: Manual
+
+Open Terminal and run:
 
 ```bash
-mkdir -p ~/Projects
-git clone https://github.com/Phonsadboy/ATRIUM-TH.git ~/Projects/ai-company
+curl -fsSL https://raw.githubusercontent.com/Phonsadboy/ATRIUM-TH/main/ops/install_macos.sh -o /tmp/atrium-install-macos.sh && bash /tmp/atrium-install-macos.sh
+```
+
+If the repo is already cloned:
+
+```bash
 cd ~/Projects/ai-company
-./atrium doctor
-./atrium bootstrap --full
-./atrium start
-./atrium status
+./atrium setup
+```
+
+#### Option 2: Codex/Claude Assisted
+
+Open Codex or Claude Code in Coding/Code mode with Full Access and send:
+
+```text
+Install ATRIUM on macOS from https://github.com/Phonsadboy/ATRIUM-TH.git.
+Use ~/Projects/ai-company.
+Do not place the repo in iCloud Drive, Desktop, or Documents if those folders sync with iCloud.
+Clone the repo if needed, then run ./atrium setup --yes.
+Finish by running ./atrium status.
+The goal is to open http://127.0.0.1:5173 and make the full stack usable.
+Never ask for or print passwords, API keys, OAuth tokens, or secrets in chat.
+If Docker Desktop, machine password, provider login, or macOS permission approval is needed, tell me exactly what to do and wait.
 ```
 
 ### Windows Through WSL2/Ubuntu
 
-Use WSL2 + Ubuntu + Docker Desktop with WSL integration. Do not clone the repo into OneDrive, Desktop, Documents, or `/mnt/c/...`; keep it inside the WSL filesystem, for example `/home/<user>/Projects/ai-company`.
+Use WSL2 + Ubuntu + Docker Desktop with WSL integration. Keep the repo inside the WSL filesystem, for example `/home/<user>/Projects/ai-company`; avoid OneDrive, Desktop, Documents, and `/mnt/c/...`.
 
-Open Codex or Claude Code on Windows and send this prompt:
+#### Option 1: Manual
 
-```text
-Install ATRIUM on Windows through WSL2/Ubuntu from https://github.com/Phonsadboy/ATRIUM-TH.git.
-Use atrium-windows.ps1 as the main shortcut.
-Install/start Docker Desktop and enable WSL integration for Ubuntu if needed.
-Clone the repo inside WSL at ~/Projects/ai-company only. Do not place it in OneDrive, Desktop, Documents, or /mnt/c/...
-After setup, run ./atrium doctor, ./atrium bootstrap --full, ./atrium start, and ./atrium status.
-The goal is to open http://127.0.0.1:5173 from a Windows browser and make the full stack usable.
-Never print secrets, API keys, OAuth tokens, or passwords in chat.
-If login, Docker Desktop, WSL integration, API key entry, firewall, or UAC approval is needed, tell the user exactly what to do and wait.
-```
-
-Manual shortcut from a cloned repo, in Administrator PowerShell:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\atrium-windows.ps1
-```
-
-The shortcut installs/checks WSL Ubuntu, installs Docker Desktop through `winget` when missing, prepares WSL dependencies, clones the repo to `~/Projects/ai-company`, bootstraps the full stack, and starts ATRIUM. If Windows asks for a restart or Ubuntu asks you to create a UNIX user, finish that step and rerun the same command.
-
-One-liner without cloning first:
+Open Administrator PowerShell and run:
 
 ```powershell
 $script="$env:TEMP\atrium-windows-install.ps1"; Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/Phonsadboy/ATRIUM-TH/main/ops/windows_wsl_install.ps1" -OutFile $script; powershell -ExecutionPolicy Bypass -File $script
 ```
 
-If raw GitHub is unavailable because of repo/private permissions, clone the repo temporarily to get the script, then run `.\atrium-windows.ps1` from that checkout. The real runtime checkout should still live inside WSL at `~/Projects/ai-company`.
+Shortcut from an already cloned Windows checkout:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\atrium-windows.ps1
+```
 
 After the shortcut is done, start manually from WSL when needed:
 
 ```bash
 cd ~/Projects/ai-company
-./atrium start
-./atrium status
+./atrium setup
+```
+
+#### Option 2: Codex/Claude Assisted
+
+Open Codex or Claude Code on the Windows machine in Coding/Code mode with Full Access and send:
+
+```text
+Install ATRIUM on Windows through WSL2/Ubuntu from https://github.com/Phonsadboy/ATRIUM-TH.git.
+Use the repo's PowerShell/WSL installer as the main path.
+Prepare Docker Desktop and enable WSL integration for Ubuntu if needed.
+Clone the repo inside WSL at ~/Projects/ai-company only.
+Do not place the repo in OneDrive, Desktop, Documents, or /mnt/c/...
+After setup, run ./atrium setup --yes and verify with ./atrium status.
+The goal is to open http://127.0.0.1:5173 from a Windows browser and make the full stack usable.
+Never ask for or print passwords, API keys, OAuth tokens, or secrets in chat.
+If Windows restart, Ubuntu user creation, Docker Desktop, WSL integration, UAC/firewall approval, or provider login is needed, tell me exactly what to do and wait.
 ```
 
 Open:
