@@ -12,6 +12,11 @@ from typing import Any
 
 
 SOURCE_FINGERPRINT_FILES = (
+    "atrium",
+    "atrium.cmd",
+    "atrium.ps1",
+    "ops/atrium_cli.py",
+    "ops/install_windows_native.ps1",
     "ops/macos_host_bridge_probe.py",
     "ops/windows_host_bridge_probe.py",
     "ops/host_bridge_artifact_summary.py",
@@ -25,6 +30,9 @@ SOURCE_FINGERPRINT_FILES = (
     "system/app/schema.py",
     "system/app/tools/host_bridge.py",
     "system/app/tools/visual_bridge.py",
+    "ui/src/contract/types.ts",
+    "ui/src/panels/console/ConnectorsPanel.tsx",
+    "ui/src/panels/console/ToolsPanel.tsx",
 )
 
 
@@ -65,13 +73,16 @@ def host_bridge_source_provenance(root: Path | None = None) -> dict[str, Any]:
         digest = hashlib.sha256(data).hexdigest()
         files[rel_path] = {"present": True, "sha256": digest, "bytes": len(data)}
         combined.update(digest.encode("ascii") + b"\0")
+    source_manifest_sha256 = combined.hexdigest()
     status_short = _git_output(resolved_root, ["status", "--short"]) or ""
     return {
         "repoRoot": str(resolved_root),
         "gitHead": _git_output(resolved_root, ["rev-parse", "HEAD"]),
         "gitDirty": bool(status_short),
         "gitStatusShort": status_short.splitlines()[:80],
-        "sourceFingerprint": combined.hexdigest(),
+        "sourceFingerprint": source_manifest_sha256,
+        "sourceManifestSha256": source_manifest_sha256,
+        "sourceFileCount": len(files),
         "files": files,
     }
 
@@ -105,6 +116,8 @@ def host_bridge_parity_proof_id(
         "currentSource": {
             "enforced": enforce_current_source,
             "sourceFingerprint": current_source.get("sourceFingerprint") if isinstance(current_source, dict) else None,
+            "sourceManifestSha256": current_source.get("sourceManifestSha256") if isinstance(current_source, dict) else None,
+            "sourceFileCount": current_source.get("sourceFileCount") if isinstance(current_source, dict) else None,
             "gitHead": current_source.get("gitHead") if isinstance(current_source, dict) else None,
         },
         "results": {
@@ -115,6 +128,8 @@ def host_bridge_parity_proof_id(
                 "artifactBytes": (result if isinstance(result, dict) else {}).get("artifactBytes"),
                 "generatedAt": (result if isinstance(result, dict) else {}).get("generatedAt"),
                 "sourceFingerprint": (result if isinstance(result, dict) else {}).get("sourceFingerprint"),
+                "sourceManifestSha256": (result if isinstance(result, dict) else {}).get("sourceManifestSha256"),
+                "sourceFileCount": (result if isinstance(result, dict) else {}).get("sourceFileCount"),
                 "gitHead": (result if isinstance(result, dict) else {}).get("gitHead"),
                 "parityRunId": (result if isinstance(result, dict) else {}).get("parityRunId"),
                 "mode": (result if isinstance(result, dict) else {}).get("mode"),

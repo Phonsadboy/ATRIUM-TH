@@ -4842,6 +4842,10 @@ export interface components {
             commands?: {
                 [key: string]: string;
             };
+            /** Contract */
+            contract?: {
+                [key: string]: unknown;
+            };
             /** Connectors */
             connectors?: components["schemas"]["HostBridgeParityConnectorProof"][];
             /** Gaps */
@@ -6846,7 +6850,7 @@ export interface components {
              * @default manual
              * @enum {string}
              */
-            restartMode: "screen" | "custom" | "manual";
+            restartMode: "screen" | "windows_native" | "custom" | "manual";
             /**
              * Restartscheduled
              * @default false

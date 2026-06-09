@@ -58,7 +58,7 @@ safe_install_dir() {
 }
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
-  printf 'This installer is for macOS. On Windows, use atrium-windows.ps1 or ops/windows_wsl_install.ps1.\n' >&2
+  printf 'This installer is for macOS. On Windows, use atrium.ps1 or ops/install_windows_native.ps1.\n' >&2
   exit 1
 fi
 

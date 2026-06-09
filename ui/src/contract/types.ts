@@ -2168,7 +2168,7 @@ export interface VersionUpdateResponse {
   backup?: Record<string, unknown> | null
   migrations?: Record<string, unknown> | null
   restartScheduled: boolean
-  restartMode: 'screen' | 'custom' | 'manual'
+  restartMode: 'screen' | 'windows_native' | 'custom' | 'manual'
   restartLogPath?: string | null
   stdout?: string | null
   stderr?: string | null
@@ -2232,6 +2232,48 @@ export interface HostBridgeParityConnectorProof {
   proofDetails: Record<string, unknown>
 }
 
+export interface HostBridgeOpenClawRequirement {
+  id?: string
+  label?: string
+  requiredEvidence?: unknown
+  requiredArtifact?: string
+  currentHostApplies?: boolean
+  currentReady?: boolean
+  registered?: boolean
+  requiredStatus?: string
+  currentStatus?: string
+  proved?: boolean
+  required?: boolean
+  ready?: boolean
+  status?: string
+  runtimeStatus?: string | null
+  readReady?: boolean
+  writeReady?: boolean
+  requiresWriteReady?: boolean
+  localFallback?: boolean
+  externalWriteRequires?: string[]
+  degradedByLocalFallback?: boolean
+  proofStatus?: ConnectorProofStatus | string
+  currentDetails?: Record<string, unknown>
+}
+
+export interface HostBridgeOpenClawContract {
+  target?: string
+  summary?: string
+  noSilentDegradation?: boolean
+  windowsNativePrimary?: boolean
+  windowsNativeOnly?: boolean
+  status?: HostBridgeParityStatus
+  localRequirements?: HostBridgeOpenClawRequirement[]
+  apiSurfaceRequirements?: HostBridgeOpenClawRequirement[]
+  reportRequirements?: HostBridgeOpenClawRequirement[]
+  featureRequirements?: HostBridgeOpenClawRequirement[]
+  windowsProofRequirements?: HostBridgeOpenClawRequirement[]
+  proofRequirements?: HostBridgeOpenClawRequirement[]
+  connectorRequirements?: HostBridgeOpenClawRequirement[]
+  osBoundaries?: string[]
+}
+
 export interface HostBridgeParityStatusResponse {
   ok: boolean
   status: HostBridgeParityStatus
@@ -2239,6 +2281,7 @@ export interface HostBridgeParityStatusResponse {
   gaps: string[]
   report: Record<string, unknown>
   local: Record<string, unknown>
+  contract: HostBridgeOpenClawContract
   connectors: HostBridgeParityConnectorProof[]
   commands: Record<string, string>
 }

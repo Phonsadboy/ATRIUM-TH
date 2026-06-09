@@ -1,5 +1,6 @@
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest import mock
 
 
@@ -160,6 +161,26 @@ class VersionStatusTest(unittest.TestCase):
         self.assertTrue(result["restartScheduled"])
         self.assertIn(("fetch", "--prune", "origin", "main"), calls)
         self.assertIn(("merge", "--ff-only", "FETCH_HEAD"), calls)
+
+    def test_windows_update_restart_uses_native_powershell_launcher(self) -> None:
+        from app import main
+
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "atrium.ps1").write_text("param($Command)\n", encoding="utf-8")
+            with (
+                mock.patch.object(main.sys, "platform", "win32"),
+                mock.patch.object(main, "_powershell_command", return_value="powershell.exe"),
+                mock.patch.object(main.subprocess, "Popen") as popen,
+            ):
+                result = main._schedule_version_restart(repo)
+
+        self.assertTrue(result["scheduled"])
+        self.assertEqual(result["mode"], "windows_native")
+        command = popen.call_args.args[0]
+        self.assertEqual(command[:4], ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass"])
+        self.assertIn(".\\atrium.ps1 restart --force", command[-1])
+        self.assertIn("self-update-restart.log", command[-1])
 
     def test_update_stops_before_fetch_when_backup_fails(self) -> None:
         from app import main

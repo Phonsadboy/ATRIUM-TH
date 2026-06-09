@@ -12,11 +12,31 @@ class HostBridgeProofTest(unittest.TestCase):
         provenance = host_bridge_source_provenance(REPO_ROOT)
 
         self.assertRegex(provenance["sourceFingerprint"], r"^[0-9a-f]{64}$")
+        self.assertEqual(provenance["sourceManifestSha256"], provenance["sourceFingerprint"])
+        self.assertEqual(provenance["sourceFileCount"], len(SOURCE_FINGERPRINT_FILES))
+        self.assertIn("atrium", SOURCE_FINGERPRINT_FILES)
+        self.assertIn("atrium.cmd", SOURCE_FINGERPRINT_FILES)
+        self.assertIn("atrium.ps1", SOURCE_FINGERPRINT_FILES)
+        self.assertIn("ops/atrium_cli.py", SOURCE_FINGERPRINT_FILES)
+        self.assertIn("ops/install_windows_native.ps1", SOURCE_FINGERPRINT_FILES)
         self.assertIn("system/app/host_bridge_proof.py", SOURCE_FINGERPRINT_FILES)
         self.assertIn("ops/host_bridge_source_summary.py", SOURCE_FINGERPRINT_FILES)
         self.assertIn("ops/windows_host_bridge_live_proof.ps1", SOURCE_FINGERPRINT_FILES)
+        self.assertIn("ui/src/contract/types.ts", SOURCE_FINGERPRINT_FILES)
+        self.assertIn("ui/src/panels/console/ConnectorsPanel.tsx", SOURCE_FINGERPRINT_FILES)
+        self.assertIn("ui/src/panels/console/ToolsPanel.tsx", SOURCE_FINGERPRINT_FILES)
+        self.assertIn("atrium.cmd", provenance["files"])
+        self.assertIn("atrium.ps1", provenance["files"])
+        self.assertIn("ops/atrium_cli.py", provenance["files"])
+        self.assertIn("ops/install_windows_native.ps1", provenance["files"])
+        self.assertIn("ui/src/panels/console/ToolsPanel.tsx", provenance["files"])
         self.assertIn("system/app/host_bridge_proof.py", provenance["files"])
         self.assertIn("ops/windows_host_bridge_live_proof.ps1", provenance["files"])
+        self.assertTrue(provenance["files"]["atrium.cmd"]["present"])
+        self.assertTrue(provenance["files"]["atrium.ps1"]["present"])
+        self.assertTrue(provenance["files"]["ops/atrium_cli.py"]["present"])
+        self.assertTrue(provenance["files"]["ops/install_windows_native.ps1"]["present"])
+        self.assertTrue(provenance["files"]["ui/src/panels/console/ToolsPanel.tsx"]["present"])
         self.assertTrue(provenance["files"]["system/app/host_bridge_proof.py"]["present"])
         self.assertTrue(provenance["files"]["ops/windows_host_bridge_live_proof.ps1"]["present"])
         self.assertIn("gitHead", provenance)
@@ -79,6 +99,64 @@ class HostBridgeProofTest(unittest.TestCase):
 
         first = host_bridge_parity_proof_id({"macos": result}, source, enforce_current_source=True)
         changed = dict(result, parityRunId="parity-run-2")
+        second = host_bridge_parity_proof_id({"macos": changed}, source, enforce_current_source=True)
+
+        self.assertRegex(first, r"^[0-9a-f]{64}$")
+        self.assertNotEqual(first, second)
+
+    def test_parity_proof_id_includes_source_file_count(self) -> None:
+        source = {"sourceFingerprint": "a" * 64, "gitHead": "b" * 40}
+        result = {
+            "present": True,
+            "proofSchemaVersion": 1,
+            "artifactSha256": "1" * 64,
+            "artifactBytes": 100,
+            "generatedAt": 1234,
+            "sourceFingerprint": "a" * 64,
+            "sourceManifestSha256": "a" * 64,
+            "sourceFileCount": 17,
+            "gitHead": "b" * 40,
+            "parityRunId": "parity-run-1",
+            "mode": "live",
+            "platform": "darwin",
+            "hostFingerprint": "c" * 64,
+            "hostPlatform": "darwin",
+            "probeOk": True,
+            "desktopAutomationReady": True,
+            "proofs": {"browserActVerified": True},
+        }
+
+        first = host_bridge_parity_proof_id({"macos": result}, source, enforce_current_source=True)
+        changed = dict(result, sourceFileCount=16)
+        second = host_bridge_parity_proof_id({"macos": changed}, source, enforce_current_source=True)
+
+        self.assertRegex(first, r"^[0-9a-f]{64}$")
+        self.assertNotEqual(first, second)
+
+    def test_parity_proof_id_includes_source_manifest_sha(self) -> None:
+        source = {"sourceFingerprint": "a" * 64, "sourceManifestSha256": "a" * 64, "sourceFileCount": 17, "gitHead": "b" * 40}
+        result = {
+            "present": True,
+            "proofSchemaVersion": 1,
+            "artifactSha256": "1" * 64,
+            "artifactBytes": 100,
+            "generatedAt": 1234,
+            "sourceFingerprint": "a" * 64,
+            "sourceManifestSha256": "a" * 64,
+            "sourceFileCount": 17,
+            "gitHead": "b" * 40,
+            "parityRunId": "parity-run-1",
+            "mode": "live",
+            "platform": "darwin",
+            "hostFingerprint": "c" * 64,
+            "hostPlatform": "darwin",
+            "probeOk": True,
+            "desktopAutomationReady": True,
+            "proofs": {"browserActVerified": True},
+        }
+
+        first = host_bridge_parity_proof_id({"macos": result}, source, enforce_current_source=True)
+        changed = dict(result, sourceManifestSha256="d" * 64)
         second = host_bridge_parity_proof_id({"macos": changed}, source, enforce_current_source=True)
 
         self.assertRegex(first, r"^[0-9a-f]{64}$")

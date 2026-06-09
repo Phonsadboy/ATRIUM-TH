@@ -1,6 +1,6 @@
 # ATRIUM on Mac / Windows
 
-ATRIUM is a Thai-first, local-first full-stack AI company workspace for macOS and Windows through WSL2. This repo includes the FastAPI backend, Vite frontend, Docker services, runtime configuration, and a shortcut CLI for setting up the local full stack.
+ATRIUM is a Thai-first, local-first full-stack AI company workspace for macOS and Windows. This repo includes the FastAPI backend, Vite frontend, Docker services, runtime configuration, and shortcut CLIs for setting up the local full stack. Windows uses a native PowerShell path for runtime control.
 
 Repository:
 
@@ -17,11 +17,11 @@ ATRIUM คือ workspace สำหรับสร้าง “บริษั�
 ### จุดเด่นของ ATRIUM
 
 - **Thai-first**: ออกแบบให้ผู้ใช้ไทยเริ่มได้ง่ายขึ้น ทั้ง prompt, onboarding และ flow การใช้งาน
-- **Local-first บน Mac/Windows**: ข้อมูล runtime, memory, database และ workspace อยู่ในเครื่องคุณเป็นหลัก โดย Windows แนะนำให้ใช้ WSL2/Ubuntu
+- **Local-first บน Mac/Windows**: ข้อมูล runtime, memory, database และ workspace อยู่ในเครื่องคุณเป็นหลัก โดย Windows ใช้ native PowerShell path
 - **AI company ไม่ใช่แค่ agent chat**: มี Executive, แผนก, task, approval, handoff, memory, artifacts และสถานะ runtime
-- **Full stack พร้อมใช้**: FastAPI backend, Vite frontend, Postgres/pgvector, Ollama และ setup shortcut ผ่าน `./atrium`
+- **Full stack พร้อมใช้**: FastAPI backend, Vite frontend, Postgres/pgvector, Ollama และ setup shortcut ผ่าน `./atrium` บน macOS หรือ `.\atrium.ps1` บน Windows
 - **ใช้ provider ได้หลายแบบ**: Claude Code account, ChatGPT account OAuth, OpenAI Platform API key, Anthropic API key และ local embedding ผ่าน Ollama
-- **เห็นความจริงของระบบ**: `./atrium doctor`, `./atrium status`, `/health`, `/api/runtime` และ redacted support report ช่วยแยกว่าอะไรพร้อม อะไรยังติด blocker
+- **เห็นความจริงของระบบ**: `./atrium doctor` / `.\atrium.ps1 doctor`, `./atrium status` / `.\atrium.ps1 status`, `/health`, `/api/runtime` และ redacted support report ช่วยแยกว่าอะไรพร้อม อะไรยังติด blocker
 - **มนุษย์ยังคุมงานสำคัญ**: งานที่กระทบระบบจริงควรมี approval, credential readiness และ status ที่ตรวจสอบได้ แทนการปล่อย agent ทำทุกอย่างแบบมองไม่เห็น
 
 ### ต่างจาก framework ทั่วไปอย่างไร
@@ -43,7 +43,7 @@ ATRIUM จึงโฟกัสอีกด้านหนึ่ง: ทำใ�
 - เปิดสิทธิ์เป็น **Full Access** หรือเทียบเท่า ให้ agent อ่าน/แก้ไฟล์, รัน terminal command, ใช้ network และเปิด browser ได้
 - เปิด agent ในเครื่องที่จะติดตั้งจริง ไม่ใช่เครื่องอื่น
 - ห้ามส่ง password, API key, OAuth token หรือ secret ลงในแชต ให้ผู้ใช้กรอกเองในหน้าต่างของระบบหรือ provider
-- ถ้า macOS/Windows ขอ password, restart, permission, firewall, Docker Desktop, WSL integration หรือ provider login ให้ผู้ใช้ทำเอง แล้วบอก agent ว่าเสร็จแล้ว
+- ถ้า macOS/Windows ขอ password, restart, permission, firewall, Docker Desktop หรือ provider login ให้ผู้ใช้ทำเอง แล้วบอก agent ว่าเสร็จแล้ว
 
 ### macOS
 
@@ -81,47 +81,93 @@ cd ~/Projects/ai-company
 ถ้าต้องเปิด Docker Desktop, ใส่รหัสเครื่อง, login provider หรือกด macOS permission ให้บอกฉันชัดเจนแล้วรอ
 ```
 
-### Windows ผ่าน WSL2/Ubuntu
+### Windows Native PowerShell
 
-Windows ต้องใช้ WSL2 + Ubuntu + Docker Desktop with WSL integration เป็นทางหลัก อย่า clone repo ไว้ใน OneDrive, Desktop, Documents หรือ `/mnt/c/...` เพราะ Docker volume, database, `node_modules`, virtualenv และ runtime files ควรอยู่ใน filesystem ของ WSL เอง
+Windows native path ใช้ PowerShell เป็นตัวควบคุม backend/frontend โดยตรง และใช้ Docker Desktop สำหรับ Postgres/Ollama ในเฟสแรก
+มี `atrium.cmd` เป็น shim สำหรับ Windows Terminal/cmd.exe ที่เรียก `.\atrium.ps1` ด้วย ExecutionPolicy Bypass ให้เอง แต่คำสั่งหลักในเอกสารยังใช้ PowerShell โดยตรง
 
-#### วิธีที่ 1: ทำเอง
-
-เปิด PowerShell แบบ Administrator แล้วรัน:
-
-```powershell
-$script="$env:TEMP\atrium-windows-install.ps1"; Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/Phonsadboy/ATRIUM-TH/main/ops/windows_wsl_install.ps1" -OutFile $script; powershell -ExecutionPolicy Bypass -File $script
-```
-
-สคริปต์นี้จะติดตั้ง/ตรวจ WSL Ubuntu, ติดตั้ง Docker Desktop ผ่าน `winget` ถ้ายังไม่มี, เตรียม dependency ใน Ubuntu, clone repo ไปที่ `~/Projects/ai-company`, รัน `./atrium setup --yes` แล้วเปิดระบบให้ ถ้า Windows ขอ restart หรือ Ubuntu ขอสร้าง UNIX user ให้ทำขั้นตอนนั้นให้เสร็จแล้วรันคำสั่งเดิมซ้ำ
-
-ถ้า clone repo ฝั่ง Windows ไว้แล้ว ให้รันจาก PowerShell ใน repo นั้น:
+ถ้ายังไม่ได้ clone repo ให้เปิด PowerShell แล้วรัน installer native:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\atrium-windows.ps1
+$script="$env:TEMP\atrium-windows-native-install.ps1"; Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/Phonsadboy/ATRIUM-TH/main/ops/install_windows_native.ps1" -OutFile $script; powershell -ExecutionPolicy Bypass -File $script
 ```
 
-หลังติดตั้งเสร็จ ถ้าต้อง setup/start ซ้ำเองใน WSL ให้ใช้:
+ถ้าต้องการข้ามบางส่วนชั่วคราว ใช้ flag เช่น `-NoStart`, `-SkipDockerInstall`, `-SkipBrowserInstall`, หรือ `-SkipClaudeCodeInstall`
 
-```bash
-cd ~/Projects/ai-company
-./atrium setup
+เปิด PowerShell ใน repo แล้วรัน:
+
+```powershell
+.\atrium.ps1 setup
 ```
 
-#### วิธีที่ 2: ให้ Codex/Claude ทำให้
+คำสั่งหลัก:
+
+```powershell
+.\atrium.ps1 doctor
+.\atrium.ps1 bootstrap --full
+.\atrium.ps1 start
+.\atrium.ps1 restart
+.\atrium.ps1 tools status
+.\atrium.ps1 tools status --json
+.\atrium.ps1 tools catalog
+.\atrium.ps1 tools catalog --json
+.\atrium.ps1 provider status --probe
+.\atrium.ps1 provider status --probe --json
+.\atrium.ps1 provider login chatgpt
+.\atrium.ps1 provider login claude-code
+.\atrium.ps1 provider disconnect chatgpt
+.\atrium.ps1 automation status --commands
+.\atrium.ps1 automation status --json
+.\atrium.ps1 automation source
+.\atrium.ps1 automation audit
+.\atrium.ps1 automation handoff --macos <macos-json>
+.\atrium.ps1 automation windows-live-proof --parity-run-id <run-id> --source-fingerprint <fingerprint> --source-manifest-sha256 <manifest> --source-file-count <count>
+.\atrium.ps1 automation artifact --label windows --expect-parity-run-id <run-id> <windows-json>
+.\atrium.ps1 automation report --macos <macos-json> --windows <copied-windows-json>
+.\atrium.ps1 status
+.\atrium.ps1 status --json
+.\atrium.ps1 logs
+.\atrium.ps1 logs --json
+.\atrium.ps1 report
+.\atrium.ps1 report --bundle
+.\atrium.ps1 stop
+```
+
+Windows native setup จะพยายามเตรียม Git, Python 3 ที่รันได้จริง, Node.js, uv, pnpm, Docker Desktop, Chrome/Edge/Brave/Chromium, Claude Code CLI, dependencies, env, backend/frontend และเปิด `http://127.0.0.1:5173` ถ้าติด UAC, firewall, Docker first-run หรือ provider login ให้ผู้ใช้กดยืนยันเองแล้วรันคำสั่งเดิมซ้ำ ทั้ง installer และ `.\atrium.ps1 setup` จะตรวจ Python 3 แบบรันจริง ไม่เชื่อแค่ Windows Store alias และจะเพิ่ม PATH ที่จำเป็นทั้งใน session ปัจจุบันและ user PATH เพื่อให้ PowerShell ใหม่ยังเรียก `uv`, `pnpm`, `docker`, `claude` และ `.\atrium.ps1` workflow ได้ต่อ
+ถ้า browser install ถูก policy ของเครื่องบล็อก ให้ติดตั้ง Chrome, Edge, Brave หรือ Chromium เอง แล้วรัน `.\atrium.ps1 automation status --commands` เพื่อดู browser/desktop gap ต่อ
+
+`.\atrium.ps1 start` จะพยายามเปิด Docker Desktop และรอ Docker ให้พร้อมก่อนเริ่ม Postgres/Ollama ถ้า Docker ยังไม่พร้อมจะหยุดพร้อม next step ชัดเจนแทนการปล่อยให้ backend fail เงียบ ๆ
+
+`.\atrium.ps1 stop` และ `.\atrium.ps1 restart` ใช้ PID files และหยุด process tree ของ frontend/backend บน Windows เพื่อช่วยลด process ลูกหรือ port listener ค้างหลัง restart
+ถ้า backend/frontend ถูกเปิดจาก terminal หรือ tool อื่น `.\atrium.ps1 status` จะยังแสดง listener จริง ส่วน `stop/restart` จะควบคุมเฉพาะ process ที่ ATRIUM native launcher เปิดและมี PID file เท่านั้น
+
+`.\atrium.ps1 tools status` และ `.\atrium.ps1 tools catalog` ตรวจ AI tool registry, tool catalog, risk/executor summary และ connector readiness จาก backend โดยตรง; เพิ่ม `--json` เพื่อส่ง redacted machine-readable diagnostics
+
+`.\atrium.ps1 provider status --probe` ตรวจ ChatGPT account และ Claude Code account จาก backend truth; เพิ่ม `--json` เพื่อดู redacted provider-auth payload สำหรับ debug ส่วน `.\atrium.ps1 provider login ...` เริ่ม login จาก PowerShell โดยตรงและรอจน provider พร้อมถ้าทำได้
+
+`.\atrium.ps1 automation status --commands` แสดงสถานะ browser/desktop HostBridge, owner permission mode และคำสั่ง parity proof ที่ต้องใช้; เพิ่ม `--json` เพื่อดึง automation permission/parity state แบบ redacted จาก PowerShell ส่วน `automation handoff --macos <macos-json>` validate macOS artifact กับ source ปัจจุบันแล้วเขียน packet คำสั่ง Windows/report/audit สำหรับส่งต่อ โดยยังไม่ถือว่า verified; `automation windows-live-proof` เป็น runner สำหรับ Windows interactive desktop session ที่ตรวจ source fingerprint, source manifest, file count, รัน full live probe และ validate artifact ก่อนส่งกลับมาทำ cross-OS report; `automation artifact` ใช้ validate proof artifact ผ่าน native CLI
+OpenClaw-level gate ยังนับ MCP external tools เป็น required surface: local MCP fallback ใช้ดูสถานะ/อ่านข้อมูลบางส่วนได้ แต่ไม่ถือว่าผ่าน external-write parity จนกว่า MCP gateway จะพร้อม
+
+`.\atrium.ps1 status` และ `.\atrium.ps1 report` จะรวมสถานะ AI tools, provider auth, permission mode, connector readiness, browser/desktop HostBridge, full-autonomy permission และ cross-OS parity gap เพื่อให้เห็นว่า Windows native automation พร้อมจริงหรือยัง; `status --json` และ `logs --json` ใช้เก็บ runtime/log truth แบบ redacted ได้จาก PowerShell
+ถ้าสั่งอัปเดตระบบจาก UI บน Windows backend จะ schedule restart ผ่าน `.\atrium.ps1 restart --force` ใน PowerShell และเขียนผลไว้ที่ `system/logs/self-update-restart.log`
+`report` จะรวม Docker CLI/Compose/daemon status, automation proof commands และ redact secret ก่อนพิมพ์ออกมา; `report --bundle` จะสร้าง zip ที่มี redacted support report, backend/frontend logs และ diagnostics JSON สำหรับ status/logs/permission/provider/tools/automation เพื่อส่ง debug
+
+ห้ามวาง repo/runtime ใน OneDrive, Desktop, Documents หรือ Downloads เพราะ database, Docker volume, `node_modules`, virtualenv และ runtime files ไม่ควรอยู่ในโฟลเดอร์ sync หรือ user-folder ที่โดน policy บ่อย
+
+#### ให้ Codex/Claude ทำให้ด้วย Windows native
 
 เปิด Codex หรือ Claude Code บนเครื่อง Windows ใน Coding/Code mode พร้อม Full Access แล้วส่งข้อความนี้:
 
 ```text
-ติดตั้ง ATRIUM บน Windows ผ่าน WSL2/Ubuntu จาก https://github.com/Phonsadboy/ATRIUM-TH.git
-ใช้สคริปต์ PowerShell/WSL installer ของ repo เป็นหลัก
-เตรียม Docker Desktop และเปิด WSL integration ให้ Ubuntu ถ้าจำเป็น
-clone repo ไว้ใน WSL ที่ ~/Projects/ai-company เท่านั้น
-ห้ามวาง repo ใน OneDrive, Desktop, Documents หรือ /mnt/c/...
-หลังติดตั้งให้รัน ./atrium setup --yes และตรวจสอบด้วย ./atrium status
+ติดตั้ง ATRIUM บน Windows native PowerShell จาก https://github.com/Phonsadboy/ATRIUM-TH.git
+ใช้ .\atrium.ps1 เป็น runtime-control path หลัก
+เตรียม Docker Desktop สำหรับ Docker-backed services และ Claude Code CLI สำหรับ Claude account provider ถ้าจำเป็น
+clone repo ไว้ในโฟลเดอร์ที่ไม่ใช่ OneDrive, Desktop, Documents หรือ Downloads
+หลังติดตั้งให้รัน .\atrium.ps1 setup --yes แล้วตรวจด้วย .\atrium.ps1 provider status --probe, .\atrium.ps1 automation status --commands, .\atrium.ps1 automation audit และ .\atrium.ps1 status
+ห้ามสรุปว่า Windows เป็น OpenClaw-level จนกว่าจะติดตั้ง live macOS/Windows proof artifacts ด้วย .\atrium.ps1 automation report แล้ว .\atrium.ps1 automation audit ผ่าน
 เป้าหมายคือเปิด http://127.0.0.1:5173 จาก Windows browser ให้ใช้งานได้จริง
 ห้ามขอหรือพิมพ์ password, API key, OAuth token หรือ secret ในแชต
-ถ้าต้อง restart Windows, สร้าง Ubuntu user, เปิด Docker Desktop, เปิด WSL integration, กด UAC/firewall หรือ login provider ให้บอกฉันชัดเจนแล้วรอ
+ถ้าต้อง restart Windows, เปิด Docker Desktop, กด UAC/firewall หรือ login provider ให้บอกฉันชัดเจนแล้วรอ
 ```
 
 เมื่อพร้อม ให้เปิด:
@@ -134,25 +180,27 @@ http://127.0.0.1:5173
 
 - Mac หรือ Windows 1 เครื่อง
 - macOS: แนะนำ Apple Silicon และ RAM อย่างน้อย 16GB
-- Windows: แนะนำ Windows 11, WSL2 + Ubuntu, Docker Desktop with WSL integration และ RAM อย่างน้อย 16GB
+- Windows: แนะนำ Windows 11, PowerShell, Docker Desktop, Git, Node.js, uv, pnpm, Chrome/Edge/Brave/Chromium, Claude Code CLI และ RAM อย่างน้อย 16GB
 - พื้นที่ว่างอย่างน้อย 20GB
 - สิทธิ์เข้า GitHub repo `Phonsadboy/ATRIUM-TH`
 - บัญชี Claude หรือ ChatGPT อย่างน้อย 1 บัญชี หรือ API key ของ OpenAI/Anthropic
 
-ตัว installer จะพยายามติดตั้ง Docker Desktop, Git, Python/uv, Node.js และ `pnpm` ให้เองถ้ายังไม่มี แต่บางขั้นตอนอาจต้องให้ผู้ใช้ใส่รหัสเครื่องหรือกดยืนยันตามหน้าต่างของ macOS/Windows
+ตัว installer จะพยายามติดตั้ง Docker Desktop, Git, Python/uv, Node.js, `pnpm`, browser ที่รองรับ และ Claude Code CLI ให้เองถ้ายังไม่มี แต่บางขั้นตอนอาจต้องให้ผู้ใช้ใส่รหัสเครื่องหรือกดยืนยันตามหน้าต่างของ macOS/Windows
 
 ตำแหน่งติดตั้งที่แนะนำ:
 
 ```text
 macOS: ~/Projects/ai-company
-Windows WSL2: ~/Projects/ai-company
+Windows: %USERPROFILE%\Projects\ai-company
 ```
 
 อย่าวาง repo ใน iCloud Drive และควรเลี่ยง `Desktop` / `Documents` ถ้าเครื่องเปิด iCloud sync เพราะ database, Docker volume, `node_modules`, virtualenv และ runtime files ไม่ควรอยู่ในโฟลเดอร์ที่ sync กับ iCloud
 
-บน Windows ให้ clone repo ใน filesystem ของ WSL เช่น `/home/<user>/Projects/ai-company` ไม่ใช่ `/mnt/c/Users/...`, OneDrive, Desktop หรือ Documents
+บน Windows ให้ clone repo ใน path local ที่ไม่อยู่ใน OneDrive, Desktop, Documents หรือ Downloads
 
 ## คำสั่งหลัก
+
+ตัวอย่างด้านล่างเป็นคำสั่งฝั่ง macOS/Linux shell; บน Windows native ให้ใช้ `.\atrium.ps1` แทน `./atrium`
 
 ```bash
 ./atrium setup
@@ -176,7 +224,7 @@ Windows WSL2: ~/Projects/ai-company
 ./atrium start
 ```
 
-เปิด backend และ frontend ใน detached `screen` sessions ใช้ได้ดีบน macOS หรือ WSL ที่มี `screen` และ `zsh` พร้อม ถ้า Windows/WSL ไม่มี `screen` หรือ `zsh` ให้รัน backend และ frontend แยก terminal ตามตัวอย่างด้านบน
+เปิด backend และ frontend ใน detached local sessions: macOS ใช้ `screen`; Windows native ใช้ PID files และ logs ใน `system/logs`
 
 ```bash
 ./atrium status
@@ -208,7 +256,6 @@ Windows WSL2: ~/Projects/ai-company
 
 - ใส่ password/admin ของเครื่อง
 - เปิด Docker Desktop ครั้งแรก
-- เปิด Docker Desktop WSL integration บน Windows
 - login Claude หรือ ChatGPT
 - ใส่ API key
 - กดอนุญาต macOS Privacy & Security
@@ -221,7 +268,7 @@ Windows WSL2: ~/Projects/ai-company
 ./atrium setup
 ```
 
-บน Windows/WSL ถ้า `./atrium start` ติด `screen` หรือ `zsh` ให้เปิด backend และ frontend แยก 2 terminal ตามตัวอย่าง Windows ด้านบนแทน
+บน Windows native ให้ใช้ `.\atrium.ps1 start`; ถ้าติด blocker เฉพาะเครื่องให้แก้ dependency/permission บน PowerShell แล้วรันคำสั่งเดิมซ้ำ
 
 หรือบอก agent:
 
@@ -231,18 +278,18 @@ Windows WSL2: ~/Projects/ai-company
 
 ## What ATRIUM Is
 
-ATRIUM is a workspace for running a personal “AI company” on your Mac or Windows workstation. The recommended Windows path is WSL2/Ubuntu with Docker Desktop WSL integration. It is not just a library where you wire agents together from scratch. You talk to an Executive, then ATRIUM can route work to departments such as research, engineering, content, operations, or custom teams you create. Each department has its own role, tools, memory, assigned work, artifacts, and visible runtime status.
+ATRIUM is a workspace for running a personal “AI company” on your Mac or Windows workstation. Windows uses a native PowerShell runtime-control path. It is not just a library where you wire agents together from scratch. You talk to an Executive, then ATRIUM can route work to departments such as research, engineering, content, operations, or custom teams you create. Each department has its own role, tools, memory, assigned work, artifacts, and visible runtime status.
 
 The project is shaped by a practical gap in many AI agent and multi-agent demos: the idea is exciting, but real use still requires you to assemble the backend, frontend, database, runtime, provider auth, memory, tool permissions, logs, health checks, and operating guide yourself. ATRIUM starts as a full-stack local app so you can open a browser and inspect a working AI company, not just watch agents talk in a terminal.
 
 ### Why ATRIUM Is Different
 
 - **Thai-first**: onboarding, prompts, and day-to-day workflow are designed around Thai users first.
-- **Local-first on Mac/Windows**: runtime data, memory, database files, and workspaces are primarily kept on your machine. Windows should use WSL2/Ubuntu for the full local stack.
+- **Local-first on Mac/Windows**: runtime data, memory, database files, and workspaces are primarily kept on your machine. Windows uses native PowerShell for runtime control and Docker Desktop for Docker-backed services.
 - **More than agent chat**: ATRIUM includes an Executive, departments, tasks, approvals, handoffs, memory, artifacts, and runtime health.
-- **Full stack included**: FastAPI backend, Vite frontend, Postgres/pgvector, Ollama, and a setup shortcut through `./atrium`.
+- **Full stack included**: FastAPI backend, Vite frontend, Postgres/pgvector, Ollama, and setup shortcuts through `./atrium` on macOS or `.\atrium.ps1` on Windows.
 - **Flexible provider paths**: Claude Code account, ChatGPT account OAuth, OpenAI Platform API key, Anthropic API key, and local embeddings through Ollama.
-- **Runtime truth over guesswork**: `./atrium doctor`, `./atrium status`, `/health`, `/api/runtime`, and redacted support reports help identify what is ready and what is blocked.
+- **Runtime truth over guesswork**: `./atrium doctor` / `.\atrium.ps1 doctor`, `./atrium status` / `.\atrium.ps1 status`, `/health`, `/api/runtime`, and redacted support reports help identify what is ready and what is blocked.
 - **Human control stays visible**: important actions should have approvals, credential readiness, and inspectable status instead of invisible autonomy.
 
 ### Compared With Generic Agent Frameworks
@@ -294,45 +341,77 @@ Never ask for or print passwords, API keys, OAuth tokens, or secrets in chat.
 If Docker Desktop, machine password, provider login, or macOS permission approval is needed, tell me exactly what to do and wait.
 ```
 
-### Windows Through WSL2/Ubuntu
+### Windows Native PowerShell
 
-Use WSL2 + Ubuntu + Docker Desktop with WSL integration. Keep the repo inside the WSL filesystem, for example `/home/<user>/Projects/ai-company`; avoid OneDrive, Desktop, Documents, and `/mnt/c/...`.
-
-#### Option 1: Manual
-
-Open Administrator PowerShell and run:
+From a Windows checkout, run:
 
 ```powershell
-$script="$env:TEMP\atrium-windows-install.ps1"; Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/Phonsadboy/ATRIUM-TH/main/ops/windows_wsl_install.ps1" -OutFile $script; powershell -ExecutionPolicy Bypass -File $script
+.\atrium.ps1 doctor
+.\atrium.ps1 bootstrap --full
+.\atrium.ps1 setup
+.\atrium.ps1 start
+.\atrium.ps1 restart
+.\atrium.ps1 tools status
+.\atrium.ps1 tools status --json
+.\atrium.ps1 tools catalog
+.\atrium.ps1 tools catalog --json
+.\atrium.ps1 provider status --probe
+.\atrium.ps1 provider status --probe --json
+.\atrium.ps1 provider login chatgpt
+.\atrium.ps1 provider login claude-code
+.\atrium.ps1 provider disconnect chatgpt
+.\atrium.ps1 automation status --commands
+.\atrium.ps1 automation status --json
+.\atrium.ps1 automation source
+.\atrium.ps1 automation audit
+.\atrium.ps1 automation handoff --macos <macos-json>
+.\atrium.ps1 automation windows-live-proof --parity-run-id <run-id> --source-fingerprint <fingerprint> --source-manifest-sha256 <manifest> --source-file-count <count>
+.\atrium.ps1 automation artifact --label windows --expect-parity-run-id <run-id> <windows-json>
+.\atrium.ps1 automation report --macos <macos-json> --windows <copied-windows-json>
+.\atrium.ps1 status
+.\atrium.ps1 status --json
+.\atrium.ps1 logs
+.\atrium.ps1 logs --json
+.\atrium.ps1 report
+.\atrium.ps1 report --bundle
+.\atrium.ps1 stop
 ```
 
-Shortcut from an already cloned Windows checkout:
+The native path controls backend/frontend directly from Windows PowerShell and uses Docker Desktop for Postgres/Ollama.
+`atrium.cmd` is also available for Windows Terminal/cmd.exe and forwards to `.\atrium.ps1` with ExecutionPolicy Bypass; the documented primary path remains PowerShell.
+The installer and `.\atrium.ps1 setup` verify a runnable Python 3 command rather than trusting the Windows Store alias, refresh PATH for the current session, and persist common user PATH entries for `uv`, `pnpm`, `docker`, and `claude` so a new PowerShell can keep using the same native workflow.
+If browser installation is blocked by local policy, install Chrome, Edge, Brave, or Chromium manually, then run `.\atrium.ps1 automation status --commands` to inspect remaining browser/desktop gaps.
+`.\atrium.ps1 start` attempts to open Docker Desktop and wait for Docker before starting Postgres/Ollama; if Docker is still blocked, it stops with an explicit next step instead of letting the backend fail later.
+`.\atrium.ps1 tools status` and `.\atrium.ps1 tools catalog` inspect the AI tool registry, tool catalog, risk/executor summary, and connector readiness directly from the backend; add `--json` for redacted machine-readable diagnostics.
+`.\atrium.ps1 provider ...` manages ChatGPT account and Claude Code account readiness from the native terminal; add `--json` to `provider status --probe` for a redacted debug payload.
+`.\atrium.ps1 automation ...` exposes HostBridge browser/desktop readiness, source provenance handoff, a Windows proof handoff packet from a validated macOS artifact, native artifact validation, the preferred Windows live proof runner, the cross-OS report installer, and the OpenClaw-level audit gate from the same native entrypoint.
+The OpenClaw-level gate treats MCP external tools as a required surface: local MCP fallback can provide read/status guidance, but it does not satisfy external-write parity until the MCP gateway is healthy.
+`.\atrium.ps1 automation status --commands` prints browser/desktop HostBridge readiness, owner permission mode, and parity proof commands; add `--json` to capture redacted automation permission/parity state from PowerShell.
+`.\atrium.ps1 status` and `.\atrium.ps1 report` include AI tool, provider-auth, permission mode, connector, browser/desktop HostBridge, full-autonomy permission, and cross-OS parity readiness summaries; `status --json` and `logs --json` capture redacted runtime/log truth from PowerShell.
+When the UI self-update flow runs on Windows, ATRIUM schedules restart through `.\atrium.ps1 restart --force` in PowerShell and writes the result to `system/logs/self-update-restart.log`.
+`report` includes Docker CLI/Compose/daemon status, automation proof commands, and redacts secrets before printing; `report --bundle` writes a redacted zip with the support report, backend/frontend logs, and status/logs/permission/provider/tools/automation diagnostics JSON for debugging.
+
+For a fresh native Windows install before the repo exists:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\atrium-windows.ps1
+$script="$env:TEMP\atrium-windows-native-install.ps1"; Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/Phonsadboy/ATRIUM-TH/main/ops/install_windows_native.ps1" -OutFile $script; powershell -ExecutionPolicy Bypass -File $script
 ```
 
-After the shortcut is done, start manually from WSL when needed:
+Temporary skip flags are available: `-NoStart`, `-SkipDockerInstall`, `-SkipBrowserInstall`, and `-SkipClaudeCodeInstall`.
 
-```bash
-cd ~/Projects/ai-company
-./atrium setup
-```
-
-#### Option 2: Codex/Claude Assisted
+#### Codex/Claude Assisted Native Windows
 
 Open Codex or Claude Code on the Windows machine in Coding/Code mode with Full Access and send:
 
 ```text
-Install ATRIUM on Windows through WSL2/Ubuntu from https://github.com/Phonsadboy/ATRIUM-TH.git.
-Use the repo's PowerShell/WSL installer as the main path.
-Prepare Docker Desktop and enable WSL integration for Ubuntu if needed.
-Clone the repo inside WSL at ~/Projects/ai-company only.
-Do not place the repo in OneDrive, Desktop, Documents, or /mnt/c/...
-After setup, run ./atrium setup --yes and verify with ./atrium status.
+Install ATRIUM on Windows native PowerShell from https://github.com/Phonsadboy/ATRIUM-TH.git.
+Use .\atrium.ps1 as the main runtime-control path.
+Prepare Docker Desktop for Docker-backed services and Claude Code CLI for the Claude account provider if needed.
+Clone the repo into a folder outside OneDrive, Desktop, Documents, and Downloads.
+After setup, run .\atrium.ps1 setup --yes and verify with .\atrium.ps1 provider status --probe, .\atrium.ps1 automation status --commands, .\atrium.ps1 automation audit, and .\atrium.ps1 status. Do not claim OpenClaw-level Windows parity until live macOS/Windows proof artifacts have been installed with .\atrium.ps1 automation report and audit passes.
 The goal is to open http://127.0.0.1:5173 from a Windows browser and make the full stack usable.
 Never ask for or print passwords, API keys, OAuth tokens, or secrets in chat.
-If Windows restart, Ubuntu user creation, Docker Desktop, WSL integration, UAC/firewall approval, or provider login is needed, tell me exactly what to do and wait.
+If Windows restart, Docker Desktop, UAC/firewall approval, or provider login is needed, tell me exactly what to do and wait.
 ```
 
 Open:
@@ -343,7 +422,7 @@ http://127.0.0.1:5173
 
 ## Windows Notes
 
-- The supported Windows path is WSL2/Ubuntu. Native PowerShell can be used for manual experiments, but `./atrium start` is a Unix-style shortcut that expects `screen` and `zsh`.
-- Docker Desktop must be running on Windows, and WSL integration must be enabled for the Ubuntu distro that contains this repo.
-- Keep the repo inside the WSL filesystem. Avoid `/mnt/c/...`, OneDrive, Desktop, and Documents for runtime-heavy files.
-- If `./atrium start` is blocked by missing `screen` or `zsh`, rerun `.\atrium-windows.ps1` or install those packages inside WSL with `sudo apt install -y screen zsh`.
+- Windows native uses `.\atrium.ps1` for setup/start/stop/status/log/report from PowerShell.
+- Docker Desktop must be running on Windows for the full Docker-backed stack.
+- Keep native Windows checkouts out of OneDrive, Desktop, Documents, and Downloads.
+- Windows browser/desktop automation must run from a signed-in interactive desktop session; service-only sessions cannot drive the visible desktop.

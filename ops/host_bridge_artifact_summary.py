@@ -15,6 +15,12 @@ if str(OPS) not in sys.path:
 
 from host_bridge_parity_report import _proof_summary  # noqa: E402
 
+SYSTEM = OPS.parent / "system"
+if str(SYSTEM) not in sys.path:
+    sys.path.insert(0, str(SYSTEM))
+
+from app.host_bridge_proof import SOURCE_FINGERPRINT_FILES  # noqa: E402
+
 
 PROBE_SCHEMA_VERSION = 1
 OS_LABELS = {
@@ -95,7 +101,11 @@ def _nested(data: dict[str, Any], *path: str) -> Any:
 
 
 def _hex64(value: Any) -> bool:
-    return isinstance(value, str) and len(value) == 64 and all(ch in "0123456789abcdef" for ch in value.lower())
+    return isinstance(value, str) and len(value) == 64 and all(ch in "0123456789abcdef" for ch in value)
+
+
+def _hex40(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 40 and all(ch in "0123456789abcdef" for ch in value)
 
 
 def summarize_artifact(
@@ -104,6 +114,8 @@ def summarize_artifact(
     label: str,
     expect_parity_run_id: str | None,
     expect_source_fingerprint: str | None,
+    expect_source_manifest_sha256: str | None,
+    expect_source_file_count: int | None,
     max_artifact_age_hours: float,
 ) -> dict[str, Any]:
     data, error = _load_json(path)
@@ -118,8 +130,13 @@ def summarize_artifact(
             "findings": findings,
         }
     assert data is not None
+    expected_source_fingerprint = str(expect_source_fingerprint or "").strip()
+    expected_source_manifest_sha256 = str(expect_source_manifest_sha256 or "").strip()
     generated_at = data.get("generatedAt")
-    source_fingerprint = _nested(data, "source", "sourceFingerprint")
+    source = data.get("source") if isinstance(data.get("source"), dict) else {}
+    source_fingerprint = source.get("sourceFingerprint")
+    source_manifest_sha256 = source.get("sourceManifestSha256")
+    git_head = source.get("gitHead")
     parity_run_id = data.get("parityRunId")
     host = data.get("host") if isinstance(data.get("host"), dict) else {}
     status = data.get("status") if isinstance(data.get("status"), dict) else {}
@@ -148,11 +165,50 @@ def summarize_artifact(
         findings.append(f"parityRunId mismatch: artifact={parity_run_id}; expected={expect_parity_run_id}")
     if not _hex64(source_fingerprint):
         findings.append("sourceFingerprint is missing or invalid")
-    elif expect_source_fingerprint and source_fingerprint != expect_source_fingerprint:
+    elif expected_source_fingerprint and source_fingerprint != expected_source_fingerprint:
         findings.append(
             "sourceFingerprint mismatch: "
-            f"artifact={source_fingerprint}; expected={expect_source_fingerprint}"
+            f"artifact={source_fingerprint}; expected={expected_source_fingerprint}"
         )
+    manifest_valid = _hex64(source_manifest_sha256)
+    if not manifest_valid:
+        findings.append("sourceManifestSha256 is missing or invalid")
+    if manifest_valid and expected_source_manifest_sha256 and source_manifest_sha256 != expected_source_manifest_sha256:
+        findings.append(
+            "sourceManifestSha256 mismatch: "
+            f"artifact={source_manifest_sha256}; expected={expected_source_manifest_sha256}"
+        )
+    if manifest_valid and _hex64(source_fingerprint) and source_manifest_sha256 != source_fingerprint:
+        findings.append("sourceManifestSha256 must match sourceFingerprint")
+    if not _hex40(git_head):
+        findings.append("gitHead is missing or invalid")
+    source_files = source.get("files")
+    source_file_count = source.get("sourceFileCount")
+    if not isinstance(source_file_count, int) or isinstance(source_file_count, bool) or source_file_count <= 0:
+        findings.append("sourceFileCount is missing or invalid")
+    if not isinstance(source_files, dict):
+        findings.append("source file provenance is missing")
+    else:
+        if isinstance(source_file_count, int) and not isinstance(source_file_count, bool) and source_file_count != len(source_files):
+            findings.append(
+                "sourceFileCount must match source file provenance: "
+                f"sourceFileCount={source_file_count}; files={len(source_files)}"
+            )
+        if expect_source_file_count is not None and len(source_files) != expect_source_file_count:
+            findings.append(
+                "sourceFileCount mismatch: "
+                f"artifact={len(source_files)}; expected={expect_source_file_count}"
+            )
+        missing_source_files = [path for path in SOURCE_FINGERPRINT_FILES if not isinstance(source_files.get(path), dict)]
+        if missing_source_files:
+            findings.append(f"source file provenance is incomplete; missing={', '.join(missing_source_files[:6])}")
+        not_present = [
+            path
+            for path in SOURCE_FINGERPRINT_FILES
+            if isinstance(source_files.get(path), dict) and source_files[path].get("present") is not True
+        ]
+        if not_present:
+            findings.append(f"source file provenance has missing files; missing={', '.join(not_present[:6])}")
     if host.get("platform") != expected_platform:
         findings.append(f"host.platform must be {expected_platform!r}, got {host.get('platform')!r}")
     if status.get("platform") != expected_platform:
@@ -174,7 +230,10 @@ def summarize_artifact(
         "generatedAt": generated_at,
         "parityRunId": parity_run_id,
         "sourceFingerprint": source_fingerprint,
-        "gitHead": _nested(data, "source", "gitHead"),
+        "sourceManifestSha256": source_manifest_sha256,
+        "sourceFileCount": source_file_count,
+        "sourceFileProvenanceCount": len(source_files) if isinstance(source_files, dict) else 0,
+        "gitHead": git_head,
         "hostPlatform": host.get("platform"),
         "hostName": host.get("hostname"),
         "hostFingerprint": host.get("hostFingerprint"),
@@ -192,6 +251,8 @@ def main() -> int:
     parser.add_argument("--label", choices=sorted(OS_LABELS), required=True)
     parser.add_argument("--expect-parity-run-id")
     parser.add_argument("--expect-source-fingerprint")
+    parser.add_argument("--expect-source-manifest-sha256")
+    parser.add_argument("--expect-source-file-count", type=int)
     parser.add_argument("--max-artifact-age-hours", type=float, default=24.0)
     args = parser.parse_args()
 
@@ -200,6 +261,8 @@ def main() -> int:
         label=args.label,
         expect_parity_run_id=args.expect_parity_run_id,
         expect_source_fingerprint=args.expect_source_fingerprint,
+        expect_source_manifest_sha256=args.expect_source_manifest_sha256,
+        expect_source_file_count=args.expect_source_file_count,
         max_artifact_age_hours=args.max_artifact_age_hours,
     )
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))

@@ -62,11 +62,16 @@ MACOS_TEXTEDIT_NATIVE_SCROLL_ACTIONS = {"AXScrollDownByPage", "setScrollBarValue
 MACOS_CALCULATOR_EXPECTED_VALUE = "1"
 
 
-def _stamp_result(result: dict[str, Any], *, parity_run_id: str | None = None) -> dict[str, Any]:
+def _stamp_result(
+    result: dict[str, Any],
+    *,
+    parity_run_id: str | None = None,
+    source: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     stamped = {
         "schemaVersion": PROBE_SCHEMA_VERSION,
         "generatedAt": int(time.time() * 1000),
-        "source": host_bridge_source_provenance(ROOT),
+        "source": source if isinstance(source, dict) else host_bridge_source_provenance(ROOT),
         "host": host_bridge_host_identity(),
         **result,
     }
@@ -75,17 +80,35 @@ def _stamp_result(result: dict[str, Any], *, parity_run_id: str | None = None) -
     return stamped
 
 
-def _source_preflight_result(expected_source_fingerprint: str | None) -> dict[str, Any] | None:
+def _hex64(value: str) -> bool:
+    return len(value) == 64 and all(ch in "0123456789abcdef" for ch in value)
+
+
+def _source_preflight_result(
+    expected_source_fingerprint: str | None,
+    expected_source_manifest_sha256: str | None = None,
+    expected_source_file_count: int | None = None,
+    source: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     expected = str(expected_source_fingerprint or "").strip().lower()
-    if not expected:
+    expected_manifest = str(expected_source_manifest_sha256 or "").strip().lower()
+    if not expected and not expected_manifest and expected_source_file_count is None:
         return None
-    source = host_bridge_source_provenance(ROOT)
+    source = source if isinstance(source, dict) else host_bridge_source_provenance(ROOT)
     actual = str(source.get("sourceFingerprint") or "").strip().lower()
+    actual_manifest = str(source.get("sourceManifestSha256") or "").strip().lower()
+    actual_file_count = source.get("sourceFileCount")
     findings: list[str] = []
-    if len(expected) != 64 or any(ch not in "0123456789abcdef" for ch in expected):
+    if expected and not _hex64(expected):
         findings.append(f"expected source fingerprint is invalid: {expected_source_fingerprint!r}")
-    elif actual != expected:
+    elif expected and actual != expected:
         findings.append(f"source fingerprint mismatch: current={actual}; expected={expected}")
+    if expected_manifest and not _hex64(expected_manifest):
+        findings.append(f"expected source manifest sha256 is invalid: {expected_source_manifest_sha256!r}")
+    elif expected_manifest and actual_manifest != expected_manifest:
+        findings.append(f"source manifest sha256 mismatch: current={actual_manifest}; expected={expected_manifest}")
+    if expected_source_file_count is not None and actual_file_count != expected_source_file_count:
+        findings.append(f"source file count mismatch: current={actual_file_count}; expected={expected_source_file_count}")
     if not findings:
         return None
     return {
@@ -95,7 +118,11 @@ def _source_preflight_result(expected_source_fingerprint: str | None) -> dict[st
         "sourcePreflight": {
             "ok": False,
             "expectedSourceFingerprint": expected,
+            "expectedSourceManifestSha256": expected_manifest,
+            "expectedSourceFileCount": expected_source_file_count,
             "actualSourceFingerprint": actual,
+            "actualSourceManifestSha256": actual_manifest,
+            "actualSourceFileCount": actual_file_count,
             "findings": findings,
         },
     }
@@ -787,9 +814,27 @@ def _interactive_textedit_probe(run_process: Any = _run_process) -> dict[str, An
         if checks["nativeScrollVerified"] is not True:
             checks["error"] = "desktop.act did not prove TextEdit AXScrollDownByPage native Accessibility action"
             return checks
+        checks["desktopSnapshotBeforeSetText"] = visual_bridge.execute_desktop_snapshot(
+            {"processId": process_id, "maxElements": 80, "maxDepth": 3, "timeoutSeconds": 5},
+            run_process,
+        )
+        refreshed_text_ref = _first_desktop_text_ref(checks["desktopSnapshotBeforeSetText"])
+        if checks["desktopSnapshotBeforeSetText"].get("returnCode") != 0 or not refreshed_text_ref:
+            checks["error"] = "desktop.snapshot did not expose a fresh TextEdit text ref after native scroll"
+            return checks
+        checks["nativeActionMetadataVerified"] = _macos_native_ref_metadata_verified(
+            checks["desktopSnapshotBeforeSetText"],
+            refreshed_text_ref,
+            supported_action="paste",
+            settable_attribute="AXValue",
+        )
+        if checks["nativeActionMetadataVerified"] is not True:
+            checks["error"] = "desktop.snapshot did not prove fresh TextEdit setValue metadata after native scroll"
+            return checks
+        checks["refreshedTextRefAfterScroll"] = refreshed_text_ref
         checks["desktopActSetText"] = visual_bridge.execute_desktop_act(
             {
-                "ref": text_ref,
+                "ref": refreshed_text_ref,
                 "action": "paste",
                 "text": expected_text,
                 "requireNative": True,
@@ -1371,9 +1416,17 @@ def main() -> int:
     parser.add_argument("--output", type=Path, help="Optional path to write the stamped probe JSON artifact.")
     parser.add_argument("--parity-run-id", help="Shared ID to stamp on paired macOS/Windows full-probe artifacts for the cross-OS verifier.")
     parser.add_argument("--expect-source-fingerprint", help="Refuse to run unless the current HostBridge source fingerprint matches this value.")
+    parser.add_argument("--expect-source-manifest-sha256", help="Refuse to run unless the current HostBridge source manifest SHA-256 matches this value.")
+    parser.add_argument("--expect-source-file-count", type=int, help="Refuse to run unless the current HostBridge proof-bound source file count matches this value.")
     args = parser.parse_args()
     full_browser_url = args.browser_url or ("https://example.com" if args.full else None)
-    result = _source_preflight_result(args.expect_source_fingerprint)
+    source_snapshot = host_bridge_source_provenance(ROOT)
+    result = _source_preflight_result(
+        args.expect_source_fingerprint,
+        args.expect_source_manifest_sha256,
+        args.expect_source_file_count,
+        source_snapshot,
+    )
     if result is None:
         result = _simulate() if args.simulate else _live(
             screenshot=args.screenshot or args.full,
@@ -1383,7 +1436,7 @@ def main() -> int:
             browser_profile=args.browser_profile,
             interactive=args.interactive or args.full,
         )
-    result = _stamp_result(result, parity_run_id=args.parity_run_id)
+    result = _stamp_result(result, parity_run_id=args.parity_run_id, source=source_snapshot)
     if args.output:
         _write_output(result, args.output)
     print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))

@@ -85,14 +85,32 @@ function toolLabel(tool: ToolName | string): string {
   return TOOL_LABEL[tool as ToolName] ?? tool
 }
 
+function browserHostIsWindows(): boolean {
+  const platform = typeof navigator !== 'undefined' ? navigator.platform.toLowerCase() : ''
+  const userAgent = typeof navigator !== 'undefined' ? navigator.userAgent.toLowerCase() : ''
+  return platform.includes('win') || userAgent.includes('windows')
+}
+
+function desktopExampleAppName(): string {
+  return browserHostIsWindows() ? 'Notepad' : 'TextEdit'
+}
+
+function shellExampleCommand(): string[] {
+  return browserHostIsWindows()
+    ? ['powershell.exe', '-NoProfile', '-Command', 'Get-Location']
+    : ['pwd']
+}
+
 function defaultArgsText(tool: ToolName): string {
+  const desktopApp = desktopExampleAppName()
+  const shellCommand = shellExampleCommand()
   const args: Record<string, unknown> =
     tool === 'fs.list' ? { path: '.' }
     : tool === 'fs.read' ? { path: 'README.md' }
     : tool === 'fs.write' ? { path: 'notes.txt', text: '' }
     : tool === 'fs.patch' ? { path: 'notes.txt', oldText: '', newText: '' }
     : tool === 'fs.delete' ? { path: 'notes.txt', recursive: false }
-    : tool === 'shell.exec' || tool === 'run_command' ? { command: ['pwd'], cwd: '.' }
+    : tool === 'shell.exec' || tool === 'run_command' ? { command: shellCommand, cwd: '.' }
     : tool === 'sandbox.exec' ? { command: ['pwd'], image: 'python:3.12-slim', network: false }
     : tool === 'git.status' ? { cwd: '.' }
     : tool === 'git.diff' ? { cwd: '.', staged: false }
@@ -109,9 +127,9 @@ function defaultArgsText(tool: ToolName): string {
     : tool === 'desktop.apps' ? { includeRunning: true, includeInstalled: true, limit: 80 }
     : tool === 'desktop.snapshot' ? { maxElements: 120, maxDepth: 4 }
     : tool === 'desktop.act' ? { ref: 'd1', action: 'click', snapshotAfter: true }
-    : tool === 'desktop.open_app' ? { appName: 'TextEdit' }
-    : tool === 'desktop.activate_app' ? { appName: 'TextEdit' }
-    : tool === 'desktop.quit_app' ? { appName: 'TextEdit', force: false }
+    : tool === 'desktop.open_app' ? { appName: desktopApp }
+    : tool === 'desktop.activate_app' ? { appName: desktopApp }
+    : tool === 'desktop.quit_app' ? { appName: desktopApp, force: false }
     : tool === 'http.get' || tool === 'http_get' ? { url: 'https://example.com' }
     : tool === 'http.post' ? { url: 'https://example.com', json: {} }
     : tool === 'mcp.call' ? { server: '', tool: '', arguments: {} }

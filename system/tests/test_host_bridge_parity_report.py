@@ -59,7 +59,9 @@ def _source(fingerprint: str | None = None, git_head: str | None = None) -> dict
         "gitDirty": False,
         "gitStatusShort": [],
         "sourceFingerprint": fingerprint or current["sourceFingerprint"],
-        "files": {},
+        "sourceManifestSha256": fingerprint or current["sourceManifestSha256"],
+        "sourceFileCount": len(current.get("files") or {}),
+        "files": current.get("files") or {},
     }
 
 
@@ -365,6 +367,10 @@ class HostBridgeParityReportTest(unittest.TestCase):
         self.assertEqual(report["results"]["windows"]["hostPlatform"], "win32")
         self.assertRegex(report["results"]["windows"]["hostFingerprint"], r"^[0-9a-f]{64}$")
         self.assertEqual(report["results"]["macos"]["sourceFingerprint"], _source()["sourceFingerprint"])
+        self.assertEqual(report["results"]["macos"]["sourceManifestSha256"], _source()["sourceManifestSha256"])
+        self.assertEqual(report["results"]["macos"]["sourceFileCount"], len(_source()["files"]))
+        self.assertEqual(report["currentSource"]["sourceManifestSha256"], _source()["sourceManifestSha256"])
+        self.assertEqual(report["currentSource"]["sourceFileCount"], len(_source()["files"]))
         self.assertEqual(report["results"]["windows"]["gitHead"], _source()["gitHead"])
         self.assertEqual(report["currentSource"]["sourceFingerprint"], _source()["sourceFingerprint"])
         self.assertGreater(report["results"]["macos"]["artifactBytes"], 0)
@@ -400,6 +406,8 @@ class HostBridgeParityReportTest(unittest.TestCase):
         self.assertTrue(persisted["results"]["macos"]["ok"])
         self.assertTrue(persisted["results"]["windows"]["ok"])
         self.assertGreater(persisted["results"]["macos"]["artifactBytes"], 0)
+        self.assertEqual(persisted["results"]["windows"]["sourceManifestSha256"], _source()["sourceManifestSha256"])
+        self.assertEqual(persisted["results"]["windows"]["sourceFileCount"], len(_source()["files"]))
         self.assertRegex(persisted["results"]["windows"]["artifactSha256"], r"^[0-9a-f]{64}$")
         self.assertTrue(persisted["results"]["macos"]["proofs"]["browserSnapshot"])
         self.assertTrue(persisted["results"]["windows"]["proofs"]["browserActIsolatedPlaywright"])
@@ -422,6 +430,80 @@ class HostBridgeParityReportTest(unittest.TestCase):
         self.assertFalse(report_bad["ok"])
         self.assertFalse(report_bad["results"]["macos"]["proofs"]["browserActVerified"])
         self.assertIn("macos: browser.act DOM-ref proof did not verify the post-click DOM state", "\n".join(report_bad["findings"]))
+
+    def test_parity_report_rejects_incomplete_source_file_provenance(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos = _macos_artifact()
+            windows = _windows_artifact()
+            macos["source"]["files"] = {}
+            windows["source"]["files"] = dict(windows["source"]["files"])
+            windows["source"]["files"].pop("atrium.ps1", None)
+            macos_path = self._write_artifact(directory, "macos.json", macos)
+            windows_path = self._write_artifact(directory, "windows.json", windows)
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        self.assertFalse(report["ok"])
+        findings = "\n".join(report["findings"])
+        self.assertIn("source file provenance is incomplete", findings)
+        self.assertIn("atrium.ps1", findings)
+
+    def test_parity_report_rejects_missing_or_mismatched_source_manifest_digest(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos = _macos_artifact()
+            windows = _windows_artifact()
+            macos["source"].pop("sourceManifestSha256", None)
+            windows["source"]["sourceManifestSha256"] = "f" * 64
+            macos_path = self._write_artifact(directory, "macos.json", macos)
+            windows_path = self._write_artifact(directory, "windows.json", windows)
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        self.assertFalse(report["ok"])
+        findings = "\n".join(report["findings"])
+        self.assertIn("sourceManifestSha256 is missing or invalid", findings)
+        self.assertIn("sourceManifestSha256 must match sourceFingerprint", findings)
+
+    def test_parity_report_rejects_non_lowercase_hex_provenance_hashes(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos = _macos_artifact()
+            windows = _windows_artifact()
+            macos["host"]["hostFingerprint"] = "A" * 64
+            windows["source"]["gitHead"] = "G" * 40
+            macos_path = self._write_artifact(directory, "macos.json", macos)
+            windows_path = self._write_artifact(directory, "windows.json", windows)
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        self.assertFalse(report["ok"])
+        findings = "\n".join(report["findings"])
+        self.assertIn("macos: artifact hostFingerprint is missing or invalid", findings)
+        self.assertIn("windows: artifact gitHead is missing or invalid", findings)
+
+    def test_parity_report_rejects_mismatched_declared_source_file_count(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos = _macos_artifact()
+            windows = _windows_artifact()
+            macos["source"]["sourceFileCount"] = len(macos["source"]["files"]) - 1
+            windows["source"]["sourceFileCount"] = len(windows["source"]["files"]) + 1
+            macos_path = self._write_artifact(directory, "macos.json", macos)
+            windows_path = self._write_artifact(directory, "windows.json", windows)
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        self.assertFalse(report["ok"])
+        findings = "\n".join(report["findings"])
+        self.assertIn("artifact sourceFileCount must match source file provenance", findings)
+        self.assertEqual(report["results"]["windows"]["sourceFileCount"], len(windows["source"]["files"]) + 1)
+        self.assertEqual(report["results"]["windows"]["sourceFileProvenanceCount"], len(windows["source"]["files"]))
 
     def test_parity_report_rejects_browser_ref_without_isolated_playwright_profile(self) -> None:
         report_module = _load_report_module()
@@ -879,6 +961,8 @@ class HostBridgeParityReportTest(unittest.TestCase):
                 label="windows",
                 expect_parity_run_id="parity-run-1",
                 expect_source_fingerprint=artifact["source"]["sourceFingerprint"],
+                expect_source_manifest_sha256=artifact["source"]["sourceManifestSha256"],
+                expect_source_file_count=len(artifact["source"]["files"]),
                 max_artifact_age_hours=24.0,
             )
 
@@ -886,6 +970,8 @@ class HostBridgeParityReportTest(unittest.TestCase):
         self.assertEqual(summary["label"], "windows")
         self.assertEqual(summary["hostPlatform"], "win32")
         self.assertEqual(summary["statusPlatform"], "win32")
+        self.assertEqual(summary["sourceManifestSha256"], artifact["source"]["sourceManifestSha256"])
+        self.assertEqual(summary["sourceFileCount"], len(_source()["files"]))
         self.assertTrue(summary["proofs"]["notepadNativeAct"])
         self.assertTrue(summary["proofs"]["browserActIsolatedPlaywright"])
         self.assertEqual(summary["findings"], [])
@@ -902,11 +988,126 @@ class HostBridgeParityReportTest(unittest.TestCase):
                 label="windows",
                 expect_parity_run_id="parity-run-1",
                 expect_source_fingerprint="f" * 64,
+                expect_source_manifest_sha256=artifact["source"]["sourceManifestSha256"],
+                expect_source_file_count=len(artifact["source"]["files"]),
                 max_artifact_age_hours=24.0,
             )
 
         self.assertFalse(summary["ok"])
         self.assertIn("sourceFingerprint mismatch", " ".join(summary["findings"]))
+
+    def test_artifact_summary_rejects_uppercase_expected_source_fingerprint(self) -> None:
+        summary_module = _load_summary_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            artifact = _windows_artifact()
+            artifact_path = self._write_artifact(directory, "windows.json", artifact)
+
+            summary = summary_module.summarize_artifact(
+                artifact_path,
+                label="windows",
+                expect_parity_run_id="parity-run-1",
+                expect_source_fingerprint=artifact["source"]["sourceFingerprint"].upper(),
+                expect_source_manifest_sha256=artifact["source"]["sourceManifestSha256"].upper(),
+                expect_source_file_count=len(artifact["source"]["files"]),
+                max_artifact_age_hours=24.0,
+            )
+
+        self.assertFalse(summary["ok"])
+        findings = " ".join(summary["findings"])
+        self.assertIn("sourceFingerprint mismatch", findings)
+        self.assertIn("sourceManifestSha256 mismatch", findings)
+
+    def test_artifact_summary_rejects_incomplete_source_file_provenance(self) -> None:
+        summary_module = _load_summary_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            artifact = _windows_artifact()
+            artifact["source"]["files"] = dict(artifact["source"]["files"])
+            artifact["source"]["files"].pop("atrium.ps1", None)
+            artifact_path = self._write_artifact(directory, "windows.json", artifact)
+
+            summary = summary_module.summarize_artifact(
+                artifact_path,
+                label="windows",
+                expect_parity_run_id="parity-run-1",
+                expect_source_fingerprint=artifact["source"]["sourceFingerprint"],
+                expect_source_manifest_sha256=artifact["source"]["sourceManifestSha256"],
+                expect_source_file_count=len(_source()["files"]),
+                max_artifact_age_hours=24.0,
+            )
+
+        self.assertFalse(summary["ok"])
+        self.assertIn("source file provenance is incomplete", " ".join(summary["findings"]))
+        self.assertIn("atrium.ps1", " ".join(summary["findings"]))
+
+    def test_artifact_summary_rejects_declared_source_file_count_mismatch(self) -> None:
+        summary_module = _load_summary_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            artifact = _windows_artifact()
+            artifact["source"]["sourceFileCount"] = len(artifact["source"]["files"]) + 1
+            artifact_path = self._write_artifact(directory, "windows.json", artifact)
+
+            summary = summary_module.summarize_artifact(
+                artifact_path,
+                label="windows",
+                expect_parity_run_id="parity-run-1",
+                expect_source_fingerprint=artifact["source"]["sourceFingerprint"],
+                expect_source_manifest_sha256=artifact["source"]["sourceManifestSha256"],
+                expect_source_file_count=len(artifact["source"]["files"]),
+                max_artifact_age_hours=24.0,
+            )
+
+        self.assertFalse(summary["ok"])
+        self.assertEqual(summary["sourceFileCount"], len(artifact["source"]["files"]) + 1)
+        self.assertEqual(summary["sourceFileProvenanceCount"], len(artifact["source"]["files"]))
+        self.assertIn("sourceFileCount must match source file provenance", " ".join(summary["findings"]))
+
+    def test_artifact_summary_rejects_mismatched_source_manifest_digest(self) -> None:
+        summary_module = _load_summary_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            artifact = _windows_artifact()
+            artifact["source"]["sourceManifestSha256"] = "f" * 64
+            artifact_path = self._write_artifact(directory, "windows.json", artifact)
+
+            summary = summary_module.summarize_artifact(
+                artifact_path,
+                label="windows",
+                expect_parity_run_id="parity-run-1",
+                expect_source_fingerprint=artifact["source"]["sourceFingerprint"],
+                expect_source_manifest_sha256=artifact["source"]["sourceFingerprint"],
+                expect_source_file_count=len(artifact["source"]["files"]),
+                max_artifact_age_hours=24.0,
+            )
+
+        self.assertFalse(summary["ok"])
+        self.assertIn("sourceManifestSha256 must match sourceFingerprint", " ".join(summary["findings"]))
+
+    def test_artifact_summary_rejects_non_lowercase_hex_host_fingerprint_and_git_head(self) -> None:
+        summary_module = _load_summary_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            artifact = _windows_artifact()
+            artifact["host"]["hostFingerprint"] = "B" * 64
+            artifact["source"]["gitHead"] = "G" * 40
+            artifact_path = self._write_artifact(directory, "windows.json", artifact)
+
+            summary = summary_module.summarize_artifact(
+                artifact_path,
+                label="windows",
+                expect_parity_run_id="parity-run-1",
+                expect_source_fingerprint=artifact["source"]["sourceFingerprint"],
+                expect_source_manifest_sha256=artifact["source"]["sourceManifestSha256"],
+                expect_source_file_count=len(artifact["source"]["files"]),
+                max_artifact_age_hours=24.0,
+            )
+
+        self.assertFalse(summary["ok"])
+        findings = " ".join(summary["findings"])
+        self.assertIn("hostFingerprint is missing or invalid", findings)
+        self.assertIn("gitHead is missing or invalid", findings)
 
     def test_artifact_summary_rejects_missing_required_windows_proof_facet(self) -> None:
         summary_module = _load_summary_module()
@@ -921,6 +1122,8 @@ class HostBridgeParityReportTest(unittest.TestCase):
                 label="windows",
                 expect_parity_run_id="parity-run-1",
                 expect_source_fingerprint=artifact["source"]["sourceFingerprint"],
+                expect_source_manifest_sha256=artifact["source"]["sourceManifestSha256"],
+                expect_source_file_count=len(artifact["source"]["files"]),
                 max_artifact_age_hours=24.0,
             )
 
@@ -939,6 +1142,22 @@ class HostBridgeParityReportTest(unittest.TestCase):
         self.assertFalse(summary["ok"])
         self.assertRegex(summary["sourceFingerprint"], r"^[0-9a-f]{64}$")
         self.assertIn("sourceFingerprint mismatch", " ".join(summary["findings"]))
+
+    def test_source_summary_rejects_uppercase_expected_source_fingerprint(self) -> None:
+        source_summary_module = _load_source_summary_module()
+        current = source_summary_module.summarize_source(root=REPO_ROOT)
+
+        summary = source_summary_module.summarize_source(
+            expect_source_fingerprint=str(current["sourceFingerprint"]).upper(),
+            expect_source_manifest_sha256=str(current["sourceManifestSha256"]).upper(),
+            expect_source_file_count=current["sourceFileCount"],
+            root=REPO_ROOT,
+        )
+
+        self.assertFalse(summary["ok"])
+        findings = " ".join(summary["findings"])
+        self.assertIn("sourceFingerprint mismatch", findings)
+        self.assertIn("sourceManifestSha256 mismatch", findings)
 
     def test_parity_report_rejects_missing_browser_ref_proof(self) -> None:
         report_module = _load_report_module()

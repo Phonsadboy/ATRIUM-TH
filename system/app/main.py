@@ -157,7 +157,7 @@ from .handoffs import (
     make_handoff_message,
     normalize_handoff_status,
 )
-from .host_bridge_proof import host_bridge_parity_proof_id, host_bridge_source_provenance
+from .host_bridge_proof import SOURCE_FINGERPRINT_FILES, host_bridge_parity_proof_id, host_bridge_source_provenance
 from .engine import (
     PAUSED_BY_USER_REASON,
     approve_task_close_request,
@@ -501,7 +501,7 @@ class VersionUpdateResponse(Schema):
     backup: dict[str, Any] | None = None
     migrations: dict[str, Any] | None = None
     restartScheduled: bool = False
-    restartMode: Literal["screen", "custom", "manual"] = "manual"
+    restartMode: Literal["screen", "windows_native", "custom", "manual"] = "manual"
     restartLogPath: str | None = None
     stdout: str | None = None
     stderr: str | None = None
@@ -1483,6 +1483,14 @@ def _can_restart_with_screen() -> bool:
     return _ATRIUM_BACKEND_SCREEN in sessions and _ATRIUM_UI_SCREEN in sessions
 
 
+def _powershell_command() -> str | None:
+    return shutil.which("powershell.exe") or shutil.which("powershell") or shutil.which("pwsh")
+
+
+def _ps_single_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
 def _schedule_version_restart(path: Path) -> dict[str, Any]:
     log_path = path / "system" / "logs" / "self-update-restart.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1490,6 +1498,16 @@ def _schedule_version_restart(path: Path) -> dict[str, Any]:
     if custom_cmd:
         command = custom_cmd
         mode = "custom"
+    elif sys.platform == "win32":
+        if not (path / "atrium.ps1").exists():
+            return {
+                "scheduled": False,
+                "mode": "manual",
+                "logPath": str(log_path),
+                "error": "atrium.ps1 was not found; restart manually after update.",
+            }
+        command = ".\\atrium.ps1 restart --force"
+        mode = "windows_native"
     elif _can_restart_with_screen():
         command = "./atrium stop && ./atrium start --force"
         mode = "screen"
@@ -1500,6 +1518,35 @@ def _schedule_version_restart(path: Path) -> dict[str, Any]:
             "logPath": str(log_path),
             "error": "ATRIUM screen sessions were not detected; restart manually after update.",
         }
+
+    if sys.platform == "win32":
+        powershell = _powershell_command()
+        if not powershell:
+            return {
+                "scheduled": False,
+                "mode": "manual",
+                "logPath": str(log_path),
+                "error": "PowerShell was not found; restart manually after update.",
+            }
+        script = (
+            "Start-Sleep -Seconds 1; "
+            f"Set-Location -LiteralPath {_ps_single_quote(str(path))}; "
+            f"& {{ {command} }} *>> {_ps_single_quote(str(log_path))}"
+        )
+        flags = (
+            getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+        subprocess.Popen(
+            [powershell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=flags,
+            close_fds=True,
+        )
+        return {"scheduled": True, "mode": mode, "logPath": str(log_path), "error": None}
 
     script = (
         "sleep 1\n"
@@ -3340,14 +3387,43 @@ def _tool_runtime_block_reason(run: dict[str, Any]) -> str | None:
     return None
 
 
-_HOST_BRIDGE_PARITY_PROOF_GAP = (
-    "Run ops/host_bridge_parity_report.py with macOS and Windows --full probe artifacts before claiming cross-OS HostBridge parity."
-)
+def _atrium_launcher_for_platform(host_platform: str | None = None) -> str:
+    return ".\\atrium.ps1" if str(host_platform or sys.platform) == "win32" else "./atrium"
+
+
+def _host_bridge_parity_report_command(host_platform: str | None = None) -> str:
+    return f"{_atrium_launcher_for_platform(host_platform)} automation report"
+
+
+def _host_bridge_parity_audit_command(host_platform: str | None = None) -> str:
+    return f"{_atrium_launcher_for_platform(host_platform)} automation audit"
+
+
+def _host_bridge_command_hint(text: str, host_platform: str | None = None) -> str:
+    return (
+        text.replace("./atrium automation report", _host_bridge_parity_report_command(host_platform))
+        .replace("./atrium automation audit", _host_bridge_parity_audit_command(host_platform))
+    )
+
+
+def _host_bridge_parity_proof_gap(host_platform: str | None = None) -> str:
+    return _host_bridge_command_hint(
+        "Run ./atrium automation report with verified macOS and Windows --full probe artifacts, "
+        "then ./atrium automation audit, before claiming cross-OS HostBridge parity.",
+        host_platform,
+    )
+
+
 _HOST_BRIDGE_PARITY_REPORT_SCHEMA_VERSION = 1
 _HOST_BRIDGE_PARITY_PROOF_SCHEMA_VERSION = 1
 _HOST_BRIDGE_PARITY_RESULT_LABELS = {"macos", "windows"}
 _HOST_BRIDGE_PARITY_RESULT_PLATFORMS = {"macos": "darwin", "windows": "win32"}
 _HOST_BRIDGE_PARITY_RUN_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{2,127}$")
+_HOST_BRIDGE_HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _host_bridge_is_hex64(value: Any) -> bool:
+    return isinstance(value, str) and _HOST_BRIDGE_HEX64_RE.fullmatch(value) is not None
 _COMMON_HOST_BRIDGE_PROOF_FACETS = {
     "browserOpen": "browser.open proof",
     "browserOpenIsolatedProfile": "browser.open isolated ATRIUM profile proof",
@@ -3400,7 +3476,7 @@ def _host_bridge_parity_report_proof(settings: Any) -> dict[str, Any]:
             "ok": False,
             "path": str(path),
             "summary": "No persisted HostBridge parity report is available.",
-            "findings": [_HOST_BRIDGE_PARITY_PROOF_GAP],
+            "findings": [_host_bridge_parity_proof_gap()],
             "details": {"reportPath": str(path), "reportPresent": False},
         }
     except (json.JSONDecodeError, OSError) as exc:
@@ -3433,26 +3509,26 @@ def _host_bridge_parity_report_proof(settings: Any) -> dict[str, Any]:
         "reportSummary": loaded.get("summary"),
     }
     if loaded.get("schemaVersion") != _HOST_BRIDGE_PARITY_REPORT_SCHEMA_VERSION:
-        findings.append("Persisted parity report schemaVersion is not 1; regenerate with ops/host_bridge_parity_report.py --output.")
+        findings.append("Persisted parity report schemaVersion is not 1; regenerate with ./atrium automation report.")
     if loaded.get("proofSchemaVersion") != _HOST_BRIDGE_PARITY_PROOF_SCHEMA_VERSION:
-        findings.append("Persisted parity report proofSchemaVersion is not 1; regenerate with ops/host_bridge_parity_report.py --output.")
+        findings.append("Persisted parity report proofSchemaVersion is not 1; regenerate with ./atrium automation report.")
     proof_id = loaded.get("proofId")
-    if loaded.get("ok") is True and (not isinstance(proof_id, str) or len(proof_id) != 64):
-        findings.append("Persisted parity report proofId is missing or invalid; regenerate with ops/host_bridge_parity_report.py --output.")
+    if loaded.get("ok") is True and not _host_bridge_is_hex64(proof_id):
+        findings.append("Persisted parity report proofId is missing or invalid; regenerate with ./atrium automation report.")
     generated_at = loaded.get("generatedAt")
     if not isinstance(generated_at, int):
-        findings.append("Persisted parity report is missing generatedAt; regenerate with ops/host_bridge_parity_report.py --output.")
+        findings.append("Persisted parity report is missing generatedAt; regenerate with ./atrium automation report.")
     else:
         now = now_ms()
         if generated_at > now + 5 * 60 * 1000:
-            findings.append("Persisted parity report generatedAt is in the future; regenerate with ops/host_bridge_parity_report.py --output.")
+            findings.append("Persisted parity report generatedAt is in the future; regenerate with ./atrium automation report.")
         max_age_hours = float(getattr(settings, "host_bridge_parity_report_max_age_hours", 24.0) or 0.0)
         if max_age_hours > 0:
             max_age_ms = int(max_age_hours * 60 * 60 * 1000)
             age_ms = now - generated_at
             if age_ms > max_age_ms:
                 findings.append(
-                    f"Persisted parity report is stale; regenerate with ops/host_bridge_parity_report.py --output. "
+                    f"Persisted parity report is stale; regenerate with ./atrium automation report. "
                     f"ageHours={age_ms / 3600000:.1f}; maxAgeHours={max_age_hours:.1f}"
                 )
     results = loaded.get("results") if isinstance(loaded.get("results"), dict) else {}
@@ -3461,15 +3537,16 @@ def _host_bridge_parity_report_proof(settings: Any) -> dict[str, Any]:
     missing_result_labels = sorted(_HOST_BRIDGE_PARITY_RESULT_LABELS - result_labels)
     if unexpected_result_labels:
         findings.append(
-            "Persisted parity report has unexpected OS result labels; regenerate with ops/host_bridge_parity_report.py --output. "
+            "Persisted parity report has unexpected OS result labels; regenerate with ./atrium automation report. "
             f"labels={', '.join(unexpected_result_labels)}"
         )
     if missing_result_labels:
         findings.append(
-            "Persisted parity report is missing required OS result labels; regenerate with ops/host_bridge_parity_report.py --output. "
+            "Persisted parity report is missing required OS result labels; regenerate with ./atrium automation report. "
             f"labels={', '.join(missing_result_labels)}"
         )
     source_fingerprints: dict[str, str] = {}
+    source_manifest_shas: dict[str, str] = {}
     git_heads: dict[str, str] = {}
     parity_run_ids: dict[str, str] = {}
     host_fingerprints: dict[str, str] = {}
@@ -3477,6 +3554,7 @@ def _host_bridge_parity_report_proof(settings: Any) -> dict[str, Any]:
     host_names: dict[str, str] = {}
     artifact_shas: dict[str, str] = {}
     artifact_bytes_by_label: dict[str, int] = {}
+    source_file_counts: dict[str, int] = {}
     artifact_generated_at_by_label: dict[str, int] = {}
     result_ok_by_label: dict[str, Any] = {}
     proofs_by_label: dict[str, dict[str, Any]] = {}
@@ -3488,51 +3566,67 @@ def _host_bridge_parity_report_proof(settings: Any) -> dict[str, Any]:
             continue
         result_ok_by_label[label] = result.get("ok")
         artifact_sha = result.get("artifactSha256")
-        if not isinstance(artifact_sha, str) or len(artifact_sha) != 64:
-            findings.append(f"Persisted parity report {label} artifactSha256 is missing or invalid; regenerate with ops/host_bridge_parity_report.py --output.")
+        if not _host_bridge_is_hex64(artifact_sha):
+            findings.append(f"Persisted parity report {label} artifactSha256 is missing or invalid; regenerate with ./atrium automation report.")
         else:
             artifact_shas[label] = artifact_sha
         artifact_bytes = result.get("artifactBytes")
         if not isinstance(artifact_bytes, int) or artifact_bytes <= 0:
-            findings.append(f"Persisted parity report {label} artifactBytes is missing or invalid; regenerate with ops/host_bridge_parity_report.py --output.")
+            findings.append(f"Persisted parity report {label} artifactBytes is missing or invalid; regenerate with ./atrium automation report.")
         else:
             artifact_bytes_by_label[label] = artifact_bytes
         if result.get("proofSchemaVersion") != _HOST_BRIDGE_PARITY_PROOF_SCHEMA_VERSION:
-            findings.append(f"Persisted parity report {label} proofSchemaVersion is not 1; regenerate with ops/host_bridge_parity_report.py --output.")
+            findings.append(f"Persisted parity report {label} proofSchemaVersion is not 1; regenerate with ./atrium automation report.")
         if result.get("schemaVersion") != 1:
-            findings.append(f"Persisted parity report {label} artifact schemaVersion is not 1; regenerate with ops/host_bridge_parity_report.py --output.")
+            findings.append(f"Persisted parity report {label} artifact schemaVersion is not 1; regenerate with ./atrium automation report.")
         artifact_generated_at = result.get("generatedAt")
         if not isinstance(artifact_generated_at, int):
-            findings.append(f"Persisted parity report {label} artifact is missing generatedAt; regenerate with ops/host_bridge_parity_report.py --output.")
+            findings.append(f"Persisted parity report {label} artifact is missing generatedAt; regenerate with ./atrium automation report.")
         elif generated_at is not None:
             artifact_generated_at_by_label[label] = artifact_generated_at
             now = now_ms()
             if artifact_generated_at > now + 5 * 60 * 1000:
-                findings.append(f"Persisted parity report {label} artifact generatedAt is in the future; regenerate with ops/host_bridge_parity_report.py --output.")
+                findings.append(f"Persisted parity report {label} artifact generatedAt is in the future; regenerate with ./atrium automation report.")
             max_age_hours = float(getattr(settings, "host_bridge_parity_report_max_age_hours", 24.0) or 0.0)
             if max_age_hours > 0:
                 max_age_ms = int(max_age_hours * 60 * 60 * 1000)
                 age_ms = now - artifact_generated_at
                 if age_ms > max_age_ms:
                     findings.append(
-                        f"Persisted parity report {label} artifact is stale; regenerate with ops/host_bridge_parity_report.py --output. "
+                        f"Persisted parity report {label} artifact is stale; regenerate with ./atrium automation report. "
                         f"ageHours={age_ms / 3600000:.1f}; maxAgeHours={max_age_hours:.1f}"
                     )
         fingerprint = result.get("sourceFingerprint")
-        if isinstance(fingerprint, str) and len(fingerprint) == 64:
+        if _host_bridge_is_hex64(fingerprint):
             source_fingerprints[label] = fingerprint
         else:
-            findings.append(f"Persisted parity report {label} artifact sourceFingerprint is missing or invalid; regenerate with ops/host_bridge_parity_report.py --output.")
+            findings.append(f"Persisted parity report {label} artifact sourceFingerprint is missing or invalid; regenerate with ./atrium automation report.")
+        source_manifest_sha = result.get("sourceManifestSha256")
+        if _host_bridge_is_hex64(source_manifest_sha) and source_manifest_sha == fingerprint:
+            source_manifest_shas[label] = source_manifest_sha
+        else:
+            findings.append(
+                f"Persisted parity report {label} artifact sourceManifestSha256 is missing, invalid, or mismatched; "
+                "regenerate with ./atrium automation report."
+            )
+        source_file_count = result.get("sourceFileCount")
+        if isinstance(source_file_count, int) and source_file_count == len(SOURCE_FINGERPRINT_FILES):
+            source_file_counts[label] = source_file_count
+        else:
+            findings.append(
+                f"Persisted parity report {label} artifact sourceFileCount does not match the current proof-bound source file set; "
+                "regenerate with ./atrium automation report."
+            )
         git_head = result.get("gitHead")
-        if isinstance(git_head, str) and len(git_head) == 40:
+        if isinstance(git_head, str) and re.fullmatch(r"[0-9a-f]{40}", git_head) is not None:
             git_heads[label] = git_head
         else:
-            findings.append(f"Persisted parity report {label} artifact gitHead is missing or invalid; regenerate with ops/host_bridge_parity_report.py --output.")
+            findings.append(f"Persisted parity report {label} artifact gitHead is missing or invalid; regenerate with ./atrium automation report.")
         host_fingerprint = result.get("hostFingerprint")
-        if isinstance(host_fingerprint, str) and len(host_fingerprint) == 64:
+        if _host_bridge_is_hex64(host_fingerprint):
             host_fingerprints[label] = host_fingerprint
         else:
-            findings.append(f"Persisted parity report {label} artifact hostFingerprint is missing or invalid; regenerate with ops/host_bridge_parity_report.py --output.")
+            findings.append(f"Persisted parity report {label} artifact hostFingerprint is missing or invalid; regenerate with ./atrium automation report.")
         host_platform = result.get("hostPlatform")
         expected_host_platform = _HOST_BRIDGE_PARITY_RESULT_PLATFORMS[label]
         if isinstance(host_platform, str) and host_platform == expected_host_platform:
@@ -3540,20 +3634,20 @@ def _host_bridge_parity_report_proof(settings: Any) -> dict[str, Any]:
         else:
             findings.append(
                 f"Persisted parity report {label} artifact hostPlatform must be {expected_host_platform}; "
-                "regenerate with ops/host_bridge_parity_report.py --output."
+                "regenerate with ./atrium automation report."
             )
         host_name = str(result.get("hostName") or "").strip()
         if host_name:
             host_names[label] = host_name
         else:
-            findings.append(f"Persisted parity report {label} artifact hostName is missing; regenerate with ops/host_bridge_parity_report.py --output.")
+            findings.append(f"Persisted parity report {label} artifact hostName is missing; regenerate with ./atrium automation report.")
         parity_run_id = result.get("parityRunId")
         if isinstance(parity_run_id, str) and _HOST_BRIDGE_PARITY_RUN_ID_RE.fullmatch(parity_run_id):
             parity_run_ids[label] = parity_run_id
         else:
             findings.append(
                 f"Persisted parity report {label} artifact parityRunId is missing or invalid; "
-                "rerun both full probes with the same --parity-run-id and regenerate with ops/host_bridge_parity_report.py --output."
+                "rerun both full probes with the same --parity-run-id, then run ./atrium automation report."
             )
         proofs = result.get("proofs") if isinstance(result.get("proofs"), dict) else {}
         proofs_by_label[label] = proofs
@@ -3561,16 +3655,20 @@ def _host_bridge_parity_report_proof(settings: Any) -> dict[str, Any]:
             if proofs.get(proof_key) is not True:
                 findings.append(
                     f"Persisted parity report {label} lacks required {proof_label}; "
-                    "regenerate with ops/host_bridge_parity_report.py --output."
+                    "regenerate with ./atrium automation report."
                 )
     if len(source_fingerprints) == 2 and len(set(source_fingerprints.values())) != 1:
         findings.append("Persisted parity report sourceFingerprint mismatch; regenerate both macOS and Windows full probe artifacts from the same HostBridge source.")
+    if len(source_manifest_shas) == 2 and len(set(source_manifest_shas.values())) != 1:
+        findings.append("Persisted parity report sourceManifestSha256 mismatch; regenerate both macOS and Windows full probe artifacts from the same HostBridge source.")
     if len(git_heads) == 2 and len(set(git_heads.values())) != 1:
         findings.append("Persisted parity report gitHead mismatch; regenerate both macOS and Windows full probe artifacts from the same commit.")
     if len(parity_run_ids) == 2 and len(set(parity_run_ids.values())) != 1:
         findings.append("Persisted parity report parityRunId mismatch; rerun macOS and Windows full probe artifacts with the same --parity-run-id.")
     if len(source_fingerprints) == 2 and len(set(source_fingerprints.values())) == 1:
         details["sourceFingerprint"] = next(iter(source_fingerprints.values()))
+    if len(source_manifest_shas) == 2 and len(set(source_manifest_shas.values())) == 1:
+        details["sourceManifestSha256"] = next(iter(source_manifest_shas.values()))
     if len(git_heads) == 2 and len(set(git_heads.values())) == 1:
         details["gitHead"] = next(iter(git_heads.values()))
     if len(parity_run_ids) == 2 and len(set(parity_run_ids.values())) == 1:
@@ -3580,6 +3678,7 @@ def _host_bridge_parity_report_proof(settings: Any) -> dict[str, Any]:
     details["hostName"] = host_names
     details["artifactSha256"] = artifact_shas
     details["artifactBytes"] = artifact_bytes_by_label
+    details["sourceFileCount"] = source_file_counts
     details["artifactGeneratedAt"] = artifact_generated_at_by_label
     details["resultOk"] = result_ok_by_label
     details["proofs"] = proofs_by_label
@@ -3592,8 +3691,10 @@ def _host_bridge_parity_report_proof(settings: Any) -> dict[str, Any]:
     if not findings and loaded.get("ok") is True:
         current_source = host_bridge_source_provenance()
         current_fingerprint = current_source.get("sourceFingerprint")
+        current_manifest_sha = current_source.get("sourceManifestSha256")
         current_git_head = current_source.get("gitHead")
         details["currentSourceFingerprint"] = current_fingerprint
+        details["currentSourceManifestSha256"] = current_manifest_sha
         details["currentGitHead"] = current_git_head
         details["currentGitDirty"] = current_source.get("gitDirty")
         expected_proof_id = host_bridge_parity_proof_id(results, current_source, enforce_current_source=True)
@@ -3601,13 +3702,20 @@ def _host_bridge_parity_report_proof(settings: Any) -> dict[str, Any]:
         if proof_id != expected_proof_id:
             findings.append(
                 "Persisted parity report proofId does not match its artifact inputs and current HostBridge source; "
-                "regenerate with ops/host_bridge_parity_report.py --output."
+                "regenerate with ./atrium automation report."
             )
         if isinstance(current_fingerprint, str) and len(source_fingerprints) == 2:
             proved_fingerprint = next(iter(source_fingerprints.values()))
             if proved_fingerprint != current_fingerprint:
                 findings.append(
                     "Persisted parity report sourceFingerprint does not match current HostBridge source; "
+                    "regenerate macOS and Windows full probe artifacts from the current checkout."
+                )
+        if isinstance(current_manifest_sha, str) and len(source_manifest_shas) == 2:
+            proved_manifest_sha = next(iter(source_manifest_shas.values()))
+            if proved_manifest_sha != current_manifest_sha:
+                findings.append(
+                    "Persisted parity report sourceManifestSha256 does not match current HostBridge source; "
                     "regenerate macOS and Windows full probe artifacts from the current checkout."
                 )
         if isinstance(current_git_head, str) and len(git_heads) == 2:
@@ -3624,7 +3732,7 @@ def _host_bridge_parity_report_proof(settings: Any) -> dict[str, Any]:
         "path": str(path),
         "summary": str(loaded.get("summary") or "Persisted HostBridge parity report is available."),
         "generatedAt": generated_at,
-        "findings": findings,
+        "findings": [_host_bridge_command_hint(str(finding)) for finding in findings],
         "details": details,
     }
 
@@ -3635,7 +3743,7 @@ def _host_bridge_connector_proof(
     runtime_status: str | None,
     parity_report: dict[str, Any],
 ) -> dict[str, Any]:
-    gaps = list(parity_report.get("findings") or [_HOST_BRIDGE_PARITY_PROOF_GAP])
+    gaps = list(parity_report.get("findings") or [_host_bridge_parity_proof_gap()])
     detail = str(runtime_status or "").strip()
     if detail and detail != "ready":
         gaps.insert(0, detail)
@@ -3675,54 +3783,110 @@ def _unique_host_bridge_gaps(values: list[Any]) -> list[str]:
     return gaps
 
 
-def _host_bridge_parity_commands() -> dict[str, str]:
+def _host_bridge_contract_gap_names(contract: dict[str, Any]) -> list[str]:
+    gap_groups = (
+        ("localRequirements", "currentReady", "currentHostApplies"),
+        ("apiSurfaceRequirements", "registered", None),
+        ("reportRequirements", "currentReady", None),
+        ("featureRequirements", "ready", "required"),
+        ("windowsProofRequirements", "proved", None),
+        ("connectorRequirements", "proved", None),
+    )
+    gaps: list[str] = []
+    for group_key, ready_key, applies_key in gap_groups:
+        items = contract.get(group_key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            if applies_key and item.get(applies_key) is False:
+                continue
+            if item.get(ready_key) is True:
+                continue
+            label = str(item.get("label") or item.get("id") or group_key).strip()
+            if not label:
+                continue
+            gaps.append(f"OpenClaw contract gap: {label}")
+    return gaps
+
+
+def _host_bridge_parity_commands(host_platform: str | None = None) -> dict[str, str]:
     parity_run_id = f"atrium-{now_ms()}-{uuid.uuid4()}"
     source = host_bridge_source_provenance()
     source_fingerprint = str(source.get("sourceFingerprint") or "")
+    source_manifest_sha = str(source.get("sourceManifestSha256") or source_fingerprint)
+    source_file_count = source.get("sourceFileCount")
     macos_artifact = "/tmp/atrium_host_bridge_macos_live.json"
+    windows_handoff_artifact = "/tmp/atrium_windows_handoff.json"
     windows_artifact_on_windows = "C:\\Temp\\atrium_host_bridge_windows_live.json"
     windows_artifact_local = "/tmp/atrium_host_bridge_windows_live.json"
-    output = "data/host-bridge-parity-report.json"
+    output = "system/data/host-bridge-parity-report.json"
     quoted_windows_source = shlex.quote(windows_artifact_on_windows)
+    report_command = (
+        f"{_host_bridge_parity_report_command(host_platform)} "
+        f"--macos {macos_artifact} --windows {windows_artifact_local} "
+        f"--windows-source-path {quoted_windows_source}"
+    )
+    source_validate_args = (
+        f"--expect-source-fingerprint {source_fingerprint} "
+        f"--expect-source-manifest-sha256 {source_manifest_sha} "
+        f"--expect-source-file-count {source_file_count}"
+    )
+    windows_source_validate_args = (
+        f"--expect-source-fingerprint {source_fingerprint} "
+        f"--expect-source-manifest-sha256 {source_manifest_sha} "
+        f"--expect-source-file-count {source_file_count}"
+    )
     return {
         "parityRunId": parity_run_id,
         "sourceFingerprint": source_fingerprint,
+        "sourceManifestSha256": source_manifest_sha,
+        "sourceFileCount": str(source_file_count) if source_file_count is not None else "",
         "macosRunIdExport": f"RUN_ID={parity_run_id}",
         "macosSourceValidate": (
             "uv --project system run python ops/host_bridge_source_summary.py "
-            f"--expect-source-fingerprint {source_fingerprint}"
+            f"{source_validate_args}"
         ),
         "windowsRunIdSet": f'$RunId = "{parity_run_id}"',
         "windowsSourceValidate": (
-            "uv --project system run python ops/host_bridge_source_summary.py "
-            f"--expect-source-fingerprint {source_fingerprint}"
+            ".\\atrium.ps1 automation source "
+            f"{windows_source_validate_args}"
         ),
         "macosProbe": (
             "uv --project system run python ops/macos_host_bridge_probe.py "
             f"--full --parity-run-id {parity_run_id} "
-            f"--expect-source-fingerprint {source_fingerprint} --output {macos_artifact}"
+            f"{source_validate_args} --output {macos_artifact}"
         ),
         "macosArtifact": macos_artifact,
         "macosArtifactValidate": (
             "uv --project system run python ops/host_bridge_artifact_summary.py "
             f"--label macos --expect-parity-run-id {parity_run_id} "
-            f"--expect-source-fingerprint {source_fingerprint} {macos_artifact}"
+            f"{source_validate_args} {macos_artifact}"
         ),
+        "windowsHandoff": (
+            f"{_atrium_launcher_for_platform(host_platform)} automation handoff "
+            f"--macos {macos_artifact} --output {windows_handoff_artifact} "
+            f"--windows-output {quoted_windows_source} --windows-local-copy {windows_artifact_local}"
+        ),
+        "windowsHandoffArtifact": windows_handoff_artifact,
         "windowsProbe": (
-            "uv --project system run python ops/windows_host_bridge_probe.py "
+            ".\\atrium.ps1 automation windows-probe "
             f"--full --parity-run-id {parity_run_id} "
-            f"--expect-source-fingerprint {source_fingerprint} --output {windows_artifact_on_windows}"
+            f"{windows_source_validate_args} --output {windows_artifact_on_windows}"
         ),
         "windowsLiveProofRunner": (
-            "powershell -NoProfile -ExecutionPolicy Bypass -File .\\ops\\windows_host_bridge_live_proof.ps1 "
-            f"-ParityRunId {parity_run_id} "
-            f"-SourceFingerprint {source_fingerprint} "
-            f"-Output {windows_artifact_on_windows}"
+            ".\\atrium.ps1 automation windows-live-proof "
+            f"--parity-run-id {parity_run_id} "
+            f"--source-fingerprint {source_fingerprint} "
+            f"--source-manifest-sha256 {source_manifest_sha} "
+            f"--source-file-count {source_file_count} "
+            f"--output {windows_artifact_on_windows}"
         ),
         "windowsArtifactValidateOnWindows": (
-            "uv --project system run python ops/host_bridge_artifact_summary.py "
+            ".\\atrium.ps1 automation artifact "
             f"--label windows --expect-parity-run-id {parity_run_id} "
-            f"--expect-source-fingerprint {source_fingerprint} {windows_artifact_on_windows}"
+            f"{source_validate_args} {windows_artifact_on_windows}"
         ),
         "windowsArtifactSource": windows_artifact_on_windows,
         "windowsArtifactLocal": windows_artifact_local,
@@ -3731,15 +3895,561 @@ def _host_bridge_parity_commands() -> dict[str, str]:
             f"on the Windows host to {windows_artifact_local} on this repo host before running verify."
         ),
         "windowsArtifactValidateLocal": (
-            "uv --project system run python ops/host_bridge_artifact_summary.py "
+            f"{_atrium_launcher_for_platform(host_platform)} automation artifact "
             f"--label windows --expect-parity-run-id {parity_run_id} "
-            f"--expect-source-fingerprint {source_fingerprint} {windows_artifact_local}"
+            f"{source_validate_args} {windows_artifact_local}"
         ),
-        "verify": (
+        "report": report_command,
+        "automationReport": report_command,
+        "verify": _host_bridge_parity_audit_command(host_platform),
+        "legacyParityReport": (
             "uv --project system run python ops/host_bridge_parity_report.py "
             f"--macos {macos_artifact} --windows {windows_artifact_local} "
             f"--windows-source-path {quoted_windows_source} --output {output}"
         ),
+    }
+
+
+def _openclaw_windows_command_surface_ready(cli_text: str) -> bool:
+    required_tokens = (
+        'action == "audit"',
+        'action == "artifact"',
+        'action == "handoff"',
+        'action == "report"',
+        'automation_status.add_argument("--json"',
+        "HOST_BRIDGE_PARITY_REPORT",
+        "ops/host_bridge_parity_report.py",
+        "--skip-current-source-check",
+        "only allowed for offline historical audits written to a custom --output path",
+        "OpenClaw Windows contract",
+    )
+    return all(token in cli_text for token in required_tokens)
+
+
+def _host_bridge_openclaw_level_contract(
+    *,
+    host_bridge: dict[str, Any],
+    parity_report: dict[str, Any],
+    proof_connectors: list[dict[str, Any]],
+    connectors_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    connector_statuses = {
+        str(item.get("id") or ""): str(item.get("proof_status") or "not_required")
+        for item in proof_connectors
+    }
+    platform = str(host_bridge.get("platform") or sys.platform)
+    repo_root = Path(__file__).resolve().parents[2]
+    route_paths = {str(getattr(route, "path", "")) for route in app.routes}
+    windows_launcher_path = repo_root / "atrium.ps1"
+    windows_cmd_launcher_path = repo_root / "atrium.cmd"
+    windows_installer_path = repo_root / "ops" / "install_windows_native.ps1"
+    cli_path = repo_root / "ops" / "atrium_cli.py"
+    main_path = repo_root / "system" / "app" / "main.py"
+    windows_launcher_text = windows_launcher_path.read_text(encoding="utf-8", errors="ignore") if windows_launcher_path.exists() else ""
+    windows_cmd_launcher_text = windows_cmd_launcher_path.read_text(encoding="utf-8", errors="ignore") if windows_cmd_launcher_path.exists() else ""
+    windows_installer_text = windows_installer_path.read_text(encoding="utf-8", errors="ignore") if windows_installer_path.exists() else ""
+    cli_text = cli_path.read_text(encoding="utf-8", errors="ignore") if cli_path.exists() else ""
+    main_text = main_path.read_text(encoding="utf-8", errors="ignore") if main_path.exists() else ""
+    windows_cmd_launcher_ready = all(
+        token.lower() in windows_cmd_launcher_text.lower()
+        for token in ("powershell.exe", "-ExecutionPolicy Bypass", "atrium.ps1", "%*")
+    )
+    windows_ps1_launcher_ready = all(
+        token in windows_launcher_text
+        for token in (
+            "Add-PathIfExists",
+            "ops\\atrium_cli.py",
+            "system\\.venv\\Scripts\\python.exe",
+            "Python312",
+            "Python311",
+            "uv",
+            "Python 3 is required",
+        )
+    )
+    windows_installer_ready = all(
+        token in windows_installer_text
+        for token in (
+            "Assert-SafeInstallPath",
+            "Test-Python3Available",
+            "Install-PythonIfMissing",
+            "Python312",
+            "Python311",
+            "OneDrive",
+            "Desktop",
+            "Documents",
+            "Downloads",
+            "Test-BrowserInstalled",
+            "Install-WingetPackageIfMissing",
+            "Docker.DockerDesktop",
+            "Google.Chrome",
+            "BraveSoftware",
+            "Chromium",
+            "Anthropic.ClaudeCode",
+            ".\\atrium.ps1 setup --yes",
+        )
+    )
+    windows_native_sources_ready = (
+        windows_launcher_path.exists()
+        and windows_cmd_launcher_path.exists()
+        and windows_installer_path.exists()
+        and cli_path.exists()
+        and windows_cmd_launcher_ready
+        and windows_ps1_launcher_ready
+        and windows_installer_ready
+    )
+    windows_process_truth_sources_ready = (
+        cli_path.exists()
+        and "BACKEND_PID" in cli_text
+        and "UI_PID" in cli_text
+        and "pid_detail" in cli_text
+        and "windows_process_details" in cli_text
+        and "windows_process_status" in cli_text
+    )
+    windows_status_json_ready = (
+        "def collect_status_payload" in cli_text
+        and 'status.add_argument("--json"' in cli_text
+        and "redact_json_value(collect_status_payload())" in cli_text
+        and "/api/runtime" in cli_text
+        and "/api/provider-auth/status" in cli_text
+        and "/api/permissions/mode" in cli_text
+        and "/api/host-bridge/parity" in cli_text
+    )
+    windows_cli_python_install_ready = (
+        "def windows_python3_command" in cli_text
+        and "Python.Python.3.12" in cli_text
+        and "Python 3 installation did not expose a runnable Python 3 command" in cli_text
+    )
+    windows_support_bundle_ready = (
+        "def command_report" in cli_text
+        and "--bundle" in cli_text
+        and "zipfile.ZipFile" in cli_text
+        and "support-report.txt" in cli_text
+        and "diagnostics/status.json" in cli_text
+        and "diagnostics/logs.json" in cli_text
+        and "diagnostics/permission-mode.json" in cli_text
+        and "diagnostics/provider-status.json" in cli_text
+        and "diagnostics/tools-status.json" in cli_text
+        and "diagnostics/automation-status.json" in cli_text
+        and "logs/{label}.log" in cli_text
+    )
+    windows_logs_json_ready = (
+        "def command_logs" in cli_text
+        and 'logs.add_argument("--json"' in cli_text
+        and "Run .\\\\atrium.ps1 start to create native" in cli_text
+        and "redact_text" in cli_text
+    )
+    windows_automation_permission_status_ready = (
+        "def collect_automation_status_payload" in cli_text
+        and "/api/permissions/mode" in cli_text
+        and 'normalized["permissionMode"]' in cli_text
+        and "Owner Permissions" in cli_text
+        and "summarize_full_autonomy" in cli_text
+    )
+    windows_self_update_restart_ready = (
+        "_schedule_version_restart" in main_text
+        and 'sys.platform == "win32"' in main_text
+        and ".\\\\atrium.ps1 restart --force" in main_text
+        and "windows_native" in main_text
+        and "powershell" in main_text.lower()
+    )
+    openclaw_command_surface_ready = _openclaw_windows_command_surface_ready(cli_text)
+    windows_provider_tools_command_surface_ready = all(
+        token in cli_text
+        for token in (
+            "def command_provider",
+            "def command_tools",
+            'provider_status.add_argument("--probe"',
+            'provider_status.add_argument("--json"',
+            'tools_status.add_argument("--json"',
+            'tools_catalog.add_argument("--json"',
+            "redact_json_value",
+            'getattr(os, "startfile"',
+            "Start-Process -FilePath",
+            "/api/provider-auth/status",
+            "/api/tools/catalog",
+            "/api/connectors",
+            "summarize_tool_catalog_payload",
+        )
+    )
+    local_requirements = [
+        {
+            "id": "windows_native_lifecycle",
+            "label": "Windows-native setup/start/stop/restart/status/log/report",
+            "requiredEvidence": [
+                ".\\atrium.ps1 setup",
+                ".\\atrium.ps1 start",
+                ".\\atrium.ps1 restart",
+                ".\\atrium.ps1 status",
+                ".\\atrium.ps1 status --json",
+                ".\\atrium.ps1 logs",
+                ".\\atrium.ps1 logs --json",
+                ".\\atrium.ps1 report",
+                ".\\atrium.ps1 report --bundle",
+                "runnable Python 3 validation in .\\atrium.ps1 setup",
+                "PID-file process truth for backend/frontend",
+                "UI self-update restart through .\\atrium.ps1 restart --force",
+            ],
+            "currentHostApplies": platform == "win32",
+            "currentReady": platform != "win32" or (
+                bool(host_bridge.get("shellReady"))
+                and windows_native_sources_ready
+                and windows_process_truth_sources_ready
+                and windows_status_json_ready
+                and windows_cli_python_install_ready
+                and windows_logs_json_ready
+                and windows_support_bundle_ready
+                and windows_self_update_restart_ready
+                and windows_automation_permission_status_ready
+            ),
+            "currentDetails": {
+                "shellReady": host_bridge.get("shellReady"),
+                "atriumPs1": windows_launcher_path.exists(),
+                "atriumPs1Runner": windows_ps1_launcher_ready,
+                "atriumCmd": windows_cmd_launcher_path.exists(),
+                "atriumCmdForwarder": windows_cmd_launcher_ready,
+                "installWindowsNativePs1": windows_installer_path.exists(),
+                "installWindowsNativeSafety": windows_installer_ready,
+                "atriumCli": cli_path.exists(),
+                "pidFiles": windows_process_truth_sources_ready,
+                "statusJson": windows_status_json_ready,
+                "python3Validated": windows_cli_python_install_ready,
+                "logsJson": windows_logs_json_ready,
+                "supportBundle": windows_support_bundle_ready,
+                "selfUpdateRestart": windows_self_update_restart_ready,
+                "automationPermissionMode": windows_automation_permission_status_ready,
+            },
+        },
+        {
+            "id": "windows_native_entrypoints",
+            "label": "Windows-native wrapper and installer entrypoints",
+            "requiredEvidence": ["atrium.ps1", "atrium.cmd", "ops/install_windows_native.ps1", "ops/atrium_cli.py"],
+            "currentHostApplies": True,
+            "currentReady": windows_native_sources_ready,
+        },
+        {
+            "id": "windows_native_provider_ai_tools",
+            "label": "Windows-native provider login and AI tools commands",
+            "requiredEvidence": [
+                ".\\atrium.ps1 provider status --probe",
+                ".\\atrium.ps1 provider status --probe --json",
+                ".\\atrium.ps1 provider login chatgpt",
+                ".\\atrium.ps1 provider login claude-code",
+                ".\\atrium.ps1 provider disconnect chatgpt",
+                "native Windows URL opener for provider OAuth",
+                ".\\atrium.ps1 tools status",
+                ".\\atrium.ps1 tools status --json",
+                ".\\atrium.ps1 tools catalog",
+                ".\\atrium.ps1 tools catalog --json",
+                "backend provider-auth/tool-catalog/connector truth",
+            ],
+            "currentHostApplies": True,
+            "currentReady": windows_provider_tools_command_surface_ready,
+            "currentDetails": {
+                "commandProvider": "def command_provider" in cli_text,
+                "commandTools": "def command_tools" in cli_text,
+                "providerStatusProbe": 'provider_status.add_argument("--probe"' in cli_text,
+                "providerStatusJson": 'provider_status.add_argument("--json"' in cli_text,
+                "providerStatusJsonRedaction": "redact_json_value" in cli_text,
+                "windowsUrlOpenNative": 'getattr(os, "startfile"' in cli_text and "Start-Process -FilePath" in cli_text,
+                "toolsStatusJson": 'tools_status.add_argument("--json"' in cli_text,
+                "toolsCatalogJson": 'tools_catalog.add_argument("--json"' in cli_text,
+                "providerAuthStatusEndpoint": "/api/provider-auth/status" in cli_text,
+                "toolCatalogEndpoint": "/api/tools/catalog" in cli_text,
+                "connectorsEndpoint": "/api/connectors" in cli_text,
+            },
+        },
+        {
+            "id": "openclaw_audit_report_commands",
+            "label": "OpenClaw audit/report command gate",
+            "requiredEvidence": [
+                ".\\atrium.ps1 automation status --json",
+                ".\\atrium.ps1 automation handoff --macos <macos-json>",
+                ".\\atrium.ps1 automation report --macos <macos-json> --windows <copied-windows-json>",
+                ".\\atrium.ps1 automation audit",
+                "backend default report path",
+                "no historical proof override for current parity claims",
+            ],
+            "currentHostApplies": True,
+            "currentReady": openclaw_command_surface_ready,
+            "currentDetails": {
+                "automationAudit": 'action == "audit"' in cli_text,
+                "automationStatusJson": 'automation_status.add_argument("--json"' in cli_text,
+                "automationHandoff": 'action == "handoff"' in cli_text,
+                "automationReport": 'action == "report"' in cli_text,
+                "defaultReportPath": "HOST_BRIDGE_PARITY_REPORT" in cli_text,
+                "rawVerifier": "ops/host_bridge_parity_report.py" in cli_text,
+                "historicalOverrideFlag": "--skip-current-source-check" in cli_text,
+                "contractOutput": "OpenClaw Windows contract" in cli_text,
+            },
+        },
+        {
+            "id": "interactive_desktop_session",
+            "label": "Signed-in interactive Windows desktop session",
+            "requiredEvidence": ["interactiveSession=true", "interactiveSessionName", "interactiveSessionId"],
+            "currentHostApplies": platform == "win32",
+            "currentReady": platform != "win32" or host_bridge.get("interactiveSession") is True,
+        },
+        {
+            "id": "windows_visual_preflight",
+            "label": "DPI-aware Win32 visual preflight",
+            "requiredEvidence": ["windowsVisualPreflightChecked=true", "windowsVisualPreflightOk=true"],
+            "currentHostApplies": platform == "win32",
+            "currentReady": platform != "win32" or (
+                host_bridge.get("windowsVisualPreflightChecked") is True
+                and host_bridge.get("windowsVisualPreflightOk") is True
+            ),
+        },
+        {
+            "id": "isolated_browser_control",
+            "label": "Isolated Chrome/Edge profile plus Playwright DOM-ref control",
+            "requiredEvidence": ["isolatedBrowserProfileReady=true", "browserPlaywrightReady=true"],
+            "currentHostApplies": platform in {"win32", "darwin"},
+            "currentReady": bool(host_bridge.get("isolatedBrowserProfileReady")) and bool(host_bridge.get("browserPlaywrightReady")),
+        },
+    ]
+    api_surface_specs = [
+        ("runtime_status", "Runtime truth endpoint", "/api/runtime", "backend runtime/provider/memory/tool truth"),
+        ("provider_status", "Provider auth status endpoint", "/api/provider-auth/status", "ChatGPT/Claude Code readiness without identity leaks"),
+        ("chatgpt_login", "ChatGPT account login endpoint", "/api/provider-auth/chatgpt/start", "native Windows browser OAuth start"),
+        ("chatgpt_disconnect", "ChatGPT account disconnect endpoint", "/api/provider-auth/chatgpt/disconnect", "native account switching cleanup"),
+        ("claude_login", "Claude Code login endpoint", "/api/provider-auth/claude-code/start", "native terminal Claude Code login start"),
+        ("claude_disconnect", "Claude Code disconnect endpoint", "/api/provider-auth/claude-code/disconnect", "native Claude Code account cleanup"),
+        ("connector_catalog", "Connector catalog endpoint", "/api/connectors", "feature readiness catalog"),
+        ("host_bridge_parity", "HostBridge parity endpoint", "/api/host-bridge/parity", "OpenClaw-level Windows contract and proof commands"),
+    ]
+    api_surface_requirements = [
+        {
+            "id": item_id,
+            "label": label,
+            "path": path,
+            "requiredEvidence": evidence,
+            "registered": path in route_paths,
+        }
+        for item_id, label, path, evidence in api_surface_specs
+    ]
+    proof_details = parity_report.get("details") if isinstance(parity_report.get("details"), dict) else {}
+    proof_groups = proof_details.get("proofs") if isinstance(proof_details.get("proofs"), dict) else {}
+    windows_proofs = proof_groups.get("windows") if isinstance(proof_groups.get("windows"), dict) else {}
+    artifact_sha = proof_details.get("artifactSha256") if isinstance(proof_details.get("artifactSha256"), dict) else {}
+    artifact_bytes = proof_details.get("artifactBytes") if isinstance(proof_details.get("artifactBytes"), dict) else {}
+    source_file_counts = proof_details.get("sourceFileCount") if isinstance(proof_details.get("sourceFileCount"), dict) else {}
+    source_manifest_sha = proof_details.get("sourceManifestSha256")
+    host_fingerprints = proof_details.get("hostFingerprint") if isinstance(proof_details.get("hostFingerprint"), dict) else {}
+    host_platforms = proof_details.get("hostPlatform") if isinstance(proof_details.get("hostPlatform"), dict) else {}
+    host_names = proof_details.get("hostName") if isinstance(proof_details.get("hostName"), dict) else {}
+    report_requirements = [
+        {
+            "id": "persisted_report_verified",
+            "label": "Persisted cross-OS parity report verified",
+            "requiredEvidence": ["report.ok=true", "reportPresent=true", "reportReadable=true"],
+            "currentReady": parity_report.get("ok") is True,
+            "currentDetails": {
+                "reportPath": proof_details.get("reportPath") or parity_report.get("path"),
+                "reportPresent": proof_details.get("reportPresent"),
+                "reportReadable": proof_details.get("reportReadable"),
+                "reportOk": proof_details.get("reportOk"),
+            },
+        },
+        {
+            "id": "proof_id_bound_to_artifacts",
+            "label": "Proof ID bound to artifacts and current source",
+            "requiredEvidence": ["proofId", "expectedProofId", "currentSourceFingerprint", "currentSourceManifestSha256", "currentGitHead"],
+            "currentReady": (
+                _host_bridge_is_hex64(proof_details.get("proofId"))
+                and proof_details.get("proofId") == proof_details.get("expectedProofId")
+                and _host_bridge_is_hex64(proof_details.get("currentSourceFingerprint"))
+                and _host_bridge_is_hex64(proof_details.get("currentSourceManifestSha256"))
+                and isinstance(proof_details.get("currentGitHead"), str)
+                and re.fullmatch(r"[0-9a-f]{40}", str(proof_details.get("currentGitHead"))) is not None
+            ),
+            "currentDetails": {
+                "proofId": proof_details.get("proofId"),
+                "expectedProofId": proof_details.get("expectedProofId"),
+                "currentSourceFingerprint": proof_details.get("currentSourceFingerprint"),
+                "currentSourceManifestSha256": proof_details.get("currentSourceManifestSha256"),
+                "currentGitHead": proof_details.get("currentGitHead"),
+            },
+        },
+        {
+            "id": "shared_parity_run_id",
+            "label": "Shared macOS/Windows parity run ID",
+            "requiredEvidence": ["same parityRunId in macos and windows artifacts"],
+            "currentReady": isinstance(proof_details.get("parityRunId"), str) and bool(str(proof_details.get("parityRunId")).strip()),
+            "currentDetails": {"parityRunId": proof_details.get("parityRunId")},
+        },
+        {
+            "id": "artifact_hash_and_size_recorded",
+            "label": "Artifact SHA-256 and byte-size provenance",
+            "requiredEvidence": ["artifactSha256.macos/windows", "artifactBytes.macos/windows"],
+            "currentReady": (
+                _host_bridge_is_hex64(artifact_sha.get("macos"))
+                and _host_bridge_is_hex64(artifact_sha.get("windows"))
+                and isinstance(artifact_bytes.get("macos"), int)
+                and artifact_bytes.get("macos") > 0
+                and isinstance(artifact_bytes.get("windows"), int)
+                and artifact_bytes.get("windows") > 0
+            ),
+            "currentDetails": {
+                "artifactSha256": artifact_sha,
+                "artifactBytes": artifact_bytes,
+            },
+        },
+        {
+            "id": "source_file_provenance_recorded",
+            "label": "HostBridge source file-set provenance recorded",
+            "requiredEvidence": ["sourceFileCount.macos/windows includes all proof-bound files", "sourceManifestSha256"],
+            "currentReady": (
+                isinstance(source_file_counts.get("macos"), int)
+                and source_file_counts.get("macos") == len(SOURCE_FINGERPRINT_FILES)
+                and isinstance(source_file_counts.get("windows"), int)
+                and source_file_counts.get("windows") == len(SOURCE_FINGERPRINT_FILES)
+                and _host_bridge_is_hex64(source_manifest_sha)
+            ),
+            "currentDetails": {
+                "sourceFileCount": source_file_counts,
+                "sourceManifestSha256": source_manifest_sha,
+                "requiredFileCount": len(SOURCE_FINGERPRINT_FILES),
+            },
+        },
+        {
+            "id": "host_identity_recorded",
+            "label": "macOS/Windows host identity recorded",
+            "requiredEvidence": ["hostFingerprint", "hostPlatform", "hostName"],
+            "currentReady": (
+                _host_bridge_is_hex64(host_fingerprints.get("macos"))
+                and _host_bridge_is_hex64(host_fingerprints.get("windows"))
+                and host_platforms.get("macos") == "darwin"
+                and host_platforms.get("windows") == "win32"
+                and bool(str(host_names.get("macos") or "").strip())
+                and bool(str(host_names.get("windows") or "").strip())
+            ),
+            "currentDetails": {
+                "hostFingerprint": host_fingerprints,
+                "hostPlatform": host_platforms,
+                "hostName": host_names,
+            },
+        },
+    ]
+    proof_requirements = [
+        {
+            "id": proof_key,
+            "label": proof_label,
+            "requiredArtifact": "windows full live HostBridge probe",
+            "proved": (
+                parity_report.get("ok") is True
+                and windows_proofs.get(proof_key) is True
+            ),
+        }
+        for proof_key, proof_label in _REQUIRED_HOST_BRIDGE_PROOF_FACETS["windows"].items()
+    ]
+    connector_requirements = [
+        {
+            "id": "browser",
+            "label": "Browser bridge connector",
+            "requiredStatus": "cross_os_verified",
+            "currentStatus": connector_statuses.get("browser", "missing"),
+            "proved": connector_statuses.get("browser") == "cross_os_verified",
+        },
+        {
+            "id": "desktop",
+            "label": "Desktop bridge connector",
+            "requiredStatus": "cross_os_verified",
+            "currentStatus": connector_statuses.get("desktop", "missing"),
+            "proved": connector_statuses.get("desktop") == "cross_os_verified",
+        },
+    ]
+    feature_specs = [
+        ("local_file", "Local file import", True, False, "read/write local workspace and artifact files"),
+        ("git", "Git workspace", True, True, "status/diff/commit/push through Owner Mode policy"),
+        ("sandbox", "Sandbox command runner", True, True, "Docker sandbox or explicit local fallback"),
+        ("http", "HTTP/API", True, True, "bounded HTTP reads and approval-gated writes"),
+        ("web", "Web search and page read", True, False, "key-free search and page fetch fallback"),
+        ("browser", "Browser bridge", True, True, "isolated browser, DOM refs, screenshots, and input proof"),
+        ("desktop", "Desktop bridge", True, True, "UIAutomation/accessibility refs, screenshots, notifications, and input proof"),
+        (
+            "mcp",
+            "MCP external tools",
+            True,
+            True,
+            "gateway-backed external read/write tools; local fallback alone is not OpenClaw-level parity",
+        ),
+    ]
+    feature_requirements: list[dict[str, Any]] = []
+    for connector_id, label, required, requires_write, evidence in feature_specs:
+        connector = connectors_by_id.get(connector_id) or {}
+        status_value = str(connector.get("status") or "missing")
+        proof_status = str(connector.get("proofStatus") or "not_required")
+        if connector_id in {"browser", "desktop"}:
+            ready = proof_status == "cross_os_verified"
+        elif connector_id == "mcp":
+            external_write_requires = connector.get("externalWriteRequires")
+            ready = (
+                status_value == "configured"
+                and connector.get("readReady") is True
+                and connector.get("writeReady") is True
+                and connector.get("localFallback") is not True
+                and (not isinstance(external_write_requires, list) or not external_write_requires)
+            )
+        else:
+            ready = (
+                status_value in {"available", "configured"}
+                and connector.get("readReady") is not False
+                and (
+                    connector.get("writeReady") is not False
+                    or (not requires_write and connector.get("localFallback") is True)
+                )
+            )
+        feature_requirements.append({
+            "id": connector_id,
+            "label": label,
+            "required": required,
+            "requiresWriteReady": requires_write,
+            "requiredEvidence": evidence,
+            "status": status_value,
+            "runtimeStatus": connector.get("runtimeStatus"),
+            "readReady": connector.get("readReady"),
+            "writeReady": connector.get("writeReady"),
+            "localFallback": connector.get("localFallback"),
+            "externalWriteRequires": connector.get("externalWriteRequires"),
+            "degradedByLocalFallback": bool(required and requires_write and connector.get("localFallback") is True and connector.get("writeReady") is not True),
+            "proofStatus": proof_status,
+            "ready": bool(ready),
+        })
+    local_blocked = any(
+        item["currentHostApplies"] and item["currentReady"] is False
+        for item in local_requirements
+    )
+    connectors_verified = all(item["proved"] for item in connector_requirements)
+    proofs_verified = all(item["proved"] for item in proof_requirements)
+    report_verified = all(item["currentReady"] for item in report_requirements)
+    required_features_ready = all(item["ready"] for item in feature_requirements if item["required"])
+    api_surface_ready = all(item["registered"] for item in api_surface_requirements)
+    if local_blocked:
+        status = "local_blocked"
+    elif connectors_verified and proofs_verified and report_verified and required_features_ready and api_surface_ready:
+        status = "cross_os_verified"
+    else:
+        status = "cross_os_unverified"
+    return {
+        "target": "openclaw_level_windows_host_parity",
+        "summary": (
+            "Windows is treated as a first-class host. Browser/desktop capability cannot be marked verified "
+            "until local runtime, Windows live proof facets, and connector proof gates all pass."
+        ),
+        "noSilentDegradation": True,
+        "windowsNativePrimary": True,
+        "windowsNativeOnly": True,
+        "status": status,
+        "localRequirements": local_requirements,
+        "apiSurfaceRequirements": api_surface_requirements,
+        "reportRequirements": report_requirements,
+        "featureRequirements": feature_requirements,
+        "windowsProofRequirements": proof_requirements,
+        "connectorRequirements": connector_requirements,
+        "osBoundaries": [
+            "Locked screens, Services sessions, UAC secure desktop, firewall prompts, and provider login prompts must surface as blockers instead of degraded success.",
+            "Coordinate input is not accepted as parity proof without DPI, virtual-screen, foreground, Unicode typing, keyboard shortcut, clipboard, and UIAutomation evidence.",
+        ],
     }
 
 
@@ -3770,14 +4480,6 @@ def _host_bridge_parity_status_payload() -> dict[str, Any]:
     else:
         status = "cross_os_unverified"
         summary = "HostBridge local runtime is ready, but no verified macOS+Windows full parity report is attached."
-    gaps = _unique_host_bridge_gaps(
-        [
-            gap
-            for connector in bridge_connectors
-            for gap in (connector.get("proofGaps") if connector else []) or []
-        ]
-        + list(parity_report.get("findings") or [])
-    )
     report_details = dict(parity_report.get("details") or {})
     report_payload = {
         **report_details,
@@ -3821,6 +4523,31 @@ def _host_bridge_parity_status_payload() -> dict[str, Any]:
             "checks": host_bridge.get("windowsVisualPreflightChecks"),
         },
     }
+    contract_payload = _host_bridge_openclaw_level_contract(
+        host_bridge=host_bridge,
+        parity_report=parity_report,
+        proof_connectors=proof_connectors,
+        connectors_by_id=connectors_by_id,
+    )
+    if contract_payload.get("status") == "local_blocked":
+        status = "local_blocked"
+        summary = "Local HostBridge runtime is blocked; OpenClaw-level Windows parity proof cannot pass."
+    elif status == "cross_os_verified" and contract_payload.get("status") != "cross_os_verified":
+        status = "cross_os_unverified"
+        summary = "HostBridge report is present, but OpenClaw-level Windows contract requirements are not fully proven."
+    gaps = _unique_host_bridge_gaps(
+        [
+            gap
+            for connector in bridge_connectors
+            for gap in (connector.get("proofGaps") if connector else []) or []
+        ]
+        + list(parity_report.get("findings") or [])
+        + (
+            _host_bridge_contract_gap_names(contract_payload)
+            if contract_payload.get("status") != "cross_os_verified"
+            else []
+        )
+    )
     return HostBridgeParityStatusResponse(
         ok=status == "cross_os_verified",
         status=status,
@@ -3828,8 +4555,9 @@ def _host_bridge_parity_status_payload() -> dict[str, Any]:
         gaps=gaps,
         report=report_payload,
         local=local_payload,
+        contract=contract_payload,
         connectors=proof_connectors,
-        commands=_host_bridge_parity_commands(),
+        commands=_host_bridge_parity_commands(str(host_bridge.get("platform") or sys.platform)),
     ).dump()
 
 

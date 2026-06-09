@@ -1,7 +1,15 @@
 import { client } from '../../state/useCompany'
 import { Pill, withAlpha } from '../../components/primitives'
 import { ACCENT_HEX } from '../../lib/visuals'
-import type { Connector, ConnectorKind, ConnectorProofStatus, ConnectorStatus, HostBridgeParityStatusResponse } from '../../contract/types'
+import type {
+  Connector,
+  ConnectorKind,
+  ConnectorProofStatus,
+  ConnectorStatus,
+  HostBridgeOpenClawContract,
+  HostBridgeOpenClawRequirement,
+  HostBridgeParityStatusResponse,
+} from '../../contract/types'
 import { Section, Loading, Empty, ErrorNote, Row, GhostBtn, useAsync } from './shared'
 
 const STATUS: Record<ConnectorStatus, { label: string; hex: string }> = {
@@ -72,6 +80,51 @@ function proofDetailLine(details?: Record<string, unknown>) {
   return parts.join(' · ')
 }
 
+function isRequirementBlocked(requirement: HostBridgeOpenClawRequirement) {
+  if (requirement.currentHostApplies === false) return false
+  if (requirement.currentReady === false) return true
+  if (requirement.registered === false) return true
+  if (requirement.proved === false) return true
+  if (requirement.required !== false && requirement.ready === false) return true
+  return false
+}
+
+function requirementName(requirement: HostBridgeOpenClawRequirement) {
+  const name = requirement.id || requirement.label || 'unknown'
+  const reasons: string[] = []
+  if (requirement.degradedByLocalFallback) reasons.push('local fallback only')
+  if (requirement.requiresWriteReady && requirement.writeReady === false) reasons.push('write not ready')
+  if (requirement.readReady === false) reasons.push('read not ready')
+  if (requirement.externalWriteRequires && requirement.externalWriteRequires.length > 0) {
+    reasons.push(requirement.externalWriteRequires.slice(0, 2).join(', '))
+  }
+  return reasons.length > 0 ? `${name} (${reasons.join('; ')})` : name
+}
+
+function contractGapGroups(contract?: HostBridgeOpenClawContract | null) {
+  if (!contract) return []
+  const groups = [
+    { id: 'local', label: 'local', requirements: contract.localRequirements },
+    { id: 'api', label: 'API', requirements: contract.apiSurfaceRequirements },
+    { id: 'report', label: 'report', requirements: contract.reportRequirements },
+    { id: 'feature', label: 'feature', requirements: contract.featureRequirements },
+    { id: 'proof', label: 'proof', requirements: contract.windowsProofRequirements ?? contract.proofRequirements },
+    { id: 'connector', label: 'connector', requirements: contract.connectorRequirements },
+  ]
+  return groups
+    .map((group) => ({
+      ...group,
+      gaps: (group.requirements ?? [])
+        .filter(isRequirementBlocked)
+        .map(requirementName),
+    }))
+    .filter((group) => group.gaps.length > 0)
+}
+
+function contractGapNames(contract?: HostBridgeOpenClawContract | null) {
+  return contractGapGroups(contract).flatMap((group) => group.gaps)
+}
+
 export function ConnectorsPanel() {
   const { data, loading, error, reload } = useAsync<{ connectors: Connector[]; parity: HostBridgeParityStatusResponse }>(
     async () => {
@@ -88,6 +141,10 @@ export function ConnectorsPanel() {
   const parityStatus = parity ? PROOF_STATUS[parity.status] ?? { label: parity.status, hex: ACCENT_HEX.lavender } : null
   const parityDetail = proofDetailLine(parity?.report)
   const parityCommands = parity?.commands ?? {}
+  const contract = parity?.contract ?? null
+  const contractStatus = contract?.status ? PROOF_STATUS[contract.status] ?? { label: contract.status, hex: ACCENT_HEX.lavender } : null
+  const openClawGapGroups = contractGapGroups(contract)
+  const openClawGaps = contractGapNames(contract)
 
   return (
     <Section
@@ -119,7 +176,38 @@ export function ConnectorsPanel() {
                   gap: {parity.gaps.slice(0, 3).join(' · ')}
                 </div>
               )}
-              {(parityCommands.parityRunId || parityCommands.sourceFingerprint || parityCommands.macosSourceValidate || parityCommands.macosProbe || parityCommands.macosArtifactValidate || parityCommands.windowsSourceValidate || parityCommands.windowsProbe || parityCommands.windowsLiveProofRunner || parityCommands.windowsArtifactValidateOnWindows || parityCommands.windowsArtifactSource || parityCommands.windowsArtifactLocal || parityCommands.windowsArtifactCopyHint || parityCommands.windowsArtifactValidateLocal || parityCommands.verify) && (
+              {contract && (
+                <div className="mt-2 border-t border-[color:var(--color-line-soft)] pt-2">
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0 text-[11px] font-medium text-[var(--color-cream)] break-words [overflow-wrap:anywhere]">OpenClaw Windows contract</div>
+                    {contractStatus && <Pill color={contractStatus.hex}>{contractStatus.label}</Pill>}
+                  </div>
+                  {contract.summary && (
+                    <div className="mt-1 text-[10px] text-[var(--color-cream-dim)] break-words [overflow-wrap:anywhere]">{contract.summary}</div>
+                  )}
+                  <div className="mt-1 flex flex-wrap gap-1">
+                    {contract.windowsNativePrimary && <Pill color={ACCENT_HEX.teal}>Windows native primary</Pill>}
+                    {contract.windowsNativeOnly && <Pill color={ACCENT_HEX.sky}>native only</Pill>}
+                    {contract.noSilentDegradation && <Pill color={ACCENT_HEX.amber}>no silent degradation</Pill>}
+                  </div>
+                  {openClawGaps.length > 0 && (
+                    <div className="mt-1 grid gap-1 text-[10px] break-words [overflow-wrap:anywhere]" style={{ color: withAlpha(contractStatus?.hex ?? ACCENT_HEX.amber, 0.9) }}>
+                      {openClawGapGroups.slice(0, 5).map((group) => (
+                        <div key={group.id}>
+                          {group.label}: {group.gaps.slice(0, 4).join(' · ')}
+                          {group.gaps.length > 4 ? ` · +${group.gaps.length - 4}` : ''}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {contract.osBoundaries && contract.osBoundaries.length > 0 && (
+                    <div className="mt-1 text-[10px] text-[var(--color-cream-faint)] break-words [overflow-wrap:anywhere]">
+                      boundary: {contract.osBoundaries.slice(0, 2).join(' · ')}
+                    </div>
+                  )}
+                </div>
+              )}
+              {(parityCommands.parityRunId || parityCommands.sourceFingerprint || parityCommands.sourceManifestSha256 || parityCommands.sourceFileCount || parityCommands.macosSourceValidate || parityCommands.macosProbe || parityCommands.macosArtifactValidate || parityCommands.windowsSourceValidate || parityCommands.windowsProbe || parityCommands.windowsLiveProofRunner || parityCommands.windowsArtifactValidateOnWindows || parityCommands.windowsArtifactSource || parityCommands.windowsArtifactLocal || parityCommands.windowsArtifactCopyHint || parityCommands.windowsArtifactValidateLocal || parityCommands.automationReport || parityCommands.report || parityCommands.verify || parityCommands.legacyParityReport) && (
                 <div className="mt-2 grid gap-1 text-[10px] text-[var(--color-cream-faint)]">
                   {parityCommands.parityRunId && (
                     <div className="break-words [overflow-wrap:anywhere]">
@@ -129,6 +217,16 @@ export function ConnectorsPanel() {
                   {parityCommands.sourceFingerprint && (
                     <div className="break-words [overflow-wrap:anywhere]">
                       source: <span style={{ fontFamily: 'var(--font-mono)' }}>{parityCommands.sourceFingerprint}</span>
+                    </div>
+                  )}
+                  {parityCommands.sourceManifestSha256 && (
+                    <div className="break-words [overflow-wrap:anywhere]">
+                      manifest: <span style={{ fontFamily: 'var(--font-mono)' }}>{parityCommands.sourceManifestSha256}</span>
+                    </div>
+                  )}
+                  {parityCommands.sourceFileCount && (
+                    <div className="break-words [overflow-wrap:anywhere]">
+                      files: <span style={{ fontFamily: 'var(--font-mono)' }}>{parityCommands.sourceFileCount}</span>
                     </div>
                   )}
                   {parityCommands.macosSourceValidate && (
@@ -183,9 +281,19 @@ export function ConnectorsPanel() {
                       {parityCommands.windowsArtifactValidateLocal}
                     </div>
                   )}
+                  {(parityCommands.automationReport || parityCommands.report) && (
+                    <div className="break-words [overflow-wrap:anywhere]" style={{ fontFamily: 'var(--font-mono)' }}>
+                      {parityCommands.automationReport || parityCommands.report}
+                    </div>
+                  )}
                   {parityCommands.verify && (
                     <div className="break-words [overflow-wrap:anywhere]" style={{ fontFamily: 'var(--font-mono)' }}>
                       {parityCommands.verify}
+                    </div>
+                  )}
+                  {parityCommands.legacyParityReport && (
+                    <div className="break-words [overflow-wrap:anywhere]" style={{ fontFamily: 'var(--font-mono)' }}>
+                      {parityCommands.legacyParityReport}
                     </div>
                   )}
                 </div>
@@ -195,6 +303,9 @@ export function ConnectorsPanel() {
           <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
             {connectors.map((c: Connector) => {
             const st = STATUS[c.status] ?? { label: c.status, hex: ACCENT_HEX.lavender }
+            const tools = c.tools ?? []
+            const requires = c.requires ?? []
+            const externalWriteRequires = c.externalWriteRequires ?? []
             const proofGaps = c.proofGaps ?? []
             const proofDetail = proofDetailLine(c.proofDetails)
             const proof = c.proofStatus && c.proofStatus !== 'not_required'
@@ -217,16 +328,16 @@ export function ConnectorsPanel() {
                   {c.runtimeStatus && <span>· {c.runtimeStatus}</span>}
                 </div>
                 {c.description && <div className="mt-1 text-[11px] text-[var(--color-cream-dim)] break-words [overflow-wrap:anywhere]">{c.description}</div>}
-                {c.tools.length > 0 && (
+                {tools.length > 0 && (
                   <div className="mt-1.5 flex flex-wrap gap-1">
-                    {c.tools.slice(0, 8).map((t) => (
+                    {tools.slice(0, 8).map((t) => (
                       <span key={t} className="rounded px-1.5 py-0.5 text-[9px]" style={{ color: 'var(--color-cream-dim)', background: 'var(--color-surface-3)', fontFamily: 'var(--font-mono)' }}>{t}</span>
                     ))}
-                    {c.tools.length > 8 && <span className="text-[9px] text-[var(--color-cream-faint)]">+{c.tools.length - 8}</span>}
+                    {tools.length > 8 && <span className="text-[9px] text-[var(--color-cream-faint)]">+{tools.length - 8}</span>}
                   </div>
                 )}
-                {c.requires.length > 0 && (
-                  <div className="mt-1 text-[10px]" style={{ color: withAlpha(ACCENT_HEX.amber, 0.9) }}>ต้องการ: {c.requires.join(', ')}</div>
+                {requires.length > 0 && (
+                  <div className="mt-1 text-[10px]" style={{ color: withAlpha(ACCENT_HEX.amber, 0.9) }}>ต้องการ: {requires.join(', ')}</div>
                 )}
                 {proof && (
                   <div className="mt-1 text-[10px] text-[var(--color-cream-faint)] break-words [overflow-wrap:anywhere]">
@@ -241,8 +352,8 @@ export function ConnectorsPanel() {
                     )}
                   </div>
                 )}
-                {c.externalWriteRequires.length > 0 && (
-                  <div className="mt-1 text-[10px]" style={{ color: withAlpha(ACCENT_HEX.amber, 0.9) }}>เขียนภายนอกต้องการ: {c.externalWriteRequires.join(', ')}</div>
+                {externalWriteRequires.length > 0 && (
+                  <div className="mt-1 text-[10px]" style={{ color: withAlpha(ACCENT_HEX.amber, 0.9) }}>เขียนภายนอกต้องการ: {externalWriteRequires.join(', ')}</div>
                 )}
               </Row>
             )

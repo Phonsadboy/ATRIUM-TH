@@ -502,7 +502,7 @@ def chat_tool_system_instructions(departments: list[dict[str, Any]], active_dept
         "Prefer args.cwd instead of a shell cd; use /bin/bash -lc on Unix/macOS or PowerShell on Windows only when you need shell syntax like pipes, &&, globs, or redirection. "
         "For long-running shell.exec work, set args.background=true and use optional stdoutPath/stderrPath/timeoutSeconds; "
         "timeoutSeconds is not capped by ATRIUM, so choose the real timeout the job needs. "
-        "set pty=true when an interactive CLI needs a real TTY; pty=true or persistent=true uses a durable terminal session when available so process can reconnect after backend restart. On Windows, PTY/persistent requests fall back to normal background process logs with pipe stdin. "
+        "set pty=true when an interactive CLI needs a real TTY; pty=true or persistent=true uses a durable terminal session when available so process can reconnect after backend restart. On Windows, persistent=true uses the native windows_pipe backend with pipe stdin and log handles; pty=true reports a PTY fallback while keeping normal background logs. "
         "shell.exec inherits the full ATRIUM process environment by default; pass env to overlay or remove variables, or set sanitizeEnv=true only when you explicitly want a restricted environment. "
         "set wakeOnComplete=true when the user expects a follow-up when it finishes. Use run_owner_tool tool='process' "
         "to list, poll, read logs, write/submit/paste input, send keys, or kill background shell runs. "
@@ -1208,7 +1208,7 @@ def chat_tool_definitions(departments: list[dict[str, Any]], active_dept: dict[s
                     "departmentId": any_dept_schema,
                     "args": {
                         "type": "object",
-                        "description": "Tool-specific arguments matching /api/tools/catalog. For shell.exec, command is required and must be a string array, never a single shell string. Example on Unix/macOS: {\"command\":[\"/bin/bash\",\"-lc\",\"find . -name '*.mp4' | head\"],\"cwd\":\"/tmp\"}; on Windows use PowerShell argv such as {\"command\":[\"powershell.exe\",\"-NoProfile\",\"-Command\",\"Get-ChildItem -Recurse -Filter *.mp4 | Select-Object -First 5\"]}. Use cwd instead of cd when possible; wrap shell syntax such as pipes, &&, globs, or redirects in /bin/bash -lc on Unix/macOS or PowerShell on Windows. Use background=true for long-running commands and optional stdoutPath/stderrPath/timeoutSeconds/pty/persistent/wakeOnComplete. On Windows, pty/persistent requests fall back to normal background process logs with pipe stdin. timeoutSeconds is not capped by ATRIUM. Use tool='process' to list, poll, read logs, write/submit/paste input, send keys, or kill background shell runs.",
+                        "description": "Tool-specific arguments matching /api/tools/catalog. For shell.exec, command is required and must be a string array, never a single shell string. Example on Unix/macOS: {\"command\":[\"/bin/bash\",\"-lc\",\"find . -name '*.mp4' | head\"],\"cwd\":\"/tmp\"}; on Windows use PowerShell argv such as {\"command\":[\"powershell.exe\",\"-NoProfile\",\"-Command\",\"Get-ChildItem -Recurse -Filter *.mp4 | Select-Object -First 5\"]}. Use cwd instead of cd when possible; wrap shell syntax such as pipes, &&, globs, or redirects in /bin/bash -lc on Unix/macOS or PowerShell on Windows. Use background=true for long-running commands and optional stdoutPath/stderrPath/timeoutSeconds/pty/persistent/wakeOnComplete. On Windows, persistent=true uses the native windows_pipe backend with pipe stdin and log handles; pty=true reports a PTY fallback while keeping normal background logs. timeoutSeconds is not capped by ATRIUM. Use tool='process' to list, poll, read logs, write/submit/paste input, send keys, or kill background shell runs.",
                     },
                     "requireApproval": {"type": "boolean"},
                     "taskId": {"type": "string"},
@@ -3705,6 +3705,10 @@ def _owner_signal_process_group(pid: int, sig: signal.Signals) -> bool:
     if not isinstance(pid, int) or pid <= 0:
         return False
     if sys.platform == "win32" or not hasattr(os, "killpg"):
+        if sys.platform == "win32":
+            sigkill = getattr(signal, "SIGKILL", None)
+            if sig == signal.SIGTERM or (sigkill is not None and sig == sigkill):
+                return _owner_windows_taskkill(pid, force=sigkill is not None and sig == sigkill)
         try:
             os.kill(pid, sig)
             return True
@@ -3740,8 +3744,37 @@ def _owner_interrupt_background_process(proc: subprocess.Popen[Any]) -> str | No
     return "SIGINT" if _owner_signal_process_group(proc.pid, signal.SIGINT) else None
 
 
+def _owner_windows_taskkill(pid: int, *, force: bool) -> bool:
+    if sys.platform != "win32" or not isinstance(pid, int) or pid <= 0:
+        return False
+    try:
+        taskkill = shutil.which("taskkill.exe") or shutil.which("taskkill")
+    except AttributeError:
+        # Python's shutil.which consults _winapi when sys.platform is patched
+        # to win32 in tests running on non-Windows hosts.
+        taskkill = None
+    if not taskkill:
+        return False
+    command = [taskkill, "/PID", str(pid), "/T"]
+    if force:
+        command.append("/F")
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            timeout=5.0,
+            check=False,
+        )
+    except Exception:
+        return False
+    return completed.returncode == 0
+
+
 def _owner_terminate_background_process(proc: subprocess.Popen[Any]) -> str | None:
     if sys.platform == "win32":
+        if _owner_windows_taskkill(proc.pid, force=False):
+            return "TASKKILL"
         try:
             proc.terminate()
             return "TERMINATE"
@@ -3752,6 +3785,8 @@ def _owner_terminate_background_process(proc: subprocess.Popen[Any]) -> str | No
 
 def _owner_kill_background_process(proc: subprocess.Popen[Any]) -> str | None:
     if sys.platform == "win32":
+        if _owner_windows_taskkill(proc.pid, force=True):
+            return "TASKKILL_FORCE"
         try:
             proc.kill()
             return "KILL"
@@ -3829,6 +3864,8 @@ def _owner_background_start_result(
     persistent_requested: bool = False,
     persistent_enabled: bool = False,
     persistent_fallback_error: str | None = None,
+    persistent_backend: str | None = None,
+    stdin_writable: bool = False,
 ) -> dict[str, Any]:
     return {
         "background": True,
@@ -3850,6 +3887,8 @@ def _owner_background_start_result(
         "mergedOutput": pty_enabled,
         "persistent": persistent_enabled,
         "persistentRequested": persistent_requested,
+        "persistentBackend": persistent_backend,
+        "stdinWritable": stdin_writable,
         **({"ptyFallbackError": pty_fallback_error} if pty_fallback_error else {}),
         **({"persistentFallbackError": persistent_fallback_error} if persistent_fallback_error else {}),
         "statusUrl": f"/api/tools/runs/{proc.pid}",  # overwritten by caller with the durable tool run id
@@ -4110,6 +4149,7 @@ def _owner_screen_run_result(
         "mergedOutput": True,
         "persistent": True,
         "persistentRequested": True,
+        "persistentBackend": "screen",
         "stdinWritable": True,
         "runnerPath": str(runner_path),
         "screenRcPath": str(screenrc_path),
@@ -4646,7 +4686,7 @@ async def _owner_start_background_shell_run(repo: Repo, run: dict[str, Any]) -> 
     persistent_requested = _tool_truthy(args.get("persistent") or args.get("persist"))
     screen_error: str | None = None
     screen = _owner_screen_executable()
-    if screen and (persistent_requested or pty_requested):
+    if screen and sys.platform != "win32" and (persistent_requested or pty_requested):
         try:
             return await _owner_start_screen_shell_run(
                 repo,
@@ -4662,8 +4702,8 @@ async def _owner_start_background_shell_run(repo: Repo, run: dict[str, Any]) -> 
             )
         except Exception as exc:
             screen_error = f"{type(exc).__name__}: {exc}"
-    elif persistent_requested:
-        screen_error = "persistent screen backend is unavailable on Windows." if sys.platform == "win32" else "screen is unavailable"
+    elif persistent_requested and sys.platform != "win32":
+        screen_error = "screen is unavailable"
     proc, pty_fd, pty_error = _owner_start_background_process(
         command,
         cwd=cwd,
@@ -4686,8 +4726,10 @@ async def _owner_start_background_shell_run(repo: Repo, run: dict[str, Any]) -> 
         pty_enabled=pty_fd is not None,
         pty_fallback_error=pty_error,
         persistent_requested=persistent_requested,
-        persistent_enabled=False,
+        persistent_enabled=persistent_requested and sys.platform == "win32",
         persistent_fallback_error=screen_error,
+        persistent_backend="windows_pipe" if persistent_requested and sys.platform == "win32" else None,
+        stdin_writable=bool(proc.stdin and not proc.stdin.closed),
     )
     result["statusUrl"] = f"/api/tools/runs/{run['id']}"
     run["result"] = result
@@ -4804,6 +4846,7 @@ def _owner_process_summary(run: dict[str, Any], args: dict[str, Any] | None = No
         "mergedOutput": bool(result.get("mergedOutput")),
         "persistent": bool(result.get("persistent")),
         "persistentRequested": bool(result.get("persistentRequested")),
+        "persistentBackend": result.get("persistentBackend"),
         "persistentFallbackError": result.get("persistentFallbackError"),
         "screenSession": result.get("screenSession"),
         "screenAlive": screen_stdin_writable if result.get("backend") == "screen" else result.get("screenAlive"),

@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SYSTEM = ROOT / "system"
 sys.path.insert(0, str(SYSTEM))
 
-from app.host_bridge_proof import host_bridge_parity_proof_id, host_bridge_source_provenance  # noqa: E402
+from app.host_bridge_proof import SOURCE_FINGERPRINT_FILES, host_bridge_parity_proof_id, host_bridge_source_provenance  # noqa: E402
 
 
 REPORT_SCHEMA_VERSION = 1
@@ -93,6 +93,14 @@ def _dict(value: Any) -> dict[str, Any]:
 
 def _positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _hex64(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(ch in "0123456789abcdef" for ch in value)
+
+
+def _hex40(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 40 and all(ch in "0123456789abcdef" for ch in value)
 
 
 def _return_code_ok(value: Any) -> bool:
@@ -466,11 +474,45 @@ def _check_artifact_metadata(
     if not isinstance(source, dict):
         findings.append(f"{label}: artifact source provenance is missing")
         return
+    files = source.get("files")
+    if not isinstance(files, dict):
+        findings.append(f"{label}: artifact source file provenance is missing")
+    else:
+        missing_files = [path for path in SOURCE_FINGERPRINT_FILES if not isinstance(files.get(path), dict)]
+        if missing_files:
+            findings.append(
+                f"{label}: artifact source file provenance is incomplete; "
+                f"missing={', '.join(missing_files[:6])}"
+            )
+        not_present = [
+            path
+            for path in SOURCE_FINGERPRINT_FILES
+            if isinstance(files.get(path), dict) and files[path].get("present") is not True
+        ]
+        if not_present:
+            findings.append(
+                f"{label}: artifact source file provenance has missing files; "
+                f"missing={', '.join(not_present[:6])}"
+            )
     fingerprint = source.get("sourceFingerprint")
-    if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+    if not _hex64(fingerprint):
         findings.append(f"{label}: artifact sourceFingerprint is missing or invalid")
+    source_manifest_sha256 = source.get("sourceManifestSha256")
+    if not _hex64(source_manifest_sha256):
+        findings.append(f"{label}: artifact sourceManifestSha256 is missing or invalid")
+    elif _hex64(fingerprint) and source_manifest_sha256 != fingerprint:
+        findings.append(f"{label}: artifact sourceManifestSha256 must match sourceFingerprint")
+    source_file_count = source.get("sourceFileCount")
+    files = source.get("files")
+    if not isinstance(source_file_count, int) or isinstance(source_file_count, bool) or source_file_count <= 0:
+        findings.append(f"{label}: artifact sourceFileCount is missing or invalid")
+    elif isinstance(files, dict) and source_file_count != len(files):
+        findings.append(
+            f"{label}: artifact sourceFileCount must match source file provenance "
+            f"(sourceFileCount={source_file_count}, files={len(files)})"
+        )
     git_head = source.get("gitHead")
-    if not isinstance(git_head, str) or len(git_head) != 40:
+    if not _hex40(git_head):
         findings.append(f"{label}: artifact gitHead is missing or invalid")
     if not _valid_parity_run_id(data.get("parityRunId")):
         findings.append(
@@ -498,7 +540,7 @@ def _check_common(
         if host.get("schemaVersion") != 1:
             findings.append(f"{label}: artifact host identity schemaVersion must be 1, got {host.get('schemaVersion')!r}")
         host_fingerprint = host.get("hostFingerprint")
-        if not isinstance(host_fingerprint, str) or len(host_fingerprint) != 64:
+        if not _hex64(host_fingerprint):
             findings.append(f"{label}: artifact hostFingerprint is missing or invalid")
         if host.get("platform") != expected_platform:
             findings.append(f"{label}: artifact host platform must be {expected_platform!r}, got {host.get('platform')!r}")
@@ -700,10 +742,10 @@ def _check_current_source_consistency(
     current_source: dict[str, Any],
 ) -> None:
     current_fingerprint = current_source.get("sourceFingerprint")
-    if isinstance(current_fingerprint, str) and len(current_fingerprint) == 64:
+    if _hex64(current_fingerprint):
         for label, data in loaded.items():
             fingerprint = _nested(data, "source", "sourceFingerprint")
-            if isinstance(fingerprint, str) and len(fingerprint) == 64 and fingerprint != current_fingerprint:
+            if _hex64(fingerprint) and fingerprint != current_fingerprint:
                 finding = (
                     f"{label}: artifact sourceFingerprint does not match current HostBridge source "
                     f"(artifact={fingerprint}, current={current_fingerprint})"
@@ -713,10 +755,10 @@ def _check_current_source_consistency(
                     results[label]["ok"] = False
                     results[label].setdefault("findings", []).append(finding)
     current_git_head = current_source.get("gitHead")
-    if isinstance(current_git_head, str) and len(current_git_head) == 40:
+    if _hex40(current_git_head):
         for label, data in loaded.items():
             git_head = _nested(data, "source", "gitHead")
-            if isinstance(git_head, str) and len(git_head) == 40 and git_head != current_git_head:
+            if _hex40(git_head) and git_head != current_git_head:
                 finding = (
                     f"{label}: artifact gitHead does not match current checkout "
                     f"(artifact={git_head}, current={current_git_head})"
@@ -806,6 +848,7 @@ def evaluate_artifacts(
             _check_windows(data, item_findings)
         findings.extend(item_findings)
         status = data.get("status") if isinstance(data.get("status"), dict) else {}
+        source_files = _nested(data, "source", "files")
         results[label] = {
             "present": True,
             "path": str(path),
@@ -818,6 +861,9 @@ def evaluate_artifacts(
             "generatedAt": data.get("generatedAt"),
             "parityRunId": data.get("parityRunId"),
             "sourceFingerprint": _nested(data, "source", "sourceFingerprint"),
+            "sourceManifestSha256": _nested(data, "source", "sourceManifestSha256"),
+            "sourceFileCount": _nested(data, "source", "sourceFileCount"),
+            "sourceFileProvenanceCount": len(source_files) if isinstance(source_files, dict) else 0,
             "gitHead": _nested(data, "source", "gitHead"),
             "gitDirty": _nested(data, "source", "gitDirty"),
             "hostFingerprint": _nested(data, "host", "hostFingerprint"),
@@ -843,6 +889,9 @@ def evaluate_artifacts(
         "summary": "full live HostBridge parity proof is complete" if not findings else "full live HostBridge parity proof is incomplete",
         "currentSource": {
             "sourceFingerprint": resolved_current_source.get("sourceFingerprint") if isinstance(resolved_current_source, dict) else None,
+            "sourceManifestSha256": resolved_current_source.get("sourceManifestSha256") if isinstance(resolved_current_source, dict) else None,
+            "sourceFileCount": resolved_current_source.get("sourceFileCount") if isinstance(resolved_current_source, dict) else None,
+            "sourceFileProvenanceCount": len(resolved_current_source.get("files") or {}) if isinstance(resolved_current_source, dict) else None,
             "gitHead": resolved_current_source.get("gitHead") if isinstance(resolved_current_source, dict) else None,
             "gitDirty": resolved_current_source.get("gitDirty") if isinstance(resolved_current_source, dict) else None,
         },

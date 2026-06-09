@@ -45,6 +45,18 @@ def _load_windows_probe_module():
     return module
 
 
+def _load_macos_probe_module():
+    spec = importlib.util.spec_from_file_location(
+        "macos_host_bridge_probe",
+        REPO_ROOT / "ops" / "macos_host_bridge_probe.py",
+    )
+    if spec is None or spec.loader is None:
+        raise AssertionError("macos_host_bridge_probe.py could not be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def _windows_preflight_ok(_run_process: object) -> dict[str, object]:
     return {
         "returnCode": 0,
@@ -197,6 +209,8 @@ def _verified_parity_report(
             "artifactBytes": 1024,
             "artifactSha256": "1" * 64,
             "sourceFingerprint": macos_fingerprint,
+            "sourceManifestSha256": macos_fingerprint,
+            "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES),
             "gitHead": macos_git_head,
             "gitDirty": False,
             "parityRunId": "parity-run-1",
@@ -211,6 +225,8 @@ def _verified_parity_report(
             "artifactBytes": 2048,
             "artifactSha256": "2" * 64,
             "sourceFingerprint": windows_fingerprint,
+            "sourceManifestSha256": windows_fingerprint,
+            "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES),
             "gitHead": windows_git_head,
             "gitDirty": False,
             "parityRunId": "parity-run-1",
@@ -233,13 +249,30 @@ def _verified_parity_report(
     }
     report["proofId"] = host_bridge_parity_proof_id(
         report["results"],
-        {"sourceFingerprint": "a" * 64, "gitHead": "b" * 40, "gitDirty": False},
+        {"sourceFingerprint": "a" * 64, "sourceManifestSha256": "a" * 64, "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES), "gitHead": "b" * 40, "gitDirty": False},
         enforce_current_source=True,
     )
     return report
 
 
 class WindowsHostBridgeTest(unittest.TestCase):
+    def test_windows_live_proof_runner_refreshes_common_paths_and_reports_cli_next_step(self) -> None:
+        script = (REPO_ROOT / "ops" / "windows_host_bridge_live_proof.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("function Add-PathIfExists", script)
+        self.assertIn("AppData\\Roaming\\npm", script)
+        self.assertIn("$UvCommand = Get-Command uv", script)
+        self.assertIn("& $UvPath @Arguments", script)
+        self.assertIn("SourceManifestSha256", script)
+        self.assertIn("SourceFileCount", script)
+        self.assertIn("--expect-source-manifest-sha256", script)
+        self.assertIn("--expect-source-file-count", script)
+        self.assertIn("$RepoRoot = [System.IO.Path]::GetFullPath((Join-Path $ScriptDirectory '..'))", script)
+        self.assertIn("'system/pyproject.toml'", script)
+        self.assertIn("Set-Location -LiteralPath $RepoRoot", script)
+        self.assertIn("Set-Location -LiteralPath $PreviousLocation", script)
+        self.assertIn("./atrium automation report", script)
+
     def _connector_catalog_for_test(
         self,
         fake_host_bridge: object,
@@ -255,6 +288,8 @@ class WindowsHostBridgeTest(unittest.TestCase):
             settings = main_module.get_settings().model_copy(update={"host_bridge_parity_report_path": report_path})
             source = current_source or {
                 "sourceFingerprint": "a" * 64,
+                "sourceManifestSha256": "a" * 64,
+                "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES),
                 "gitHead": "b" * 40,
                 "gitDirty": False,
             }
@@ -281,6 +316,8 @@ class WindowsHostBridgeTest(unittest.TestCase):
             settings = main_module.get_settings().model_copy(update={"host_bridge_parity_report_path": report_path})
             source = current_source or {
                 "sourceFingerprint": "a" * 64,
+                "sourceManifestSha256": "a" * 64,
+                "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES),
                 "gitHead": "b" * 40,
                 "gitDirty": False,
             }
@@ -2119,12 +2156,12 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertIn("Win32 input APIs", connectors["browser"]["requires"])
         self.assertEqual(connectors["browser"]["proofStatus"], "local_blocked")
         self.assertIn("profile discovery ready", connectors["browser"]["proofGaps"][0])
-        self.assertIn("host_bridge_parity_report.py", connectors["browser"]["proofGaps"][-1])
+        self.assertIn("./atrium automation report", connectors["browser"]["proofGaps"][-1])
         self.assertEqual(connectors["desktop"]["status"], "blocked_by_runtime")
         self.assertTrue(connectors["desktop"]["readReady"])
         self.assertFalse(connectors["desktop"]["writeReady"])
         self.assertEqual(connectors["desktop"]["proofStatus"], "local_blocked")
-        self.assertIn("host_bridge_parity_report.py", connectors["desktop"]["proofGaps"][-1])
+        self.assertIn("./atrium automation report", connectors["desktop"]["proofGaps"][-1])
 
     def test_connector_catalog_reports_windows_visual_preflight_failure(self) -> None:
         class FakeStatus:
@@ -2164,7 +2201,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertEqual(connectors["desktop"]["runtimeStatus"], "Windows visual automation preflight failed: failed checks: dpiAwareness")
         self.assertIn("DPI-aware visual preflight", connectors["desktop"]["requires"])
         self.assertEqual(connectors["desktop"]["proofStatus"], "local_blocked")
-        self.assertIn("host_bridge_parity_report.py", connectors["desktop"]["proofGaps"][-1])
+        self.assertIn("./atrium automation report", connectors["desktop"]["proofGaps"][-1])
 
     def test_connector_catalog_reports_macos_visual_preflight_failure(self) -> None:
         class FakeStatus:
@@ -2234,7 +2271,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertIn("Chrome/Edge/Brave/Chromium for isolated profile", browser["requires"])
         self.assertEqual(browser["proofStatus"], "cross_os_unverified")
         self.assertIn("isolated browser profile app missing", browser["proofGaps"][0])
-        self.assertIn("host_bridge_parity_report.py", browser["proofGaps"][-1])
+        self.assertIn("./atrium automation report", browser["proofGaps"][-1])
 
     def test_connector_catalog_marks_ready_host_bridge_as_cross_os_unverified(self) -> None:
         class FakeStatus:
@@ -2263,8 +2300,8 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_unverified")
         self.assertIn("verified macOS+Windows full parity report", connectors["browser"]["proofSummary"])
         self.assertIn("verified macOS+Windows full parity report", connectors["desktop"]["proofSummary"])
-        self.assertIn("host_bridge_parity_report.py", connectors["browser"]["proofGaps"][-1])
-        self.assertIn("host_bridge_parity_report.py", connectors["desktop"]["proofGaps"][-1])
+        self.assertIn("./atrium automation report", connectors["browser"]["proofGaps"][-1])
+        self.assertIn("./atrium automation report", connectors["desktop"]["proofGaps"][-1])
         self.assertEqual(connectors["local_file"]["proofStatus"], "not_required")
 
     def test_connector_catalog_marks_ready_host_bridge_as_cross_os_verified_from_persisted_report(self) -> None:
@@ -2379,6 +2416,39 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertIn("artifactSha256", " ".join(connectors["browser"]["proofGaps"]))
         self.assertIn("artifactBytes", " ".join(connectors["desktop"]["proofGaps"]))
 
+    def test_connector_catalog_rejects_verified_report_with_non_hex_artifact_hash(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        report = _verified_parity_report()
+        report["results"]["windows"]["artifactSha256"] = "z" * 64
+        fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+        connectors = self._connector_catalog_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=report,
+        )
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "cross_os_unverified")
+        self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_unverified")
+        self.assertIn("artifactSha256", " ".join(connectors["browser"]["proofGaps"]))
+
     def test_connector_catalog_rejects_verified_report_without_host_identity(self) -> None:
         class FakeStatus:
             def to_dict(self) -> dict[str, object]:
@@ -2414,6 +2484,74 @@ class WindowsHostBridgeTest(unittest.TestCase):
         gaps = " ".join(connectors["browser"]["proofGaps"])
         self.assertIn("hostFingerprint", gaps)
         self.assertIn("hostPlatform", gaps)
+
+    def test_connector_catalog_rejects_verified_report_without_source_file_provenance(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        report = _verified_parity_report()
+        report["results"]["macos"].pop("sourceFileCount", None)
+        report["results"]["windows"]["sourceFileCount"] = len(main_module.SOURCE_FINGERPRINT_FILES) - 1
+        fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+        connectors = self._connector_catalog_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=report,
+        )
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "cross_os_unverified")
+        self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_unverified")
+        gaps = " ".join(connectors["browser"]["proofGaps"])
+        self.assertIn("sourceFileCount", gaps)
+
+    def test_connector_catalog_rejects_verified_report_with_extra_source_file_count(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        report = _verified_parity_report()
+        report["results"]["macos"]["sourceFileCount"] = len(main_module.SOURCE_FINGERPRINT_FILES) + 1
+        fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+        connectors = self._connector_catalog_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=report,
+        )
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "cross_os_unverified")
+        self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_unverified")
+        self.assertIn("sourceFileCount", " ".join(connectors["browser"]["proofGaps"]))
 
     def test_connector_catalog_rejects_verified_report_without_proof_id(self) -> None:
         class FakeStatus:
@@ -2502,7 +2640,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
             def status(self) -> FakeStatus:
                 return FakeStatus()
 
-        current_source = {"sourceFingerprint": "a" * 64, "gitHead": "b" * 40, "gitDirty": False}
+        current_source = {"sourceFingerprint": "a" * 64, "sourceManifestSha256": "a" * 64, "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES), "gitHead": "b" * 40, "gitDirty": False}
         report = _verified_parity_report()
         report["results"]["macos"]["proofs"]["browserActVerified"] = False
         report["proofId"] = host_bridge_parity_proof_id(
@@ -2544,7 +2682,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
             def status(self) -> FakeStatus:
                 return FakeStatus()
 
-        current_source = {"sourceFingerprint": "a" * 64, "gitHead": "b" * 40, "gitDirty": False}
+        current_source = {"sourceFingerprint": "a" * 64, "sourceManifestSha256": "a" * 64, "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES), "gitHead": "b" * 40, "gitDirty": False}
         report = _verified_parity_report()
         report["results"]["macos"]["proofs"].pop("appleScriptClipboard")
         report["proofId"] = host_bridge_parity_proof_id(
@@ -2585,7 +2723,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
             def status(self) -> FakeStatus:
                 return FakeStatus()
 
-        current_source = {"sourceFingerprint": "a" * 64, "gitHead": "b" * 40, "gitDirty": False}
+        current_source = {"sourceFingerprint": "a" * 64, "sourceManifestSha256": "a" * 64, "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES), "gitHead": "b" * 40, "gitDirty": False}
         report = _verified_parity_report()
         report["results"]["windows"]["proofs"]["browserActIsolatedPlaywright"] = False
         report["proofId"] = host_bridge_parity_proof_id(
@@ -2627,7 +2765,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
             def status(self) -> FakeStatus:
                 return FakeStatus()
 
-        current_source = {"sourceFingerprint": "a" * 64, "gitHead": "b" * 40, "gitDirty": False}
+        current_source = {"sourceFingerprint": "a" * 64, "sourceManifestSha256": "a" * 64, "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES), "gitHead": "b" * 40, "gitDirty": False}
         report = _verified_parity_report()
         report["results"]["windows"]["proofs"].pop("windowsInteractiveSessionIdentity")
         report["proofId"] = host_bridge_parity_proof_id(
@@ -2668,7 +2806,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
             def status(self) -> FakeStatus:
                 return FakeStatus()
 
-        current_source = {"sourceFingerprint": "a" * 64, "gitHead": "b" * 40, "gitDirty": False}
+        current_source = {"sourceFingerprint": "a" * 64, "sourceManifestSha256": "a" * 64, "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES), "gitHead": "b" * 40, "gitDirty": False}
         report = _verified_parity_report()
         report["results"]["macos"].pop("parityRunId")
         report["results"]["windows"]["parityRunId"] = "other-run"
@@ -2711,7 +2849,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
             def status(self) -> FakeStatus:
                 return FakeStatus()
 
-        current_source = {"sourceFingerprint": "a" * 64, "gitHead": "b" * 40, "gitDirty": False}
+        current_source = {"sourceFingerprint": "a" * 64, "sourceManifestSha256": "a" * 64, "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES), "gitHead": "b" * 40, "gitDirty": False}
         report = _verified_parity_report()
         report["results"]["linux"] = {
             "present": True,
@@ -2804,7 +2942,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
             FakeHostBridge,
             fake_profiles,
             parity_report=_verified_parity_report(),
-            current_source={"sourceFingerprint": "c" * 64, "gitHead": "b" * 40, "gitDirty": True},
+            current_source={"sourceFingerprint": "c" * 64, "sourceManifestSha256": "c" * 64, "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES), "gitHead": "b" * 40, "gitDirty": True},
         )
 
         self.assertEqual(connectors["browser"]["proofStatus"], "cross_os_unverified")
@@ -2885,6 +3023,120 @@ class WindowsHostBridgeTest(unittest.TestCase):
         paths = {getattr(route, "path", None) for route in main_module.app.routes}
         self.assertIn("/api/host-bridge/parity", paths)
 
+    def test_probe_artifact_stamp_uses_start_source_snapshot(self) -> None:
+        windows_probe = _load_windows_probe_module()
+        macos_probe = _load_macos_probe_module()
+        source_snapshot = {
+            "sourceFingerprint": "a" * 64,
+            "sourceManifestSha256": "a" * 64,
+            "sourceFileCount": 18,
+            "gitHead": "b" * 40,
+        }
+        changed_source = {
+            "sourceFingerprint": "c" * 64,
+            "sourceManifestSha256": "c" * 64,
+            "sourceFileCount": 18,
+            "gitHead": "d" * 40,
+        }
+
+        with mock.patch.object(windows_probe, "host_bridge_source_provenance", return_value=changed_source):
+            stamped = windows_probe._stamp_result({"ok": True, "mode": "live"}, source=source_snapshot)
+        self.assertEqual(stamped["source"]["sourceFingerprint"], "a" * 64)
+
+        with mock.patch.object(macos_probe, "host_bridge_source_provenance", return_value=changed_source):
+            stamped = macos_probe._stamp_result({"ok": True, "mode": "live"}, source=source_snapshot)
+        self.assertEqual(stamped["source"]["sourceFingerprint"], "a" * 64)
+
+    def test_macos_textedit_probe_refreshes_text_ref_after_native_scroll(self) -> None:
+        probe = _load_macos_probe_module()
+        act_refs: list[str] = []
+        snapshot_calls = 0
+
+        def fake_list_apps(args: dict[str, object], _run_process: object) -> dict[str, object]:
+            query = str(args.get("query") or "")
+            include_running = args.get("includeRunning") is True
+            if query == "TextEdit" and include_running and not fake_list_apps.opened:
+                return {"returnCode": 0, "running": []}
+            if query == "TextEdit" and include_running:
+                return {"returnCode": 0, "running": [{"name": "TextEdit", "processId": 42}]}
+            return {"returnCode": 0, "running": []}
+
+        fake_list_apps.opened = False  # type: ignore[attr-defined]
+
+        def fake_open_app(_args: dict[str, object], _run_process: object) -> dict[str, object]:
+            fake_list_apps.opened = True  # type: ignore[attr-defined]
+            return {"returnCode": 0}
+
+        def fake_snapshot(_args: dict[str, object], _run_process: object) -> dict[str, object]:
+            nonlocal snapshot_calls
+            snapshot_calls += 1
+            text_ref = "d-old" if snapshot_calls == 1 else "d-new"
+            return {
+                "returnCode": 0,
+                "refCount": 2,
+                "snapshot": {
+                    "elements": [
+                        {
+                            "ref": "d-scroll",
+                            "role": "AXScrollArea",
+                            "nativeSupportedActions": ["scroll"],
+                            "axActions": ["AXScrollDownByPage"],
+                            "supportedActions": ["scroll"],
+                            "settableAttributes": [],
+                        },
+                        {
+                            "ref": text_ref,
+                            "role": "AXTextArea",
+                            "nativeSupportedActions": ["paste", "type"],
+                            "supportedActions": ["paste", "type"],
+                            "settableAttributes": ["AXValue"],
+                            "value": "" if text_ref == "d-old" else probe.MACOS_TEXTEDIT_EXPECTED_TEXT,
+                        },
+                    ]
+                },
+            }
+
+        def fake_act(args: dict[str, object], _run_process: object) -> dict[str, object]:
+            act_refs.append(str(args.get("ref") or ""))
+            if args.get("action") == "scroll":
+                return {
+                    "returnCode": 0,
+                    "usedNativeAction": True,
+                    "nativeAttempt": {
+                        "returnCode": 0,
+                        "nativeStatus": "OK",
+                        "nativeAction": "AXScrollDownByPage",
+                    },
+                }
+            return {
+                "returnCode": 0,
+                "usedNativeAction": True,
+                "nativeAttempt": {
+                    "returnCode": 0,
+                    "nativeStatus": "OK",
+                    "nativeAction": "setValue",
+                },
+            }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(probe, "get_settings", return_value=type("Settings", (), {"data_dir": Path(tmp)})()),
+                mock.patch.object(visual_bridge, "execute_list_apps", fake_list_apps),
+                mock.patch.object(visual_bridge, "execute_open_app", fake_open_app),
+                mock.patch.object(visual_bridge, "execute_activate_app", lambda _args, _run_process: {"returnCode": 0, "ok": True}),
+                mock.patch.object(visual_bridge, "execute_desktop_snapshot", fake_snapshot),
+                mock.patch.object(visual_bridge, "execute_desktop_act", fake_act),
+                mock.patch.object(visual_bridge, "execute_quit_app", lambda _args, _run_process: {"returnCode": 0, "quitVerified": True}),
+                mock.patch.object(probe.time, "sleep", lambda _seconds: None),
+            ):
+                result = probe._interactive_textedit_probe()
+
+        self.assertNotIn("error", result)
+        self.assertEqual(act_refs, ["d-scroll", "d-new"])
+        self.assertEqual(result["refreshedTextRefAfterScroll"], "d-new")
+        self.assertTrue(result["nativeActionVerified"])
+        self.assertTrue(result["textValueVerified"])
+
     def test_host_bridge_parity_status_reports_local_blocked_runtime(self) -> None:
         class FakeStatus:
             def to_dict(self) -> dict[str, object]:
@@ -2921,49 +3173,91 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertEqual(payload["local"]["platform"], "darwin")
         self.assertEqual(payload["local"]["desktop"]["proofStatus"], "local_blocked")
         self.assertEqual(payload["local"]["macosVisualPreflight"]["ok"], False)
+        self.assertEqual(payload["contract"]["target"], "openclaw_level_windows_host_parity")
+        self.assertTrue(payload["contract"]["noSilentDegradation"])
+        self.assertTrue(payload["contract"]["windowsNativePrimary"])
+        self.assertEqual(payload["contract"]["connectorRequirements"][1]["currentStatus"], "local_blocked")
+        self.assertEqual(payload["commands"]["automationReport"], payload["commands"]["report"])
+        self.assertIn("./atrium automation report", payload["commands"]["automationReport"])
+        self.assertEqual(payload["commands"]["verify"], "./atrium automation audit")
         self.assertRegex(payload["commands"]["parityRunId"], r"^atrium-\d+-[0-9a-f-]{36}$")
         self.assertRegex(payload["commands"]["sourceFingerprint"], r"^[0-9a-f]{64}$")
+        self.assertEqual(payload["commands"]["sourceManifestSha256"], payload["commands"]["sourceFingerprint"])
+        self.assertEqual(payload["commands"]["sourceFileCount"], str(len(main_module.SOURCE_FINGERPRINT_FILES)))
         self.assertIn(payload["commands"]["parityRunId"], payload["commands"]["macosRunIdExport"])
         self.assertIn("ops/host_bridge_source_summary.py", payload["commands"]["macosSourceValidate"])
         self.assertIn(payload["commands"]["sourceFingerprint"], payload["commands"]["macosSourceValidate"])
+        self.assertIn("--expect-source-manifest-sha256", payload["commands"]["macosSourceValidate"])
+        self.assertIn(payload["commands"]["sourceManifestSha256"], payload["commands"]["macosSourceValidate"])
+        self.assertIn("--expect-source-file-count", payload["commands"]["macosSourceValidate"])
+        self.assertIn(payload["commands"]["sourceFileCount"], payload["commands"]["macosSourceValidate"])
         self.assertIn(payload["commands"]["parityRunId"], payload["commands"]["windowsRunIdSet"])
-        self.assertIn("ops/host_bridge_source_summary.py", payload["commands"]["windowsSourceValidate"])
+        self.assertIn(".\\atrium.ps1 automation source", payload["commands"]["windowsSourceValidate"])
         self.assertIn(payload["commands"]["sourceFingerprint"], payload["commands"]["windowsSourceValidate"])
+        self.assertIn("--expect-source-manifest-sha256", payload["commands"]["windowsSourceValidate"])
+        self.assertIn(payload["commands"]["sourceManifestSha256"], payload["commands"]["windowsSourceValidate"])
+        self.assertIn("--expect-source-file-count", payload["commands"]["windowsSourceValidate"])
+        self.assertIn(payload["commands"]["sourceFileCount"], payload["commands"]["windowsSourceValidate"])
         self.assertIn("ops/macos_host_bridge_probe.py --full", payload["commands"]["macosProbe"])
         self.assertIn("--parity-run-id", payload["commands"]["macosProbe"])
         self.assertIn("--expect-source-fingerprint", payload["commands"]["macosProbe"])
         self.assertIn(payload["commands"]["sourceFingerprint"], payload["commands"]["macosProbe"])
+        self.assertIn("--expect-source-manifest-sha256", payload["commands"]["macosProbe"])
+        self.assertIn(payload["commands"]["sourceManifestSha256"], payload["commands"]["macosProbe"])
+        self.assertIn("--expect-source-file-count", payload["commands"]["macosProbe"])
+        self.assertIn(payload["commands"]["sourceFileCount"], payload["commands"]["macosProbe"])
         self.assertIn(payload["commands"]["parityRunId"], payload["commands"]["macosProbe"])
         self.assertIn("ops/host_bridge_artifact_summary.py", payload["commands"]["macosArtifactValidate"])
         self.assertIn("--label macos", payload["commands"]["macosArtifactValidate"])
         self.assertIn(payload["commands"]["parityRunId"], payload["commands"]["macosArtifactValidate"])
         self.assertIn(payload["commands"]["sourceFingerprint"], payload["commands"]["macosArtifactValidate"])
-        self.assertIn("ops/windows_host_bridge_probe.py --full", payload["commands"]["windowsProbe"])
+        self.assertIn("--expect-source-manifest-sha256", payload["commands"]["macosArtifactValidate"])
+        self.assertIn(payload["commands"]["sourceManifestSha256"], payload["commands"]["macosArtifactValidate"])
+        self.assertIn("--expect-source-file-count", payload["commands"]["macosArtifactValidate"])
+        self.assertIn(payload["commands"]["sourceFileCount"], payload["commands"]["macosArtifactValidate"])
+        self.assertIn(".\\atrium.ps1 automation windows-probe --full", payload["commands"]["windowsProbe"])
         self.assertIn("--parity-run-id", payload["commands"]["windowsProbe"])
         self.assertIn("--expect-source-fingerprint", payload["commands"]["windowsProbe"])
         self.assertIn(payload["commands"]["sourceFingerprint"], payload["commands"]["windowsProbe"])
+        self.assertIn("--expect-source-manifest-sha256", payload["commands"]["windowsProbe"])
+        self.assertIn(payload["commands"]["sourceManifestSha256"], payload["commands"]["windowsProbe"])
+        self.assertIn("--expect-source-file-count", payload["commands"]["windowsProbe"])
+        self.assertIn(payload["commands"]["sourceFileCount"], payload["commands"]["windowsProbe"])
         self.assertIn(payload["commands"]["parityRunId"], payload["commands"]["windowsProbe"])
-        self.assertIn("windows_host_bridge_live_proof.ps1", payload["commands"]["windowsLiveProofRunner"])
-        self.assertIn("-ParityRunId", payload["commands"]["windowsLiveProofRunner"])
-        self.assertIn("-SourceFingerprint", payload["commands"]["windowsLiveProofRunner"])
+        self.assertIn(".\\atrium.ps1 automation windows-live-proof", payload["commands"]["windowsLiveProofRunner"])
+        self.assertIn("--parity-run-id", payload["commands"]["windowsLiveProofRunner"])
+        self.assertIn("--source-fingerprint", payload["commands"]["windowsLiveProofRunner"])
+        self.assertIn("--source-manifest-sha256", payload["commands"]["windowsLiveProofRunner"])
+        self.assertIn("--source-file-count", payload["commands"]["windowsLiveProofRunner"])
         self.assertIn(payload["commands"]["parityRunId"], payload["commands"]["windowsLiveProofRunner"])
         self.assertIn(payload["commands"]["sourceFingerprint"], payload["commands"]["windowsLiveProofRunner"])
+        self.assertIn(payload["commands"]["sourceManifestSha256"], payload["commands"]["windowsLiveProofRunner"])
+        self.assertIn(payload["commands"]["sourceFileCount"], payload["commands"]["windowsLiveProofRunner"])
         self.assertIn("C:\\Temp\\atrium_host_bridge_windows_live.json", payload["commands"]["windowsLiveProofRunner"])
-        self.assertIn("ops/host_bridge_artifact_summary.py", payload["commands"]["windowsArtifactValidateOnWindows"])
+        self.assertIn(".\\atrium.ps1 automation artifact", payload["commands"]["windowsArtifactValidateOnWindows"])
         self.assertIn("--label windows", payload["commands"]["windowsArtifactValidateOnWindows"])
         self.assertIn(payload["commands"]["parityRunId"], payload["commands"]["windowsArtifactValidateOnWindows"])
         self.assertIn(payload["commands"]["sourceFingerprint"], payload["commands"]["windowsArtifactValidateOnWindows"])
+        self.assertIn("--expect-source-manifest-sha256", payload["commands"]["windowsArtifactValidateOnWindows"])
+        self.assertIn(payload["commands"]["sourceManifestSha256"], payload["commands"]["windowsArtifactValidateOnWindows"])
+        self.assertIn("--expect-source-file-count", payload["commands"]["windowsArtifactValidateOnWindows"])
+        self.assertIn(payload["commands"]["sourceFileCount"], payload["commands"]["windowsArtifactValidateOnWindows"])
         self.assertEqual(payload["commands"]["windowsArtifactSource"], "C:\\Temp\\atrium_host_bridge_windows_live.json")
         self.assertEqual(payload["commands"]["windowsArtifactLocal"], "/tmp/atrium_host_bridge_windows_live.json")
         self.assertIn("C:\\Temp\\atrium_host_bridge_windows_live.json", payload["commands"]["windowsArtifactCopyHint"])
         self.assertIn("/tmp/atrium_host_bridge_windows_live.json", payload["commands"]["windowsArtifactCopyHint"])
-        self.assertIn("ops/host_bridge_artifact_summary.py", payload["commands"]["windowsArtifactValidateLocal"])
+        self.assertIn("./atrium automation artifact", payload["commands"]["windowsArtifactValidateLocal"])
         self.assertIn("--label windows", payload["commands"]["windowsArtifactValidateLocal"])
         self.assertIn(payload["commands"]["parityRunId"], payload["commands"]["windowsArtifactValidateLocal"])
         self.assertIn(payload["commands"]["sourceFingerprint"], payload["commands"]["windowsArtifactValidateLocal"])
-        self.assertIn("ops/host_bridge_parity_report.py", payload["commands"]["verify"])
-        self.assertIn("--windows /tmp/atrium_host_bridge_windows_live.json", payload["commands"]["verify"])
-        self.assertIn("--windows-source-path 'C:\\Temp\\atrium_host_bridge_windows_live.json'", payload["commands"]["verify"])
+        self.assertIn("--expect-source-manifest-sha256", payload["commands"]["windowsArtifactValidateLocal"])
+        self.assertIn(payload["commands"]["sourceManifestSha256"], payload["commands"]["windowsArtifactValidateLocal"])
+        self.assertIn("--expect-source-file-count", payload["commands"]["windowsArtifactValidateLocal"])
+        self.assertIn(payload["commands"]["sourceFileCount"], payload["commands"]["windowsArtifactValidateLocal"])
+        self.assertIn("--windows /tmp/atrium_host_bridge_windows_live.json", payload["commands"]["automationReport"])
+        self.assertIn("--windows-source-path 'C:\\Temp\\atrium_host_bridge_windows_live.json'", payload["commands"]["automationReport"])
+        self.assertIn("ops/host_bridge_parity_report.py", payload["commands"]["legacyParityReport"])
+        self.assertIn("--output system/data/host-bridge-parity-report.json", payload["commands"]["legacyParityReport"])
 
     def test_host_bridge_parity_status_accepts_verified_report_and_endpoint_handler(self) -> None:
         class FakeStatus:
@@ -2976,6 +3270,16 @@ class WindowsHostBridgeTest(unittest.TestCase):
                     "desktopAutomationReady": True,
                     "isolatedBrowserProfileReady": True,
                     "browserPlaywrightReady": True,
+                    "shellReady": True,
+                    "interactiveSession": True,
+                    "interactiveSessionName": "Console",
+                    "interactiveSessionId": 1,
+                    "windowsVisualPreflightChecked": True,
+                    "windowsVisualPreflightOk": True,
+                    "windowsVisualPreflightChecks": {
+                        "dpiAwareness": True,
+                        "virtualScreen": True,
+                    },
                 }
 
         class FakeHostBridge:
@@ -2989,16 +3293,22 @@ class WindowsHostBridgeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             report_path = Path(tmp) / "host-bridge-parity-report.json"
             report_path.write_text(json.dumps(report), encoding="utf-8")
-            settings = main_module.get_settings().model_copy(update={"host_bridge_parity_report_path": report_path})
+            settings = main_module.get_settings().model_copy(update={
+                "host_bridge_parity_report_path": report_path,
+                "mcp_gateway_url": "http://127.0.0.1:9999/mcp",
+                "mcp_gateway_token": "test-token",
+                "mcp_enabled_servers": "github,calendar,drive,notion",
+            })
             fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
             with (
                 mock.patch.object(main_module, "HostBridge", FakeHostBridge),
                 mock.patch.object(main_module, "list_browser_profiles", lambda: fake_profiles),
+                mock.patch.object(main_module, "_mcp_gateway_health", lambda _settings, probe=False: {"configured": True, "checked": True, "ok": True, "status": 200}),
                 mock.patch.object(main_module, "get_settings", lambda: settings),
                 mock.patch.object(
                     main_module,
                     "host_bridge_source_provenance",
-                    lambda: {"sourceFingerprint": "a" * 64, "gitHead": "b" * 40, "gitDirty": False},
+                    lambda: {"sourceFingerprint": "a" * 64, "sourceManifestSha256": "a" * 64, "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES), "gitHead": "b" * 40, "gitDirty": False},
                 ),
             ):
                 payload = asyncio.run(main_module.get_host_bridge_parity())
@@ -3010,9 +3320,452 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertEqual(payload["report"]["proofId"], report["proofId"])
         self.assertEqual(payload["report"]["parityRunId"], "parity-run-1")
         self.assertEqual(payload["report"]["artifactSha256"]["windows"], "2" * 64)
+        self.assertEqual(payload["contract"]["status"], "cross_os_verified")
+        self.assertTrue(payload["contract"]["noSilentDegradation"])
+        self.assertTrue(payload["contract"]["windowsNativePrimary"])
+        self.assertTrue(payload["contract"]["windowsNativeOnly"])
+        lifecycle_requirement = next(
+            item for item in payload["contract"]["localRequirements"]
+            if item["id"] == "windows_native_lifecycle"
+        )
+        self.assertTrue(lifecycle_requirement["currentDetails"]["atriumPs1"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["atriumPs1Runner"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["atriumCmd"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["atriumCmdForwarder"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["installWindowsNativePs1"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["installWindowsNativeSafety"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["atriumCli"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["pidFiles"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["statusJson"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["python3Validated"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["logsJson"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["supportBundle"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["selfUpdateRestart"])
+        self.assertIn(".\\atrium.ps1 status --json", lifecycle_requirement["requiredEvidence"])
+        self.assertIn(".\\atrium.ps1 logs --json", lifecycle_requirement["requiredEvidence"])
+        self.assertIn(".\\atrium.ps1 report --bundle", lifecycle_requirement["requiredEvidence"])
+        self.assertIn("runnable Python 3 validation in .\\atrium.ps1 setup", lifecycle_requirement["requiredEvidence"])
+        self.assertIn("UI self-update restart through .\\atrium.ps1 restart --force", lifecycle_requirement["requiredEvidence"])
+        entrypoint_requirement = next(
+            item for item in payload["contract"]["localRequirements"]
+            if item["id"] == "windows_native_entrypoints"
+        )
+        self.assertIn("atrium.cmd", entrypoint_requirement["requiredEvidence"])
+        self.assertIn("ops/atrium_cli.py", entrypoint_requirement["requiredEvidence"])
+        provider_tools_requirement = next(
+            item for item in payload["contract"]["localRequirements"]
+            if item["id"] == "windows_native_provider_ai_tools"
+        )
+        self.assertTrue(provider_tools_requirement["currentReady"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["commandProvider"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["commandTools"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["providerStatusJson"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["providerStatusJsonRedaction"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["windowsUrlOpenNative"])
+        self.assertIn(".\\atrium.ps1 provider status --probe --json", provider_tools_requirement["requiredEvidence"])
+        self.assertIn("native Windows URL opener for provider OAuth", provider_tools_requirement["requiredEvidence"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["toolsStatusJson"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["toolsCatalogJson"])
+        self.assertIn(".\\atrium.ps1 tools status --json", provider_tools_requirement["requiredEvidence"])
+        self.assertIn(".\\atrium.ps1 tools catalog --json", provider_tools_requirement["requiredEvidence"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["toolCatalogEndpoint"])
+        command_gate_requirement = next(
+            item for item in payload["contract"]["localRequirements"]
+            if item["id"] == "openclaw_audit_report_commands"
+        )
+        self.assertTrue(command_gate_requirement["currentReady"])
+        self.assertTrue(command_gate_requirement["currentDetails"]["automationAudit"])
+        self.assertTrue(command_gate_requirement["currentDetails"]["automationStatusJson"])
+        self.assertTrue(command_gate_requirement["currentDetails"]["automationHandoff"])
+        self.assertTrue(command_gate_requirement["currentDetails"]["automationReport"])
+        self.assertTrue(command_gate_requirement["currentDetails"]["defaultReportPath"])
+        self.assertIn(".\\atrium.ps1 automation status --json", command_gate_requirement["requiredEvidence"])
+        self.assertIn(".\\atrium.ps1 automation handoff --macos <macos-json>", command_gate_requirement["requiredEvidence"])
+        self.assertTrue(all(item["currentReady"] for item in payload["contract"]["reportRequirements"]))
+        report_requirement_ids = {item["id"] for item in payload["contract"]["reportRequirements"]}
+        self.assertIn("proof_id_bound_to_artifacts", report_requirement_ids)
+        self.assertIn("artifact_hash_and_size_recorded", report_requirement_ids)
+        self.assertIn("source_file_provenance_recorded", report_requirement_ids)
+        self.assertIn("host_identity_recorded", report_requirement_ids)
+        self.assertTrue(all(item["proved"] for item in payload["contract"]["windowsProofRequirements"]))
+        self.assertTrue(all(item["proved"] for item in payload["contract"]["connectorRequirements"]))
+        self.assertTrue(all(item["registered"] for item in payload["contract"]["apiSurfaceRequirements"]))
+        required_features = [item for item in payload["contract"]["featureRequirements"] if item["required"]]
+        self.assertTrue(all(item["ready"] for item in required_features))
+        self.assertEqual(
+            {item["id"] for item in required_features},
+            {"local_file", "git", "sandbox", "http", "web", "browser", "desktop", "mcp"},
+        )
+        mcp_requirement = next(item for item in required_features if item["id"] == "mcp")
+        self.assertTrue(mcp_requirement["requiresWriteReady"])
+        self.assertFalse(mcp_requirement["degradedByLocalFallback"])
+        self.assertTrue(mcp_requirement["writeReady"])
         self.assertEqual(payload["connectors"][0]["proofStatus"], "cross_os_verified")
         self.assertEqual(payload["connectors"][1]["proofStatus"], "cross_os_verified")
-        self.assertIn("data/host-bridge-parity-report.json", payload["commands"]["verify"])
+        self.assertEqual(payload["commands"]["automationReport"], payload["commands"]["report"])
+        self.assertIn(".\\atrium.ps1 automation report", payload["commands"]["automationReport"])
+        self.assertEqual(payload["commands"]["verify"], ".\\atrium.ps1 automation audit")
+        self.assertIn("system/data/host-bridge-parity-report.json", payload["commands"]["legacyParityReport"])
+
+    def test_host_bridge_parity_status_reports_openclaw_contract_gaps_when_report_proof_is_verified(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                    "shellReady": True,
+                    "interactiveSession": True,
+                    "interactiveSessionName": "Console",
+                    "interactiveSessionId": 1,
+                    "windowsVisualPreflightChecked": True,
+                    "windowsVisualPreflightOk": True,
+                    "windowsVisualPreflightChecks": {
+                        "dpiAwareness": True,
+                        "virtualScreen": True,
+                    },
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        report = _verified_parity_report()
+        with tempfile.TemporaryDirectory() as tmp:
+            report_path = Path(tmp) / "host-bridge-parity-report.json"
+            report_path.write_text(json.dumps(report), encoding="utf-8")
+            settings = main_module.get_settings().model_copy(update={
+                "host_bridge_parity_report_path": report_path,
+                "mcp_gateway_url": "",
+                "mcp_gateway_token": "",
+                "mcp_enabled_servers": "",
+            })
+            fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+            with (
+                mock.patch.object(main_module, "HostBridge", FakeHostBridge),
+                mock.patch.object(main_module, "list_browser_profiles", lambda: fake_profiles),
+                mock.patch.object(main_module, "get_settings", lambda: settings),
+                mock.patch.object(
+                    main_module,
+                    "host_bridge_source_provenance",
+                    lambda: {"sourceFingerprint": "a" * 64, "sourceManifestSha256": "a" * 64, "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES), "gitHead": "b" * 40, "gitDirty": False},
+                ),
+            ):
+                payload = asyncio.run(main_module.get_host_bridge_parity())
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["status"], "cross_os_unverified")
+        self.assertEqual(payload["connectors"][0]["proofStatus"], "cross_os_verified")
+        self.assertEqual(payload["connectors"][1]["proofStatus"], "cross_os_verified")
+        self.assertEqual(payload["contract"]["status"], "cross_os_unverified")
+        self.assertIn("OpenClaw contract gap: MCP external tools", payload["gaps"])
+        mcp_requirement = next(item for item in payload["contract"]["featureRequirements"] if item["id"] == "mcp")
+        self.assertFalse(mcp_requirement["ready"])
+        self.assertTrue(mcp_requirement["degradedByLocalFallback"])
+
+    def test_openclaw_level_contract_refuses_missing_required_feature_connector(self) -> None:
+        host_bridge_status = {
+            "platform": "win32",
+            "shellReady": True,
+            "interactiveSession": True,
+            "interactiveSessionName": "Console",
+            "interactiveSessionId": 1,
+            "windowsVisualPreflightChecked": True,
+            "windowsVisualPreflightOk": True,
+            "isolatedBrowserProfileReady": True,
+            "browserPlaywrightReady": True,
+        }
+        proof_connectors = [
+            {"id": "browser", "proof_status": "cross_os_verified"},
+            {"id": "desktop", "proof_status": "cross_os_verified"},
+        ]
+        connectors_by_id = {
+            "local_file": {"status": "available", "readReady": True, "writeReady": True},
+            "sandbox": {"status": "available", "readReady": True, "writeReady": True},
+            "http": {"status": "available", "readReady": True, "writeReady": True},
+            "web": {"status": "available", "readReady": True, "writeReady": False, "localFallback": True},
+            "mcp": {"status": "configured", "readReady": True, "writeReady": True, "localFallback": False, "externalWriteRequires": []},
+            "browser": {"status": "available", "readReady": True, "writeReady": True, "proofStatus": "cross_os_verified"},
+            "desktop": {"status": "available", "readReady": True, "writeReady": True, "proofStatus": "cross_os_verified"},
+        }
+
+        contract = main_module._host_bridge_openclaw_level_contract(
+            host_bridge=host_bridge_status,
+            parity_report=_verified_parity_report(),
+            proof_connectors=proof_connectors,
+            connectors_by_id=connectors_by_id,
+        )
+
+        self.assertEqual(contract["status"], "cross_os_unverified")
+        git_requirement = next(item for item in contract["featureRequirements"] if item["id"] == "git")
+        self.assertEqual(git_requirement["status"], "missing")
+        self.assertFalse(git_requirement["ready"])
+
+    def test_openclaw_level_contract_refuses_mcp_local_fallback_for_external_tools(self) -> None:
+        host_bridge_status = {
+            "platform": "win32",
+            "shellReady": True,
+            "interactiveSession": True,
+            "interactiveSessionName": "Console",
+            "interactiveSessionId": 1,
+            "windowsVisualPreflightChecked": True,
+            "windowsVisualPreflightOk": True,
+            "isolatedBrowserProfileReady": True,
+            "browserPlaywrightReady": True,
+        }
+        proof_connectors = [
+            {"id": "browser", "proof_status": "cross_os_verified"},
+            {"id": "desktop", "proof_status": "cross_os_verified"},
+        ]
+        connectors_by_id = {
+            "local_file": {"status": "available", "readReady": True, "writeReady": True},
+            "git": {"status": "available", "readReady": True, "writeReady": True},
+            "sandbox": {"status": "available", "readReady": True, "writeReady": True},
+            "http": {"status": "available", "readReady": True, "writeReady": True},
+            "web": {"status": "available", "readReady": True, "writeReady": False, "localFallback": True},
+            "mcp": {
+                "status": "available",
+                "readReady": True,
+                "writeReady": False,
+                "localFallback": True,
+                "externalWriteRequires": ["ATRIUM_MCP_GATEWAY_URL configured for write-capable external MCP servers"],
+            },
+            "browser": {"status": "available", "readReady": True, "writeReady": True, "proofStatus": "cross_os_verified"},
+            "desktop": {"status": "available", "readReady": True, "writeReady": True, "proofStatus": "cross_os_verified"},
+        }
+
+        contract = main_module._host_bridge_openclaw_level_contract(
+            host_bridge=host_bridge_status,
+            parity_report=_verified_parity_report(),
+            proof_connectors=proof_connectors,
+            connectors_by_id=connectors_by_id,
+        )
+
+        self.assertEqual(contract["status"], "cross_os_unverified")
+        mcp_requirement = next(item for item in contract["featureRequirements"] if item["id"] == "mcp")
+        self.assertTrue(mcp_requirement["required"])
+        self.assertTrue(mcp_requirement["requiresWriteReady"])
+        self.assertTrue(mcp_requirement["degradedByLocalFallback"])
+        self.assertFalse(mcp_requirement["ready"])
+        self.assertIn("ATRIUM_MCP_GATEWAY_URL", " ".join(mcp_requirement["externalWriteRequires"]))
+
+    def test_openclaw_level_contract_refuses_broken_cmd_entrypoint(self) -> None:
+        host_bridge_status = {
+            "platform": "win32",
+            "shellReady": True,
+            "interactiveSession": True,
+            "interactiveSessionName": "Console",
+            "interactiveSessionId": 1,
+            "windowsVisualPreflightChecked": True,
+            "windowsVisualPreflightOk": True,
+            "isolatedBrowserProfileReady": True,
+            "browserPlaywrightReady": True,
+        }
+        proof_connectors = [
+            {"id": "browser", "proof_status": "cross_os_verified"},
+            {"id": "desktop", "proof_status": "cross_os_verified"},
+        ]
+        connectors_by_id = {
+            "local_file": {"status": "available", "readReady": True, "writeReady": True},
+            "git": {"status": "available", "readReady": True, "writeReady": True},
+            "sandbox": {"status": "available", "readReady": True, "writeReady": True},
+            "http": {"status": "available", "readReady": True, "writeReady": True},
+            "web": {"status": "available", "readReady": True, "writeReady": False, "localFallback": True},
+            "mcp": {"status": "configured", "readReady": True, "writeReady": True, "localFallback": False, "externalWriteRequires": []},
+            "browser": {"status": "available", "readReady": True, "writeReady": True, "proofStatus": "cross_os_verified"},
+            "desktop": {"status": "available", "readReady": True, "writeReady": True, "proofStatus": "cross_os_verified"},
+        }
+
+        def fake_read_text(path: Path, *_args: object, **_kwargs: object) -> str:
+            path_text = str(path).replace("\\", "/")
+            if path_text.endswith("atrium.cmd"):
+                return "@echo off\nrem broken shim\n"
+            if path_text.endswith("atrium.ps1"):
+                return "Add-PathIfExists\nops\\atrium_cli.py\nsystem\\.venv\\Scripts\\python.exe\nPython312\nPython311\nuv\nPython 3 is required\n"
+            if path_text.endswith("install_windows_native.ps1"):
+                return (
+                    "Assert-SafeInstallPath\nTest-Python3Available\nInstall-PythonIfMissing\n"
+                    "Python312\nPython311\nOneDrive\nDesktop\nDocuments\nDownloads\n"
+                    "Test-BrowserInstalled\nInstall-WingetPackageIfMissing\nDocker.DockerDesktop\nGoogle.Chrome\n"
+                    "BraveSoftware\nChromium\nAnthropic.ClaudeCode\n.\\atrium.ps1 setup --yes\n"
+                )
+            if path_text.endswith("atrium_cli.py"):
+                return (
+                    "BACKEND_PID\nUI_PID\npid_detail\nwindows_process_details\nwindows_process_status\ndef command_provider\n"
+                    "def command_tools\nprovider_status.add_argument(\"--probe\"\n"
+                    "provider_status.add_argument(\"--json\"\nredact_json_value\n"
+                    "/api/provider-auth/status\n/api/tools/catalog\n/api/connectors\n"
+                    "summarize_tool_catalog_payload\naction == \"audit\"\naction == \"artifact\"\naction == \"report\"\n"
+                    "HOST_BRIDGE_PARITY_REPORT\nops/host_bridge_parity_report.py\n"
+                    "--skip-current-source-check\nonly allowed for offline historical audits written to a custom --output path\n"
+                    "OpenClaw Windows contract\n"
+                )
+            return ""
+
+        with (
+            mock.patch.object(Path, "exists", lambda _path: True),
+            mock.patch.object(Path, "read_text", fake_read_text),
+        ):
+            contract = main_module._host_bridge_openclaw_level_contract(
+                host_bridge=host_bridge_status,
+                parity_report=_verified_parity_report(),
+                proof_connectors=proof_connectors,
+                connectors_by_id=connectors_by_id,
+            )
+
+        self.assertEqual(contract["status"], "local_blocked")
+        lifecycle_requirement = next(item for item in contract["localRequirements"] if item["id"] == "windows_native_lifecycle")
+        entrypoint_requirement = next(item for item in contract["localRequirements"] if item["id"] == "windows_native_entrypoints")
+        self.assertFalse(lifecycle_requirement["currentDetails"]["atriumCmdForwarder"])
+        self.assertFalse(lifecycle_requirement["currentReady"])
+        self.assertFalse(entrypoint_requirement["currentReady"])
+
+    def test_openclaw_level_contract_refuses_incomplete_report_integrity_details(self) -> None:
+        host_bridge_status = {
+            "platform": "win32",
+            "shellReady": True,
+            "interactiveSession": True,
+            "interactiveSessionName": "Console",
+            "interactiveSessionId": 1,
+            "windowsVisualPreflightChecked": True,
+            "windowsVisualPreflightOk": True,
+            "isolatedBrowserProfileReady": True,
+            "browserPlaywrightReady": True,
+        }
+        proof_connectors = [
+            {"id": "browser", "proof_status": "cross_os_verified"},
+            {"id": "desktop", "proof_status": "cross_os_verified"},
+        ]
+        connectors_by_id = {
+            "local_file": {"status": "available", "readReady": True, "writeReady": True},
+            "git": {"status": "available", "readReady": True, "writeReady": True},
+            "sandbox": {"status": "available", "readReady": True, "writeReady": True},
+            "http": {"status": "available", "readReady": True, "writeReady": True},
+            "web": {"status": "available", "readReady": True, "writeReady": False, "localFallback": True},
+            "mcp": {"status": "configured", "readReady": True, "writeReady": True, "localFallback": False, "externalWriteRequires": []},
+            "browser": {"status": "available", "readReady": True, "writeReady": True, "proofStatus": "cross_os_verified"},
+            "desktop": {"status": "available", "readReady": True, "writeReady": True, "proofStatus": "cross_os_verified"},
+        }
+        verified_proofs = _verified_parity_proofs()
+        parity_report = {
+            "ok": True,
+            "details": {
+                "proofs": verified_proofs,
+                "proofId": "a" * 64,
+                "expectedProofId": "a" * 64,
+                "currentSourceFingerprint": "b" * 64,
+                "currentGitHead": "c" * 40,
+                "parityRunId": "parity-run-1",
+            },
+        }
+
+        contract = main_module._host_bridge_openclaw_level_contract(
+            host_bridge=host_bridge_status,
+            parity_report=parity_report,
+            proof_connectors=proof_connectors,
+            connectors_by_id=connectors_by_id,
+        )
+
+        self.assertEqual(contract["status"], "cross_os_unverified")
+        artifact_requirement = next(item for item in contract["reportRequirements"] if item["id"] == "artifact_hash_and_size_recorded")
+        source_requirement = next(item for item in contract["reportRequirements"] if item["id"] == "source_file_provenance_recorded")
+        host_requirement = next(item for item in contract["reportRequirements"] if item["id"] == "host_identity_recorded")
+        self.assertFalse(artifact_requirement["currentReady"])
+        self.assertFalse(source_requirement["currentReady"])
+        self.assertFalse(host_requirement["currentReady"])
+
+    def test_openclaw_command_surface_refuses_missing_report_gate(self) -> None:
+        self.assertFalse(main_module._openclaw_windows_command_surface_ready('action == "audit"'))
+        self.assertFalse(main_module._openclaw_windows_command_surface_ready(
+            'action == "audit"\n'
+            'action == "artifact"\n'
+            'action == "report"\n'
+            'HOST_BRIDGE_PARITY_REPORT\n'
+            'ops/host_bridge_parity_report.py\n'
+            'OpenClaw Windows contract\n'
+        ))
+        self.assertFalse(main_module._openclaw_windows_command_surface_ready(
+            'action == "audit"\n'
+            'action == "artifact"\n'
+            'action == "report"\n'
+            'automation_status.add_argument("--json"\n'
+            'HOST_BRIDGE_PARITY_REPORT\n'
+            'ops/host_bridge_parity_report.py\n'
+            '--skip-current-source-check\n'
+            'OpenClaw Windows contract\n'
+        ))
+        self.assertFalse(main_module._openclaw_windows_command_surface_ready(
+            'action == "audit"\n'
+            'action == "artifact"\n'
+            'action == "report"\n'
+            'automation_status.add_argument("--json"\n'
+            'HOST_BRIDGE_PARITY_REPORT\n'
+            'ops/host_bridge_parity_report.py\n'
+            '--skip-current-source-check\n'
+            'only allowed for offline historical audits written to a custom --output path\n'
+            'OpenClaw Windows contract\n'
+        ))
+        self.assertTrue(main_module._openclaw_windows_command_surface_ready(
+            'action == "audit"\n'
+            'action == "artifact"\n'
+            'action == "handoff"\n'
+            'action == "report"\n'
+            'automation_status.add_argument("--json"\n'
+            'HOST_BRIDGE_PARITY_REPORT\n'
+            'ops/host_bridge_parity_report.py\n'
+            '--skip-current-source-check\n'
+            'only allowed for offline historical audits written to a custom --output path\n'
+            'OpenClaw Windows contract\n'
+        ))
+
+    def test_host_bridge_parity_refuses_openclaw_level_windows_contract_without_live_session(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                    "shellReady": True,
+                    "interactiveSession": False,
+                    "interactiveSessionName": "Services",
+                    "interactiveSessionId": 0,
+                    "windowsVisualPreflightChecked": True,
+                    "windowsVisualPreflightOk": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+        payload = self._host_bridge_parity_status_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=_verified_parity_report(),
+        )
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["status"], "local_blocked")
+        self.assertEqual(payload["contract"]["status"], "local_blocked")
+        interactive = next(
+            item for item in payload["contract"]["localRequirements"]
+            if item["id"] == "interactive_desktop_session"
+        )
+        self.assertFalse(interactive["currentReady"])
 
     def test_windows_background_shell_disables_screen_and_pty_without_posix_session_kwargs(self) -> None:
         class FakeProc:
@@ -3058,6 +3811,34 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertIn("PTY is not available on Windows", pty_error or "")
         self.assertEqual(popen_calls[0]["creationflags"], 512)
         self.assertNotIn("start_new_session", popen_calls[0])
+
+    def test_windows_background_shell_marks_native_persistent_pipe_backend(self) -> None:
+        class FakeStdin:
+            closed = False
+
+        class FakeProc:
+            pid = 4321
+            stdin = FakeStdin()
+
+        result = chat_tools._owner_background_start_result(
+            command=["powershell.exe", "-NoProfile"],
+            cwd=Path("C:/repo"),
+            proc=FakeProc(),
+            stdout_path=Path("C:/repo/out.log"),
+            stderr_path=Path("C:/repo/err.log"),
+            started_at=123,
+            timeout_seconds=300,
+            persistent_requested=True,
+            persistent_enabled=True,
+            persistent_backend="windows_pipe",
+            stdin_writable=True,
+        )
+
+        self.assertTrue(result["persistent"])
+        self.assertTrue(result["persistentRequested"])
+        self.assertEqual(result["persistentBackend"], "windows_pipe")
+        self.assertTrue(result["stdinWritable"])
+        self.assertNotIn("persistentFallbackError", result)
 
     def test_windows_background_timeout_terminates_and_kills_process_object(self) -> None:
         class FakeProc:
