@@ -23,8 +23,8 @@ ModelId = Literal[
     "claude-opus-4-7",
     "claude-opus-4-8",
     "gpt-5.5",
+    "gpt-5.4",
     "gpt-5.4-mini",
-    "gpt-5.3-codex",
 ]
 ThinkingEffort = Literal["off", "low", "medium", "high", "xhigh", "max"]
 ModelSpeed = Literal["standard", "fast"]
@@ -168,9 +168,9 @@ MODELS: dict[str, dict] = {
         "defaultThinkingEffort": "medium",
         "blurb": "รุ่น GPT เบา เร็วกว่า เหมาะกับงานทั่วไปและงาน UI agent",
     },
-    "gpt-5.3-codex": {
-        "id": "gpt-5.3-codex",
-        "label": "GPT-5.3 Codex",
+    "gpt-5.4": {
+        "id": "gpt-5.4",
+        "label": "GPT-5.4",
         "tier": "gpt",
         "providerIds": ["openai", "chatgpt_account"],
         "inputPerMTok": 5.0,
@@ -178,7 +178,7 @@ MODELS: dict[str, dict] = {
         "contextWindowTokens": 1_000_000,
         "supportedEfforts": ["low", "medium", "high", "xhigh"],
         "defaultThinkingEffort": "medium",
-        "blurb": "รุ่น GPT/Codex สำหรับงาน coding ผ่าน Responses API",
+        "blurb": "รุ่น GPT กลางสำหรับงาน reasoning และ coding ผ่าน Responses API",
     },
 }
 

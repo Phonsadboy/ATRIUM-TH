@@ -3872,7 +3872,7 @@ export interface components {
              * Model
              * @enum {string}
              */
-            model: "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4-mini" | "gpt-5.3-codex";
+            model: "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini";
             /** Name */
             name: string;
             /**
@@ -4238,7 +4238,7 @@ export interface components {
              * Model
              * @enum {string}
              */
-            model: "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4-mini" | "gpt-5.3-codex";
+            model: "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini";
             /** Mood */
             mood: number;
             /** Name */
@@ -4302,7 +4302,7 @@ export interface components {
             /** Emoji */
             emoji?: string | null;
             /** Model */
-            model?: ("claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4-mini" | "gpt-5.3-codex") | null;
+            model?: ("claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini") | null;
             /** Name */
             name?: string | null;
             /** Providerid */
@@ -4411,7 +4411,7 @@ export interface components {
              * Model
              * @enum {string}
              */
-            model: "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4-mini" | "gpt-5.3-codex";
+            model: "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini";
             /**
              * Providerid
              * @enum {string}
@@ -5424,7 +5424,7 @@ export interface components {
              * Model
              * @enum {string}
              */
-            model: "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4-mini" | "gpt-5.3-codex";
+            model: "claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini";
         };
         /** Notification */
         Notification: {
@@ -5580,7 +5580,7 @@ export interface components {
              * Model
              * @default claude-sonnet-4-6
              */
-            model: ("claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4-mini" | "gpt-5.3-codex") | null;
+            model: ("claude-sonnet-4-6" | "claude-opus-4-6" | "claude-opus-4-7" | "claude-opus-4-8" | "gpt-5.5" | "gpt-5.4" | "gpt-5.4-mini") | null;
             /** Name */
             name: string;
             /**

@@ -21,6 +21,17 @@ function Add-PathIfExists {
     }
 }
 
+function Add-PythonInstallPaths {
+    $pythonRoot = "$env:LocalAppData\Programs\Python"
+    if (-not (Test-Path $pythonRoot)) {
+        return
+    }
+    Get-ChildItem -Path $pythonRoot -Directory -Filter "Python3*" -ErrorAction SilentlyContinue | ForEach-Object {
+        Add-PathIfExists $_.FullName
+        Add-PathIfExists (Join-Path $_.FullName "Scripts")
+    }
+}
+
 Add-PathIfExists "$env:USERPROFILE\.local\bin"
 Add-PathIfExists "$env:USERPROFILE\AppData\Local\Microsoft\WindowsApps"
 Add-PathIfExists "$env:USERPROFILE\AppData\Roaming\npm"
@@ -32,6 +43,7 @@ Add-PathIfExists "$env:LocalAppData\Programs\Python\Python312"
 Add-PathIfExists "$env:LocalAppData\Programs\Python\Python312\Scripts"
 Add-PathIfExists "$env:LocalAppData\Programs\Python\Python311"
 Add-PathIfExists "$env:LocalAppData\Programs\Python\Python311\Scripts"
+Add-PythonInstallPaths
 
 if (-not (Test-Path $Cli)) {
     throw "Missing ATRIUM CLI: $Cli"

@@ -3198,6 +3198,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertIn(payload["commands"]["sourceManifestSha256"], payload["commands"]["windowsSourceValidate"])
         self.assertIn("--expect-source-file-count", payload["commands"]["windowsSourceValidate"])
         self.assertIn(payload["commands"]["sourceFileCount"], payload["commands"]["windowsSourceValidate"])
+        self.assertIn("--json", payload["commands"]["windowsSourceValidate"])
         self.assertIn("ops/macos_host_bridge_probe.py --full", payload["commands"]["macosProbe"])
         self.assertIn("--parity-run-id", payload["commands"]["macosProbe"])
         self.assertIn("--expect-source-fingerprint", payload["commands"]["macosProbe"])
@@ -3215,6 +3216,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertIn(payload["commands"]["sourceManifestSha256"], payload["commands"]["macosArtifactValidate"])
         self.assertIn("--expect-source-file-count", payload["commands"]["macosArtifactValidate"])
         self.assertIn(payload["commands"]["sourceFileCount"], payload["commands"]["macosArtifactValidate"])
+        self.assertIn("--max-artifact-age-hours 24.0", payload["commands"]["macosArtifactValidate"])
         self.assertIn(".\\atrium.ps1 automation windows-probe --full", payload["commands"]["windowsProbe"])
         self.assertIn("--parity-run-id", payload["commands"]["windowsProbe"])
         self.assertIn("--expect-source-fingerprint", payload["commands"]["windowsProbe"])
@@ -3242,6 +3244,8 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertIn(payload["commands"]["sourceManifestSha256"], payload["commands"]["windowsArtifactValidateOnWindows"])
         self.assertIn("--expect-source-file-count", payload["commands"]["windowsArtifactValidateOnWindows"])
         self.assertIn(payload["commands"]["sourceFileCount"], payload["commands"]["windowsArtifactValidateOnWindows"])
+        self.assertIn("--max-artifact-age-hours 24.0", payload["commands"]["windowsArtifactValidateOnWindows"])
+        self.assertIn("--json", payload["commands"]["windowsArtifactValidateOnWindows"])
         self.assertEqual(payload["commands"]["windowsArtifactSource"], "C:\\Temp\\atrium_host_bridge_windows_live.json")
         self.assertEqual(payload["commands"]["windowsArtifactLocal"], "/tmp/atrium_host_bridge_windows_live.json")
         self.assertIn("C:\\Temp\\atrium_host_bridge_windows_live.json", payload["commands"]["windowsArtifactCopyHint"])
@@ -3254,9 +3258,13 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertIn(payload["commands"]["sourceManifestSha256"], payload["commands"]["windowsArtifactValidateLocal"])
         self.assertIn("--expect-source-file-count", payload["commands"]["windowsArtifactValidateLocal"])
         self.assertIn(payload["commands"]["sourceFileCount"], payload["commands"]["windowsArtifactValidateLocal"])
+        self.assertIn("--max-artifact-age-hours 24.0", payload["commands"]["windowsArtifactValidateLocal"])
+        self.assertIn("--json", payload["commands"]["windowsArtifactValidateLocal"])
         self.assertIn("--windows /tmp/atrium_host_bridge_windows_live.json", payload["commands"]["automationReport"])
+        self.assertIn("--max-artifact-age-hours 24.0", payload["commands"]["automationReport"])
         self.assertIn("--windows-source-path 'C:\\Temp\\atrium_host_bridge_windows_live.json'", payload["commands"]["automationReport"])
         self.assertIn("ops/host_bridge_parity_report.py", payload["commands"]["legacyParityReport"])
+        self.assertIn("--max-artifact-age-hours 24.0", payload["commands"]["legacyParityReport"])
         self.assertIn("--output system/data/host-bridge-parity-report.json", payload["commands"]["legacyParityReport"])
 
     def test_host_bridge_parity_status_accepts_verified_report_and_endpoint_handler(self) -> None:
@@ -3350,8 +3358,13 @@ class WindowsHostBridgeTest(unittest.TestCase):
             item for item in payload["contract"]["localRequirements"]
             if item["id"] == "windows_native_entrypoints"
         )
-        self.assertIn("atrium.cmd", entrypoint_requirement["requiredEvidence"])
+        entrypoint_evidence = " ".join(str(item) for item in entrypoint_requirement["requiredEvidence"])
+        self.assertIn("atrium.cmd", entrypoint_evidence)
+        self.assertIn("pwsh fallback", entrypoint_evidence)
         self.assertIn("ops/atrium_cli.py", entrypoint_requirement["requiredEvidence"])
+        self.assertTrue(entrypoint_requirement["currentDetails"]["installWindowsNativeBaseSafety"])
+        self.assertTrue(entrypoint_requirement["currentDetails"]["installWindowsNativeSetupRunner"])
+        self.assertTrue(entrypoint_requirement["currentDetails"]["installWindowsNativeSafety"])
         provider_tools_requirement = next(
             item for item in payload["contract"]["localRequirements"]
             if item["id"] == "windows_native_provider_ai_tools"
@@ -3588,20 +3601,31 @@ class WindowsHostBridgeTest(unittest.TestCase):
             if path_text.endswith("atrium.cmd"):
                 return "@echo off\nrem broken shim\n"
             if path_text.endswith("atrium.ps1"):
-                return "Add-PathIfExists\nops\\atrium_cli.py\nsystem\\.venv\\Scripts\\python.exe\nPython312\nPython311\nuv\nPython 3 is required\n"
+                return "Add-PathIfExists\nAdd-PythonInstallPaths\nops\\atrium_cli.py\nsystem\\.venv\\Scripts\\python.exe\nPython3*\nPython312\nPython311\nuv\nPython 3 is required\n"
             if path_text.endswith("install_windows_native.ps1"):
                 return (
                     "Assert-SafeInstallPath\nTest-Python3Available\nInstall-PythonIfMissing\n"
-                    "Python312\nPython311\nOneDrive\nDesktop\nDocuments\nDownloads\n"
+                    "Invoke-Native\n$LASTEXITCODE\nPython3*\nPython312\nPython311\nOneDrive\nDesktop\nDocuments\nDownloads\n"
                     "Test-BrowserInstalled\nInstall-WingetPackageIfMissing\nDocker.DockerDesktop\nGoogle.Chrome\n"
-                    "BraveSoftware\nChromium\nAnthropic.ClaudeCode\n.\\atrium.ps1 setup --yes\n"
+                    "BraveSoftware\nChromium\nAnthropic.ClaudeCode\ncorepack enable failed\n"
+                    "corepack pnpm activation failed\nClaude Code npm install failed\n\".\\atrium.ps1\"\n\"setup\"\n\"--yes\"\n"
                 )
             if path_text.endswith("atrium_cli.py"):
                 return (
-                    "BACKEND_PID\nUI_PID\npid_detail\nwindows_process_details\nwindows_process_status\ndef command_provider\n"
+                    "BACKEND_PID\nUI_PID\npid_detail\nwindows_process_details\nwindows_process_status\nreport_command_path\ndef command_provider\n"
+                    "def collect_status_payload\nstatus.add_argument(\"--json\"\nredact_json_value(collect_status_payload())\n"
+                    "def command_report\n--bundle\nzipfile.ZipFile\nsupport-report.txt\n"
+                    "diagnostics/status.json\ndiagnostics/process.json\ndiagnostics/logs.json\n"
+                    "diagnostics/permission-mode.json\ndiagnostics/provider-status.json\n"
+                    "diagnostics/tools-status.json\ndiagnostics/automation-status.json\nlogs/{label}.log\n"
+                    "def command_logs\nlogs.add_argument(\"--json\"\nRun .\\\\atrium.ps1 start to create native\nredact_text\n"
+                    "def collect_automation_status_payload\nnormalized[\"permissionMode\"]\n\"localArtifacts\"\n"
+                    "automation_permission.local_artifacts\nOwner Permissions\nLocal Proof Artifacts\nsummarize_full_autonomy\n"
                     "def command_tools\nprovider_status.add_argument(\"--probe\"\n"
                     "provider_status.add_argument(\"--json\"\nredact_json_value\n"
+                    "getattr(os, \"startfile\"\nStart-Process -FilePath\nps_single_quote(url)\n"
                     "/api/provider-auth/status\n/api/tools/catalog\n/api/connectors\n"
+                    "/api/runtime\n/api/permissions/mode\n/api/host-bridge/parity\n"
                     "summarize_tool_catalog_payload\naction == \"audit\"\naction == \"artifact\"\naction == \"report\"\n"
                     "HOST_BRIDGE_PARITY_REPORT\nops/host_bridge_parity_report.py\n"
                     "--skip-current-source-check\nonly allowed for offline historical audits written to a custom --output path\n"

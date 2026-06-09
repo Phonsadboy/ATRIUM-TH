@@ -3826,6 +3826,7 @@ def _host_bridge_parity_commands(host_platform: str | None = None) -> dict[str, 
     report_command = (
         f"{_host_bridge_parity_report_command(host_platform)} "
         f"--macos {macos_artifact} --windows {windows_artifact_local} "
+        "--max-artifact-age-hours 24.0 "
         f"--windows-source-path {quoted_windows_source}"
     )
     source_validate_args = (
@@ -3851,7 +3852,7 @@ def _host_bridge_parity_commands(host_platform: str | None = None) -> dict[str, 
         "windowsRunIdSet": f'$RunId = "{parity_run_id}"',
         "windowsSourceValidate": (
             ".\\atrium.ps1 automation source "
-            f"{windows_source_validate_args}"
+            f"{windows_source_validate_args} --json"
         ),
         "macosProbe": (
             "uv --project system run python ops/macos_host_bridge_probe.py "
@@ -3862,7 +3863,7 @@ def _host_bridge_parity_commands(host_platform: str | None = None) -> dict[str, 
         "macosArtifactValidate": (
             "uv --project system run python ops/host_bridge_artifact_summary.py "
             f"--label macos --expect-parity-run-id {parity_run_id} "
-            f"{source_validate_args} {macos_artifact}"
+            f"{source_validate_args} --max-artifact-age-hours 24.0 {macos_artifact}"
         ),
         "windowsHandoff": (
             f"{_atrium_launcher_for_platform(host_platform)} automation handoff "
@@ -3886,7 +3887,7 @@ def _host_bridge_parity_commands(host_platform: str | None = None) -> dict[str, 
         "windowsArtifactValidateOnWindows": (
             ".\\atrium.ps1 automation artifact "
             f"--label windows --expect-parity-run-id {parity_run_id} "
-            f"{source_validate_args} {windows_artifact_on_windows}"
+            f"{source_validate_args} --max-artifact-age-hours 24.0 --json {windows_artifact_on_windows}"
         ),
         "windowsArtifactSource": windows_artifact_on_windows,
         "windowsArtifactLocal": windows_artifact_local,
@@ -3897,7 +3898,7 @@ def _host_bridge_parity_commands(host_platform: str | None = None) -> dict[str, 
         "windowsArtifactValidateLocal": (
             f"{_atrium_launcher_for_platform(host_platform)} automation artifact "
             f"--label windows --expect-parity-run-id {parity_run_id} "
-            f"{source_validate_args} {windows_artifact_local}"
+            f"{source_validate_args} --max-artifact-age-hours 24.0 --json {windows_artifact_local}"
         ),
         "report": report_command,
         "automationReport": report_command,
@@ -3905,7 +3906,7 @@ def _host_bridge_parity_commands(host_platform: str | None = None) -> dict[str, 
         "legacyParityReport": (
             "uv --project system run python ops/host_bridge_parity_report.py "
             f"--macos {macos_artifact} --windows {windows_artifact_local} "
-            f"--windows-source-path {quoted_windows_source} --output {output}"
+            f"--max-artifact-age-hours 24.0 --windows-source-path {quoted_windows_source} --output {output}"
         ),
     }
 
@@ -3952,26 +3953,31 @@ def _host_bridge_openclaw_level_contract(
     main_text = main_path.read_text(encoding="utf-8", errors="ignore") if main_path.exists() else ""
     windows_cmd_launcher_ready = all(
         token.lower() in windows_cmd_launcher_text.lower()
-        for token in ("powershell.exe", "-ExecutionPolicy Bypass", "atrium.ps1", "%*")
+        for token in ("powershell.exe", "pwsh.exe", "-ExecutionPolicy Bypass", "atrium.ps1", "%*", "Missing PowerShell")
     )
     windows_ps1_launcher_ready = all(
         token in windows_launcher_text
         for token in (
             "Add-PathIfExists",
+            "Add-PythonInstallPaths",
             "ops\\atrium_cli.py",
             "system\\.venv\\Scripts\\python.exe",
+            "Python3*",
             "Python312",
             "Python311",
             "uv",
             "Python 3 is required",
         )
     )
-    windows_installer_ready = all(
+    windows_installer_base_ready = all(
         token in windows_installer_text
         for token in (
             "Assert-SafeInstallPath",
             "Test-Python3Available",
             "Install-PythonIfMissing",
+            "Invoke-Native",
+            "$LASTEXITCODE",
+            "Python3*",
             "Python312",
             "Python311",
             "OneDrive",
@@ -3985,9 +3991,18 @@ def _host_bridge_openclaw_level_contract(
             "BraveSoftware",
             "Chromium",
             "Anthropic.ClaudeCode",
-            ".\\atrium.ps1 setup --yes",
+            "corepack enable failed",
+            "corepack pnpm activation failed",
+            "Claude Code npm install failed",
         )
     )
+    windows_installer_setup_runner_ready = (
+        "Invoke-Native" in windows_installer_text
+        and '".\\atrium.ps1"' in windows_installer_text
+        and '"setup"' in windows_installer_text
+        and '"--yes"' in windows_installer_text
+    )
+    windows_installer_ready = windows_installer_base_ready and windows_installer_setup_runner_ready
     windows_native_sources_ready = (
         windows_launcher_path.exists()
         and windows_cmd_launcher_path.exists()
@@ -4004,6 +4019,7 @@ def _host_bridge_openclaw_level_contract(
         and "pid_detail" in cli_text
         and "windows_process_details" in cli_text
         and "windows_process_status" in cli_text
+        and "report_command_path" in cli_text
     )
     windows_status_json_ready = (
         "def collect_status_payload" in cli_text
@@ -4025,6 +4041,7 @@ def _host_bridge_openclaw_level_contract(
         and "zipfile.ZipFile" in cli_text
         and "support-report.txt" in cli_text
         and "diagnostics/status.json" in cli_text
+        and "diagnostics/process.json" in cli_text
         and "diagnostics/logs.json" in cli_text
         and "diagnostics/permission-mode.json" in cli_text
         and "diagnostics/provider-status.json" in cli_text
@@ -4042,7 +4059,10 @@ def _host_bridge_openclaw_level_contract(
         "def collect_automation_status_payload" in cli_text
         and "/api/permissions/mode" in cli_text
         and 'normalized["permissionMode"]' in cli_text
+        and '"localArtifacts"' in cli_text
+        and "automation_permission.local_artifacts" in cli_text
         and "Owner Permissions" in cli_text
+        and "Local Proof Artifacts" in cli_text
         and "summarize_full_autonomy" in cli_text
     )
     windows_self_update_restart_ready = (
@@ -4065,6 +4085,7 @@ def _host_bridge_openclaw_level_contract(
             "redact_json_value",
             'getattr(os, "startfile"',
             "Start-Process -FilePath",
+            "ps_single_quote(url)",
             "/api/provider-auth/status",
             "/api/tools/catalog",
             "/api/connectors",
@@ -4122,9 +4143,25 @@ def _host_bridge_openclaw_level_contract(
         {
             "id": "windows_native_entrypoints",
             "label": "Windows-native wrapper and installer entrypoints",
-            "requiredEvidence": ["atrium.ps1", "atrium.cmd", "ops/install_windows_native.ps1", "ops/atrium_cli.py"],
+            "requiredEvidence": [
+                "atrium.ps1",
+                "atrium.cmd with Windows PowerShell/pwsh fallback",
+                "ops/install_windows_native.ps1",
+                "ops/atrium_cli.py",
+            ],
             "currentHostApplies": True,
             "currentReady": windows_native_sources_ready,
+            "currentDetails": {
+                "atriumPs1": windows_launcher_path.exists(),
+                "atriumPs1Runner": windows_ps1_launcher_ready,
+                "atriumCmd": windows_cmd_launcher_path.exists(),
+                "atriumCmdForwarder": windows_cmd_launcher_ready,
+                "installWindowsNativePs1": windows_installer_path.exists(),
+                "installWindowsNativeBaseSafety": windows_installer_base_ready,
+                "installWindowsNativeSetupRunner": windows_installer_setup_runner_ready,
+                "installWindowsNativeSafety": windows_installer_ready,
+                "atriumCli": cli_path.exists(),
+            },
         },
         {
             "id": "windows_native_provider_ai_tools",
@@ -4150,7 +4187,11 @@ def _host_bridge_openclaw_level_contract(
                 "providerStatusProbe": 'provider_status.add_argument("--probe"' in cli_text,
                 "providerStatusJson": 'provider_status.add_argument("--json"' in cli_text,
                 "providerStatusJsonRedaction": "redact_json_value" in cli_text,
-                "windowsUrlOpenNative": 'getattr(os, "startfile"' in cli_text and "Start-Process -FilePath" in cli_text,
+                "windowsUrlOpenNative": (
+                    'getattr(os, "startfile"' in cli_text
+                    and "Start-Process -FilePath" in cli_text
+                    and "ps_single_quote(url)" in cli_text
+                ),
                 "toolsStatusJson": 'tools_status.add_argument("--json"' in cli_text,
                 "toolsCatalogJson": 'tools_catalog.add_argument("--json"' in cli_text,
                 "providerAuthStatusEndpoint": "/api/provider-auth/status" in cli_text,

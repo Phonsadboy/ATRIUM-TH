@@ -44,8 +44,8 @@ ModelId = Literal[
     "claude-opus-4-7",
     "claude-opus-4-8",
     "gpt-5.5",
+    "gpt-5.4",
     "gpt-5.4-mini",
-    "gpt-5.3-codex",
 ]
 ThinkingEffort = Literal["off", "low", "medium", "high", "xhigh", "max"]
 ModelSpeed = Literal["standard", "fast"]

@@ -33,6 +33,18 @@ function Test-AnyCommand {
     return $false
 }
 
+function Invoke-Native {
+    param(
+        [string]$FilePath,
+        [string[]]$ArgumentList,
+        [string]$FailureMessage
+    )
+    & $FilePath @ArgumentList
+    if ($LASTEXITCODE -ne 0) {
+        throw "$FailureMessage (exit code $LASTEXITCODE)."
+    }
+}
+
 function Add-PathIfExists {
     param([string]$PathValue)
     if (-not $PathValue -or -not (Test-Path $PathValue)) {
@@ -91,6 +103,16 @@ function Add-CommonPaths {
         Add-PathIfExists $path
         Add-UserPathIfExists $path
     }
+    $pythonRoot = "$env:LocalAppData\Programs\Python"
+    if (Test-Path $pythonRoot) {
+        Get-ChildItem -Path $pythonRoot -Directory -Filter "Python3*" -ErrorAction SilentlyContinue | ForEach-Object {
+            Add-PathIfExists $_.FullName
+            Add-UserPathIfExists $_.FullName
+            $scriptsPath = Join-Path $_.FullName "Scripts"
+            Add-PathIfExists $scriptsPath
+            Add-UserPathIfExists $scriptsPath
+        }
+    }
 }
 
 function Assert-SafeInstallPath {
@@ -122,7 +144,7 @@ function Install-WingetPackageIfMissing {
         throw "$DisplayName is missing and winget is unavailable. Install $DisplayName manually, then rerun this installer."
     }
     Write-Step "Install $DisplayName"
-    winget install --id $PackageId --exact --accept-source-agreements --accept-package-agreements
+    Invoke-Native -FilePath "winget" -ArgumentList @("install", "--id", $PackageId, "--exact", "--accept-source-agreements", "--accept-package-agreements") -FailureMessage "$DisplayName winget install failed"
     Add-CommonPaths
     if (-not (Test-AnyCommand $CommandName)) {
         $expected = $CommandName -join " or "
@@ -161,7 +183,7 @@ function Install-PythonIfMissing {
         throw "Python 3 is missing and winget is unavailable. Install Python 3 manually, then rerun this installer."
     }
     Write-Step "Install Python 3"
-    winget install --id Python.Python.3.12 --exact --accept-source-agreements --accept-package-agreements
+    Invoke-Native -FilePath "winget" -ArgumentList @("install", "--id", "Python.Python.3.12", "--exact", "--accept-source-agreements", "--accept-package-agreements") -FailureMessage "Python 3 winget install failed"
     Add-CommonPaths
     if (-not (Test-Python3Available)) {
         throw "Python 3 installation did not expose a runnable Python 3 command. Restart PowerShell and rerun this installer, or install Python 3 manually."
@@ -188,8 +210,8 @@ function Enable-PnpmIfMissing {
         throw "corepack is missing. Install Node.js LTS, restart PowerShell, then rerun this installer."
     }
     Write-Step "Enable pnpm"
-    corepack enable
-    corepack prepare pnpm@10.15.0 --activate
+    Invoke-Native -FilePath "corepack" -ArgumentList @("enable") -FailureMessage "corepack enable failed"
+    Invoke-Native -FilePath "corepack" -ArgumentList @("prepare", "pnpm@10.15.0", "--activate") -FailureMessage "corepack pnpm activation failed"
     Add-CommonPaths
     if (-not (Test-Command "pnpm")) {
         throw "pnpm is still unavailable. Restart PowerShell and rerun this installer."
@@ -204,7 +226,7 @@ function Install-ClaudeCodeIfMissing {
     if (Test-Command "winget") {
         Write-Step "Install Claude Code"
         try {
-            winget install --id Anthropic.ClaudeCode --exact --accept-source-agreements --accept-package-agreements
+            Invoke-Native -FilePath "winget" -ArgumentList @("install", "--id", "Anthropic.ClaudeCode", "--exact", "--accept-source-agreements", "--accept-package-agreements") -FailureMessage "Claude Code winget install failed"
         }
         catch {
             $wingetError = $_.Exception.Message
@@ -216,7 +238,7 @@ function Install-ClaudeCodeIfMissing {
     }
     if (Test-Command "npm") {
         Write-Step "Install Claude Code through npm"
-        npm install -g "@anthropic-ai/claude-code"
+        Invoke-Native -FilePath "npm" -ArgumentList @("install", "-g", "@anthropic-ai/claude-code") -FailureMessage "Claude Code npm install failed"
         Add-CommonPaths
         if (Test-Command "claude") {
             return
@@ -291,7 +313,7 @@ if (-not $SkipBrowserInstall -and -not (Test-BrowserInstalled)) {
     if (Test-Command "winget") {
         Write-Step "Install Google Chrome"
         try {
-            winget install --id Google.Chrome --exact --accept-source-agreements --accept-package-agreements
+            Invoke-Native -FilePath "winget" -ArgumentList @("install", "--id", "Google.Chrome", "--exact", "--accept-source-agreements", "--accept-package-agreements") -FailureMessage "Google Chrome winget install failed"
             Add-CommonPaths
         }
         catch {
@@ -322,17 +344,17 @@ elseif (Test-Path $installFullPath) {
 }
 else {
     Write-Step "Clone ATRIUM"
-    git clone $RepoUrl $installFullPath
+    Invoke-Native -FilePath "git" -ArgumentList @("clone", $RepoUrl, $installFullPath) -FailureMessage "git clone failed"
 }
 
 Write-Step "Run ATRIUM native guided setup"
 Push-Location $installFullPath
 try {
     if ($NoStart) {
-        powershell -NoProfile -ExecutionPolicy Bypass -File .\atrium.ps1 setup --yes --no-start
+        Invoke-Native -FilePath "powershell" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ".\atrium.ps1", "setup", "--yes", "--no-start") -FailureMessage "ATRIUM native setup failed"
     }
     else {
-        powershell -NoProfile -ExecutionPolicy Bypass -File .\atrium.ps1 setup --yes
+        Invoke-Native -FilePath "powershell" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ".\atrium.ps1", "setup", "--yes") -FailureMessage "ATRIUM native setup failed"
     }
 }
 finally {

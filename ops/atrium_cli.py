@@ -357,6 +357,12 @@ def powershell_command() -> str | None:
     return command_path("powershell.exe") or command_path("powershell") or command_path("pwsh")
 
 
+def report_command_path(name: str) -> str | None:
+    if name == "powershell":
+        return powershell_command()
+    return command_path(name)
+
+
 def docker_compose_cmd() -> list[str] | None:
     docker = command_path("docker")
     if not docker:
@@ -421,7 +427,7 @@ def open_docker_desktop() -> bool:
             Path(os.environ.get("LocalAppData", "")) / "Docker" / "Docker Desktop.exe",
         ):
             if candidate.exists():
-                path_literal = json.dumps(str(candidate))
+                path_literal = ps_single_quote(str(candidate))
                 run([powershell, "-NoProfile", "-Command", f"Start-Process -FilePath {path_literal}"], timeout=20)
                 return True
     return False
@@ -466,7 +472,7 @@ def open_url(url: str) -> None:
             return
         powershell = powershell_command()
         if powershell:
-            run([powershell, "-NoProfile", "-Command", f"Start-Process -FilePath {json.dumps(url)}"], timeout=10)
+            run([powershell, "-NoProfile", "-Command", f"Start-Process -FilePath {ps_single_quote(url)}"], timeout=10)
             return
         cmd = command_path("cmd.exe") or command_path("cmd")
         if cmd:
@@ -1158,7 +1164,8 @@ def build_windows_handoff_payload(
         ".\\atrium.ps1 automation source "
         f"--expect-source-fingerprint {source_fingerprint} "
         f"--expect-source-manifest-sha256 {source_manifest_sha256} "
-        f"--expect-source-file-count {source_file_count}"
+        f"--expect-source-file-count {source_file_count} "
+        "--json"
     )
     windows_artifact = (
         ".\\atrium.ps1 automation artifact --label windows "
@@ -1166,12 +1173,15 @@ def build_windows_handoff_payload(
         f"--expect-source-fingerprint {source_fingerprint} "
         f"--expect-source-manifest-sha256 {source_manifest_sha256} "
         f"--expect-source-file-count {source_file_count} "
+        "--max-artifact-age-hours 24.0 "
+        "--json "
         f"{ps_single_quote(windows_output)}"
     )
     report = (
         f"{local_cli_command('automation', 'report')} "
         f"--macos {shell_quote(macos_artifact)} "
         f"--windows {shell_quote(windows_local_copy)} "
+        "--max-artifact-age-hours 24.0 "
         f"--windows-source-path {shell_quote(windows_output)}"
     )
     audit = local_cli_command("automation", "audit")
@@ -1388,6 +1398,10 @@ def normalize_parity_commands(commands: object, *, current_source: dict[str, obj
                     )
                 else:
                     value = f"{value} --expect-source-file-count {current_file_count}"
+                if key in {"macosSourceValidate", "windowsSourceValidate"} and "automation source" in value and "--json" not in value:
+                    value = f"{value} --json"
+                if key in {"windowsArtifactValidateOnWindows", "windowsArtifactValidateLocal"} and "automation artifact" in value and "--json" not in value:
+                    value = f"{value} --json"
                 normalized[key] = value
         live = normalized.get("windowsLiveProofRunner")
         if isinstance(live, str) and (
@@ -1984,6 +1998,14 @@ def windows_process_status() -> str:
     )
 
 
+def collect_process_payload() -> dict[str, object]:
+    return {
+        "mode": "windows-native" if windows_native() else "screen-or-macos",
+        "summary": windows_process_status() if windows_native() else screen_sessions().replace("\n", " | "),
+        "details": windows_process_details() if windows_native() else None,
+    }
+
+
 def windows_start_process(label: str, command: Sequence[str], cwd: Path, log_path: Path, pid_path: Path) -> None:
     pid = read_pid(pid_path)
     if process_running(pid):
@@ -2104,13 +2126,13 @@ def provider_status_from_env() -> list[str]:
 
 def doctor_tool_names() -> tuple[str, ...]:
     if windows_native():
-        return ("git", "node", "pnpm", "uv", "python3", "docker", "winget", "powershell.exe", "claude")
+        return ("git", "node", "pnpm", "uv", "python3", "docker", "winget", "powershell", "claude")
     return ("git", "brew", "node", "pnpm", "uv", "python3", "docker")
 
 
 def report_tool_names() -> tuple[str, ...]:
     if windows_native():
-        return ("git", "node", "pnpm", "uv", "python3", "docker", "winget", "powershell.exe", "claude")
+        return ("git", "node", "pnpm", "uv", "python3", "docker", "winget", "powershell", "claude")
     return ("git", "brew", "node", "pnpm", "uv", "python3", "docker", "screen")
 
 
@@ -2341,12 +2363,17 @@ def command_automation(args: argparse.Namespace) -> int:
                 "ATRIUM backend is not reachable for OpenClaw Windows audit",
                 next_step=raw or "Start ATRIUM first, then rerun automation audit.",
             )
-        payload = normalize_parity_payload_for_cli(payload)
+        source_summary = current_source_summary()
+        payload = normalize_parity_payload_for_cli(payload, current_source=source_summary)
+        payload["localArtifacts"] = collect_local_proof_artifacts(source_summary)
         if args.json:
             print(json.dumps(redact_json_value(payload), ensure_ascii=False, indent=2, sort_keys=True))
         else:
             print_header("OpenClaw Windows Audit")
             for line in summarize_parity_payload(payload):
+                print_info(line)
+            print_header("Local Proof Artifacts")
+            for line in summarize_local_proof_artifacts(payload):
                 print_info(line)
         contract = payload.get("contract") if isinstance(payload.get("contract"), dict) else {}
         passed = payload.get("ok") is True and contract.get("status") == "cross_os_verified"
@@ -2360,7 +2387,7 @@ def command_automation(args: argparse.Namespace) -> int:
             for gap in gaps[:20]:
                 print_check(False, gap)
             commands = payload.get("commands")
-            commands = normalize_parity_commands(commands, current_source=current_source_summary())
+            commands = normalize_parity_commands(commands, current_source=source_summary)
             if commands:
                 live = commands.get("windowsLiveProofRunner")
                 report = commands.get("automationReport") or commands.get("report")
@@ -2378,6 +2405,14 @@ def command_automation(args: argparse.Namespace) -> int:
         append_optional_value(command, "--expect-source-fingerprint", args.expect_source_fingerprint)
         append_optional_value(command, "--expect-source-manifest-sha256", args.expect_source_manifest_sha256)
         append_optional_value(command, "--expect-source-file-count", args.expect_source_file_count)
+        if getattr(args, "json", False):
+            result = run(command, cwd=ROOT, timeout=15)
+            output = result.stdout.strip()
+            if output:
+                print(output)
+            elif result.stderr.strip():
+                print(json.dumps({"ok": False, "findings": [result.stderr.strip()]}, ensure_ascii=False, indent=2, sort_keys=True))
+            return result.returncode
         run_interactive(command, cwd=ROOT)
         return 0
 
@@ -2491,7 +2526,16 @@ def command_automation(args: argparse.Namespace) -> int:
         append_optional_value(command, "--expect-source-fingerprint", args.expect_source_fingerprint)
         append_optional_value(command, "--expect-source-manifest-sha256", args.expect_source_manifest_sha256)
         append_optional_value(command, "--expect-source-file-count", args.expect_source_file_count)
+        append_optional_value(command, "--max-artifact-age-hours", args.max_artifact_age_hours)
         command.append(args.artifact)
+        if getattr(args, "json", False):
+            result = run(command, cwd=ROOT, timeout=30)
+            output = result.stdout.strip()
+            if output:
+                print(output)
+            elif result.stderr.strip():
+                print(json.dumps({"ok": False, "findings": [result.stderr.strip()]}, ensure_ascii=False, indent=2, sort_keys=True))
+            return result.returncode
         run_interactive(command, cwd=ROOT)
         return 0
 
@@ -2539,7 +2583,7 @@ def command_doctor(_args: argparse.Namespace) -> int:
 
     print_header("Tools")
     for tool in doctor_tool_names():
-        found = command_path(tool)
+        found = report_command_path(tool)
         print_check(bool(found), tool, found or "missing")
     compose_cmd = docker_compose_cmd()
     print_check(bool(compose_cmd), "docker compose", " ".join(compose_cmd) if compose_cmd else "missing")
@@ -2608,6 +2652,10 @@ def command_doctor(_args: argparse.Namespace) -> int:
         print_header("Automation Permission")
         for line in summarize_parity_payload(parity_payload):
             print_info(line)
+
+    print_header("Local Proof Artifacts")
+    for line in summarize_local_proof_artifacts(collect_local_proof_artifacts(current_source_summary())):
+        print_info(line)
     return 0
 
 
@@ -2898,11 +2946,7 @@ def summarize_runtime_payload(payload: object) -> str:
 
 
 def collect_status_payload() -> dict[str, object]:
-    process_payload = {
-        "mode": "windows-native" if windows_native() else "screen-or-macos",
-        "summary": windows_process_status() if windows_native() else screen_sessions().replace("\n", " | "),
-        "details": windows_process_details() if windows_native() else None,
-    }
+    process_payload = collect_process_payload()
     ports_payload = {
         label: {
             "port": port,
@@ -2938,6 +2982,13 @@ def collect_status_payload() -> dict[str, object]:
     ok_connectors, raw_connectors, connectors_payload = backend_json("/api/connectors", timeout=8.0)
     ok_parity, raw_parity, parity_payload = backend_json("/api/host-bridge/parity", timeout=8.0)
     parity_payload = normalize_parity_payload_for_cli(parity_payload) if ok_parity else None
+    local_artifacts = collect_local_proof_artifacts(current_source_summary())
+    automation_permission_payload: dict[str, object]
+    if isinstance(parity_payload, dict):
+        automation_permission_payload = dict(parity_payload)
+        automation_permission_payload["localArtifacts"] = local_artifacts
+    else:
+        automation_permission_payload = {"ok": False, "error": raw_parity[:400], "localArtifacts": local_artifacts}
     return {
         "repo": str(ROOT),
         "platform": platform.platform(),
@@ -2950,7 +3001,7 @@ def collect_status_payload() -> dict[str, object]:
         "permissionMode": permission_payload,
         "runtime": runtime_payload,
         "connectors": connectors_payload if ok_connectors else {"ok": False, "error": raw_connectors[:400]},
-        "automationPermission": parity_payload if ok_parity else {"ok": False, "error": raw_parity[:400]},
+        "automationPermission": automation_permission_payload,
         "urls": {"frontend": FRONTEND_URL, "backend": BACKEND_URL},
     }
 
@@ -3030,6 +3081,10 @@ def command_status(args: argparse.Namespace) -> int:
         print_header("Automation Permission")
         for line in summarize_parity_payload(parity_payload):
             print_info(line)
+
+    print_header("Local Proof Artifacts")
+    for line in summarize_local_proof_artifacts(collect_local_proof_artifacts(current_source_summary())):
+        print_info(line)
 
     print_header("URLs")
     print_info("frontend", FRONTEND_URL)
@@ -3126,6 +3181,10 @@ def support_bundle_json_payloads() -> dict[str, object]:
     except Exception as exc:
         payloads["diagnostics/status.json"] = {"ok": False, "error": str(exc)[:400]}
     try:
+        payloads["diagnostics/process.json"] = collect_process_payload()
+    except Exception as exc:
+        payloads["diagnostics/process.json"] = {"ok": False, "error": str(exc)[:400]}
+    try:
         payloads["diagnostics/logs.json"] = collect_logs_payload("all", 200)
     except Exception as exc:
         payloads["diagnostics/logs.json"] = {"ok": False, "error": str(exc)[:400]}
@@ -3167,7 +3226,7 @@ def report_lines() -> list[str]:
     else:
         lines.append(f"process.screen={screen_sessions().replace(chr(10), ' | ')}")
     for tool in report_tool_names():
-        lines.append(f"tool.{tool}={'present' if command_path(tool) else 'missing'}")
+        lines.append(f"tool.{tool}={'present' if report_command_path(tool) else 'missing'}")
     lines.extend(docker_report_lines())
     for port, label in PORTS.items():
         lines.append(f"port.{label}.{port}={port_owner(port) if port_open(port) else 'free'}")
@@ -3207,8 +3266,14 @@ def report_lines() -> list[str]:
     lines.extend(summarize_connectors_payload(connectors_payload if ok else None))
     ok, _raw, parity_payload = backend_json("/api/host-bridge/parity", timeout=8.0)
     parity_payload = normalize_parity_payload_for_cli(parity_payload) if ok else None
+    local_artifacts = collect_local_proof_artifacts(current_source_summary())
+    if isinstance(parity_payload, dict):
+        parity_payload = dict(parity_payload)
+        parity_payload["localArtifacts"] = local_artifacts
     lines.append("automation_permission:")
     lines.extend(summarize_parity_payload(parity_payload))
+    lines.append("automation_permission.local_artifacts:")
+    lines.extend(summarize_local_proof_artifacts(local_artifacts))
     lines.append("automation_permission.commands:")
     lines.extend(summarize_parity_command_payload(parity_payload))
     return lines
@@ -3333,6 +3398,7 @@ def build_parser() -> argparse.ArgumentParser:
     automation_source.add_argument("--expect-source-fingerprint", help="fail if the current fingerprint differs")
     automation_source.add_argument("--expect-source-manifest-sha256", help="fail if the current source manifest SHA-256 differs")
     automation_source.add_argument("--expect-source-file-count", type=int, help="fail if the current proof-bound source file count differs")
+    automation_source.add_argument("--json", action="store_true", help="print pure source summary JSON without command trace")
     automation_source.set_defaults(func=command_automation)
 
     windows_probe = automation_sub.add_parser("windows-probe", help="run the Windows HostBridge probe through uv")
@@ -3375,6 +3441,8 @@ def build_parser() -> argparse.ArgumentParser:
     artifact.add_argument("--expect-source-fingerprint", help="fail if the artifact source fingerprint differs")
     artifact.add_argument("--expect-source-manifest-sha256", help="fail if the artifact source manifest SHA-256 differs")
     artifact.add_argument("--expect-source-file-count", type=int, help="fail if the artifact proof-bound source file count differs")
+    artifact.add_argument("--max-artifact-age-hours", type=float, default=24.0, help="reject artifacts older than this many hours")
+    artifact.add_argument("--json", action="store_true", help="print pure artifact summary JSON without command trace")
     artifact.set_defaults(func=command_automation)
 
     parity_report = automation_sub.add_parser("report", help="verify macOS/Windows live artifacts and install the backend parity report")

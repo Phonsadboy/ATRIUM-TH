@@ -13,7 +13,7 @@ database maintenance.
   prepares Git, Python, uv, Node/pnpm, Docker Desktop, Chrome/Edge/Brave/Chromium
   browser support, Claude Code CLI, clone, and hands off to `.\atrium.ps1 setup --yes`
 - `..\atrium.cmd` - optional Windows Terminal/cmd.exe shim that forwards to
-  `.\atrium.ps1` with ExecutionPolicy Bypass
+  `.\atrium.ps1` with ExecutionPolicy Bypass and falls back to `pwsh.exe`
 - `macos_host_bridge_probe.py` - macOS HostBridge parity probe for shell,
   browser, desktop, notification, and Calculator Accessibility checks
 - `windows_host_bridge_probe.py` - Windows HostBridge parity probe for shell,
@@ -79,7 +79,7 @@ After the repo exists:
 .\atrium.ps1 automation source
 .\atrium.ps1 automation handoff --macos <macos-json>
 .\atrium.ps1 automation windows-live-proof --parity-run-id <run-id> --source-fingerprint <fingerprint> --source-manifest-sha256 <manifest> --source-file-count <count>
-.\atrium.ps1 automation artifact --label windows --expect-parity-run-id <run-id> <windows-json>
+.\atrium.ps1 automation artifact --label windows --expect-parity-run-id <run-id> --json <windows-json>
 .\atrium.ps1 automation report --macos <macos-json> --windows <copied-windows-json>
 .\atrium.ps1 status
 .\atrium.ps1 status --json
@@ -90,10 +90,12 @@ After the repo exists:
 .\atrium.ps1 stop
 ```
 
-From `cmd.exe`, use `atrium.cmd <command>` for the same native workflow.
+From `cmd.exe`, use `atrium.cmd <command>` for the same native workflow; it
+prefers Windows PowerShell and falls back to PowerShell 7 (`pwsh.exe`).
 
 The Windows native path runs the same `ops/atrium_cli.py` CLI but uses
-PowerShell/PID-file lifecycle management instead of `screen`/`zsh`. `stop` and
+PowerShell/PID-file lifecycle management instead of `screen`/`zsh`; CLI
+diagnostics accept Windows PowerShell or PowerShell 7 (`pwsh`). `stop` and
 `restart` stop the Windows frontend/backend process tree so child `uv`, Python,
 Node, or Vite processes do not keep ports open after restart. Backend and
 frontend logs and PID files live under `system/logs`. Docker Desktop is the
@@ -103,6 +105,9 @@ instead of trusting the Windows Store alias. The installer and CLI refresh PATH
 for the current PowerShell session and persist common user PATH entries for
 `uv`, `pnpm`, Docker, Git, Node, Python Launcher, and Claude Code so the native
 workflow survives a new terminal.
+The installer checks native command exit codes for dependency installers,
+`git clone`, and `.\atrium.ps1 setup`, so failed prerequisite/clone/setup runs
+stop the installer instead of printing a successful handoff.
 `start` attempts to open Docker Desktop and waits for Docker before starting
 Postgres/Ollama; if Docker is still blocked, it stops with a clear next step
 instead of letting the backend fail later.
@@ -123,11 +128,14 @@ Backend self-update restart also uses the native PowerShell path on Windows:
 `system/logs/self-update-restart.log`.
 `status` and `report` also summarize provider auth, AI tool registry counts,
 connector readiness, browser/desktop HostBridge readiness, full-autonomy
-permission state, Docker CLI/Compose/daemon readiness, and the HostBridge
-cross-OS parity proof gap plus generated proof commands.
+permission state, local proof artifact freshness, Docker CLI/Compose/daemon
+readiness, and the HostBridge cross-OS parity proof gap plus generated proof
+commands. On Windows,
+`status --json` also includes backend/frontend PID ownership, PID-file state,
+and log paths for support handoff.
 `report --bundle` writes a redacted support zip containing `support-report.txt`,
 `manifest.json`, available backend/frontend logs, and machine-readable
-`diagnostics/status.json`, `diagnostics/logs.json`,
+`diagnostics/status.json`, `diagnostics/process.json`, `diagnostics/logs.json`,
 `diagnostics/permission-mode.json`, `diagnostics/provider-status.json`,
 `diagnostics/tools-status.json`, and `diagnostics/automation-status.json` for
 Windows-native support handoff.

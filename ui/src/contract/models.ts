@@ -161,9 +161,9 @@ export const MODELS: Record<ModelId, ModelInfo> = {
     contextWindowTokens: 1_000_000,
     blurb: 'รุ่น GPT เบา เร็วกว่า เหมาะกับงานทั่วไปและงาน UI agent',
   },
-  'gpt-5.3-codex': {
-    id: 'gpt-5.3-codex',
-    label: 'GPT-5.3 Codex',
+  'gpt-5.4': {
+    id: 'gpt-5.4',
+    label: 'GPT-5.4',
     tier: 'gpt',
     providerIds: ['openai', 'chatgpt_account'],
     inputPerMTok: 5,
@@ -172,7 +172,7 @@ export const MODELS: Record<ModelId, ModelInfo> = {
     supportedEfforts: ['low', 'medium', 'high', 'xhigh'],
     defaultThinkingEffort: 'medium',
     contextWindowTokens: 1_000_000,
-    blurb: 'รุ่น GPT/Codex สำหรับงาน coding ผ่าน Responses API',
+    blurb: 'รุ่น GPT กลางสำหรับงาน reasoning และ coding ผ่าน Responses API',
   },
 }
 
@@ -182,8 +182,8 @@ export const MODEL_LIST: ModelInfo[] = [
   MODELS['claude-opus-4-7'],
   MODELS['claude-opus-4-8'],
   MODELS['gpt-5.5'],
+  MODELS['gpt-5.4'],
   MODELS['gpt-5.4-mini'],
-  MODELS['gpt-5.3-codex'],
 ]
 
 export const DEFAULT_MODEL: ModelId = 'claude-sonnet-4-6'

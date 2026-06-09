@@ -90,10 +90,17 @@ class AtriumCliEnvTests(unittest.TestCase):
         with mock.patch.object(atrium_cli.platform, "system", return_value="Windows"):
             self.assertEqual(
                 atrium_cli.doctor_tool_names(),
-                ("git", "node", "pnpm", "uv", "python3", "docker", "winget", "powershell.exe", "claude"),
+                ("git", "node", "pnpm", "uv", "python3", "docker", "winget", "powershell", "claude"),
             )
             self.assertNotIn("screen", atrium_cli.report_tool_names())
             self.assertNotIn("brew", atrium_cli.report_tool_names())
+
+    def test_windows_powershell_tool_status_accepts_pwsh(self) -> None:
+        def fake_command_path(name: str) -> str | None:
+            return "pwsh.exe" if name == "pwsh" else None
+
+        with mock.patch.object(atrium_cli, "command_path", side_effect=fake_command_path):
+            self.assertEqual(atrium_cli.report_command_path("powershell"), "pwsh.exe")
 
     def test_windows_tool_install_falls_back_to_npm_for_claude_code(self) -> None:
         def fake_command_path(name: str) -> str | None:
@@ -306,7 +313,7 @@ class AtriumCliEnvTests(unittest.TestCase):
         ):
             self.assertEqual(atrium_cli.command_stop(args), 2)
 
-    def test_open_docker_desktop_uses_resolved_powershell_and_json_quoted_path(self) -> None:
+    def test_open_docker_desktop_uses_resolved_powershell_and_single_quoted_path(self) -> None:
         def fake_exists(path: Path) -> bool:
             return "Docker Desktop.exe" in str(path)
 
@@ -321,7 +328,7 @@ class AtriumCliEnvTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertEqual(command[0], "pwsh.exe")
         self.assertIn("Start-Process -FilePath", command[-1])
-        self.assertIn('"C:/Program Files/Docker/Docker/Docker Desktop.exe"', command[-1])
+        self.assertIn("'C:/Program Files/Docker/Docker/Docker Desktop.exe'", command[-1])
 
     def test_open_url_falls_back_to_powershell_when_cmd_is_missing(self) -> None:
         def fake_command_path(name: str) -> str | None:
@@ -337,7 +344,7 @@ class AtriumCliEnvTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertEqual(command[0], "pwsh.exe")
         self.assertIn("Start-Process", command[-1])
-        self.assertIn('"https://auth.example.test/login?next=a b"', command[-1])
+        self.assertIn("'https://auth.example.test/login?next=a b'", command[-1])
 
     def test_restart_stops_then_starts_with_wait_seconds(self) -> None:
         args = type("Args", (), {"force": True, "wait_seconds": 7})()
@@ -495,6 +502,35 @@ class AtriumCliEnvTests(unittest.TestCase):
         self.assertNotIn("access-secret", output.getvalue())
         self.assertNotIn("sk-secret", output.getvalue())
 
+    def test_status_payload_includes_local_proof_artifacts(self) -> None:
+        local_artifacts = {
+            "currentSourceFingerprint": "b" * 64,
+            "macos": {"exists": True, "ok": True, "sourceStatus": "current", "parityRunId": "atrium-run-1"},
+            "handoff": {"exists": True, "ok": True, "sourceStatus": "current", "parityRunId": "atrium-run-1"},
+            "windowsLocal": {"exists": False, "status": "missing"},
+        }
+
+        def fake_backend_json(path: str, *, timeout: float = 5.0):
+            if path == "/api/host-bridge/parity":
+                return True, "{}", {"ok": False, "status": "cross_os_unverified"}
+            if path in {"/health", "/api/runtime", "/api/provider-auth/status", "/api/permissions/mode", "/api/connectors"}:
+                return True, "{}", {"ok": True}
+            return False, "unexpected", None
+
+        with (
+            mock.patch.object(atrium_cli, "windows_native", return_value=False),
+            mock.patch.object(atrium_cli, "screen_sessions", return_value=""),
+            mock.patch.object(atrium_cli, "port_open", return_value=False),
+            mock.patch.object(atrium_cli, "command_path", return_value=None),
+            mock.patch.object(atrium_cli, "backend_json", side_effect=fake_backend_json),
+            mock.patch.object(atrium_cli, "current_source_summary", return_value={"sourceFingerprint": "b" * 64}),
+            mock.patch.object(atrium_cli, "collect_local_proof_artifacts", return_value=local_artifacts),
+        ):
+            payload = atrium_cli.collect_status_payload()
+
+        self.assertEqual(payload["automationPermission"]["localArtifacts"]["windowsLocal"]["status"], "missing")
+        self.assertEqual(payload["automationPermission"]["localArtifacts"]["macos"]["sourceStatus"], "current")
+
     def test_docker_report_lines_include_daemon_truth(self) -> None:
         with (
             mock.patch.object(atrium_cli, "command_path", return_value="docker.exe"),
@@ -506,6 +542,50 @@ class AtriumCliEnvTests(unittest.TestCase):
         self.assertIn("docker.cli=present", lines)
         self.assertIn("docker.compose=docker.exe compose", lines)
         self.assertIn("docker.running=false", lines)
+
+    def test_report_lines_include_local_proof_artifacts(self) -> None:
+        local_artifacts = {
+            "currentSourceFingerprint": "b" * 64,
+            "macos": {"exists": True, "ok": True, "sourceStatus": "current", "parityRunId": "atrium-run-1"},
+            "handoff": {"exists": True, "ok": True, "sourceStatus": "current", "parityRunId": "atrium-run-1"},
+            "windowsLocal": {"exists": False, "status": "missing"},
+        }
+
+        def fake_backend_json(path: str, *, timeout: float = 5.0):
+            if path == "/api/host-bridge/parity":
+                return True, "{}", {"ok": False, "commands": {"verify": "./atrium automation audit"}}
+            if path in {
+                "/health",
+                "/api/runtime",
+                "/api/provider-auth/status",
+                "/api/permissions/mode",
+                "/api/tools/catalog",
+                "/api/connectors",
+            }:
+                return True, "{}", {"ok": True}
+            return False, "unexpected", None
+
+        with (
+            mock.patch.object(atrium_cli, "git_status_summary", return_value="clean"),
+            mock.patch.object(atrium_cli, "remote_ok", return_value=(True, "origin/main")),
+            mock.patch.object(atrium_cli, "is_i_cloud_risky", return_value=(False, "ok")),
+            mock.patch.object(atrium_cli, "memory_gb", return_value="16GB"),
+            mock.patch.object(atrium_cli, "windows_native", return_value=False),
+            mock.patch.object(atrium_cli, "screen_sessions", return_value=""),
+            mock.patch.object(atrium_cli, "command_path", return_value=None),
+            mock.patch.object(atrium_cli, "docker_report_lines", return_value=[]),
+            mock.patch.object(atrium_cli, "port_open", return_value=False),
+            mock.patch.object(atrium_cli, "backend_json", side_effect=fake_backend_json),
+            mock.patch.object(atrium_cli, "render_env_status", return_value=[]),
+            mock.patch.object(atrium_cli, "provider_status_from_env", return_value=[]),
+            mock.patch.object(atrium_cli, "current_source_summary", return_value={"sourceFingerprint": "b" * 64}),
+            mock.patch.object(atrium_cli, "collect_local_proof_artifacts", return_value=local_artifacts),
+        ):
+            lines = atrium_cli.report_lines()
+
+        self.assertIn("automation_permission.local_artifacts:", lines)
+        self.assertIn("macos: exists=true, ok=true, source=current, run=atrium-run-1", lines)
+        self.assertIn("windowsLocal: exists=false, status=missing", lines)
 
     def test_report_bundle_writes_redacted_report_and_logs(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -524,6 +604,10 @@ class AtriumCliEnvTests(unittest.TestCase):
                     "support_bundle_json_payloads",
                     return_value={
                         "diagnostics/status.json": {"runtime": {"provider": {"apiKey": "sk-secret"}}},
+                        "diagnostics/process.json": {
+                            "mode": "windows-native",
+                            "details": {"backend": {"pid": 1234, "running": True}},
+                        },
                         "diagnostics/logs.json": {"logs": {"backend": {"lines": ["ATRIUM_OPENAI_API_KEY=sk-secret"]}}},
                         "diagnostics/permission-mode.json": {"fullAutonomyStatus": {"credentials": {"apiKey": "sk-secret"}}},
                         "diagnostics/provider-status.json": {"chatgptAccount": {"email": "owner@example.com"}},
@@ -538,6 +622,7 @@ class AtriumCliEnvTests(unittest.TestCase):
                 report = archive.read("support-report.txt").decode("utf-8")
                 backend_log = archive.read("logs/backend.log").decode("utf-8")
                 status_json = archive.read("diagnostics/status.json").decode("utf-8")
+                process_json = archive.read("diagnostics/process.json").decode("utf-8")
                 logs_json = archive.read("diagnostics/logs.json").decode("utf-8")
                 permission_json = archive.read("diagnostics/permission-mode.json").decode("utf-8")
                 provider_json = archive.read("diagnostics/provider-status.json").decode("utf-8")
@@ -546,6 +631,7 @@ class AtriumCliEnvTests(unittest.TestCase):
         self.assertIn("support-report.txt", names)
         self.assertIn("logs/backend.log", names)
         self.assertIn("diagnostics/status.json", names)
+        self.assertIn("diagnostics/process.json", names)
         self.assertIn("diagnostics/logs.json", names)
         self.assertIn("diagnostics/permission-mode.json", names)
         self.assertIn("diagnostics/provider-status.json", names)
@@ -554,6 +640,7 @@ class AtriumCliEnvTests(unittest.TestCase):
         self.assertNotIn("sk-secret", report)
         self.assertNotIn("sk-secret", backend_log)
         self.assertNotIn("sk-secret", status_json)
+        self.assertIn('"mode": "windows-native"', process_json)
         self.assertNotIn("sk-secret", logs_json)
         self.assertNotIn("sk-secret", permission_json)
         self.assertNotIn("owner@example.com", provider_json)
@@ -779,11 +866,25 @@ class AtriumCliEnvTests(unittest.TestCase):
         with (
             mock.patch.object(atrium_cli, "ensure_repo_root"),
             mock.patch.object(atrium_cli, "backend_json", return_value=(True, "{}", payload)),
+            mock.patch.object(atrium_cli, "current_source_summary", return_value={"sourceFingerprint": "b" * 64}),
+            mock.patch.object(
+                atrium_cli,
+                "collect_local_proof_artifacts",
+                return_value={
+                    "currentSourceFingerprint": "b" * 64,
+                    "macos": {"exists": True, "ok": True, "sourceStatus": "stale", "parityRunId": "atrium-old"},
+                    "handoff": {"exists": True, "ok": True, "sourceStatus": "stale", "parityRunId": "atrium-old"},
+                    "windowsLocal": {"exists": False, "status": "missing"},
+                },
+            ),
             redirect_stdout(output),
         ):
             self.assertEqual(atrium_cli.command_automation(args), 2)
 
         text = output.getvalue()
+        self.assertIn("Local Proof Artifacts", text)
+        self.assertIn("macos: exists=true, ok=true, source=stale, run=atrium-old", text)
+        self.assertIn("windowsLocal: exists=false, status=missing", text)
         self.assertIn("OpenClaw Windows Gaps", text)
         self.assertIn("feature.git", text)
         self.assertIn("windowsLiveProofRunner", text)
@@ -852,6 +953,16 @@ class AtriumCliEnvTests(unittest.TestCase):
                     "gitDirty": True,
                 },
             ),
+            mock.patch.object(
+                atrium_cli,
+                "collect_local_proof_artifacts",
+                return_value={
+                    "currentSourceFingerprint": current_fingerprint,
+                    "macos": {"exists": True, "ok": True, "sourceStatus": "stale", "parityRunId": "atrium-old"},
+                    "handoff": {"exists": True, "ok": True, "sourceStatus": "stale", "parityRunId": "atrium-old"},
+                    "windowsLocal": {"exists": False, "status": "missing"},
+                },
+            ),
             redirect_stdout(output),
         ):
             self.assertEqual(atrium_cli.command_automation(args), 2)
@@ -869,6 +980,9 @@ class AtriumCliEnvTests(unittest.TestCase):
         self.assertIn("automation report", normalized["report"]["findings"][0])
         self.assertIn("automation report", normalized["connectors"][0]["proofGaps"][0])
         self.assertEqual(normalized["cliSource"]["sourceFileCount"], 17)
+        self.assertEqual(normalized["localArtifacts"]["macos"]["sourceStatus"], "stale")
+        self.assertEqual(normalized["localArtifacts"]["handoff"]["sourceStatus"], "stale")
+        self.assertEqual(normalized["localArtifacts"]["windowsLocal"]["status"], "missing")
 
     def test_automation_audit_json_is_redacted(self) -> None:
         args = type("Args", (), {"automation_action": "audit", "json": True})()
@@ -1385,6 +1499,7 @@ class AtriumCliEnvTests(unittest.TestCase):
         self.assertIn(f"--expect-source-fingerprint {current_fingerprint}", normalized["windowsSourceValidate"])
         self.assertIn(f"--expect-source-manifest-sha256 {current_manifest}", normalized["windowsSourceValidate"])
         self.assertIn("--expect-source-file-count 17", normalized["windowsSourceValidate"])
+        self.assertIn("--json", normalized["windowsSourceValidate"])
         self.assertIn(f"--expect-source-fingerprint {current_fingerprint}", normalized["windowsProbe"])
         self.assertIn(f"--expect-source-manifest-sha256 {current_manifest}", normalized["windowsProbe"])
         self.assertIn("--expect-source-file-count 17", normalized["windowsProbe"])
@@ -1422,6 +1537,64 @@ class AtriumCliEnvTests(unittest.TestCase):
         self.assertIn("sourceFileCount=17", text)
         self.assertIn("verify=.\\atrium.ps1 automation audit", text)
         self.assertIn("legacyParityReport=uv --project system run python ops/host_bridge_parity_report.py", text)
+
+    def test_automation_source_json_prints_pure_verifier_payload(self) -> None:
+        args = type(
+            "Args",
+            (),
+            {
+                "automation_action": "source",
+                "expect_source_fingerprint": "a" * 64,
+                "expect_source_manifest_sha256": "b" * 64,
+                "expect_source_file_count": 17,
+                "json": True,
+            },
+        )()
+        payload = {"ok": True, "sourceFingerprint": "a" * 64, "sourceManifestSha256": "b" * 64, "sourceFileCount": 17}
+        output = io.StringIO()
+        with (
+            mock.patch.object(atrium_cli, "ensure_repo_root"),
+            mock.patch.object(atrium_cli, "command_path", return_value="/bin/uv"),
+            mock.patch.object(atrium_cli, "run", return_value=atrium_cli.CommandResult(0, json.dumps(payload), "")) as run,
+            redirect_stdout(output),
+        ):
+            self.assertEqual(atrium_cli.command_automation(args), 0)
+
+        printed = output.getvalue()
+        self.assertNotIn("$ ", printed)
+        self.assertEqual(json.loads(printed), payload)
+        command = run.call_args.args[0]
+        self.assertIn("ops/host_bridge_source_summary.py", command)
+        self.assertIn("--expect-source-fingerprint", command)
+        self.assertIn("a" * 64, command)
+        self.assertIn("--expect-source-manifest-sha256", command)
+        self.assertIn("b" * 64, command)
+        self.assertIn("--expect-source-file-count", command)
+        self.assertIn("17", command)
+
+    def test_automation_source_json_returns_verifier_failure_code(self) -> None:
+        args = type(
+            "Args",
+            (),
+            {
+                "automation_action": "source",
+                "expect_source_fingerprint": "a" * 64,
+                "expect_source_manifest_sha256": None,
+                "expect_source_file_count": None,
+                "json": True,
+            },
+        )()
+        payload = {"ok": False, "findings": ["sourceFingerprint mismatch"]}
+        output = io.StringIO()
+        with (
+            mock.patch.object(atrium_cli, "ensure_repo_root"),
+            mock.patch.object(atrium_cli, "command_path", return_value="/bin/uv"),
+            mock.patch.object(atrium_cli, "run", return_value=atrium_cli.CommandResult(1, json.dumps(payload), "")),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(atrium_cli.command_automation(args), 1)
+
+        self.assertEqual(json.loads(output.getvalue()), payload)
 
     def test_automation_windows_probe_builds_uv_command(self) -> None:
         args = type(
@@ -1474,6 +1647,8 @@ class AtriumCliEnvTests(unittest.TestCase):
                 "expect_source_fingerprint": "a" * 64,
                 "expect_source_manifest_sha256": "b" * 64,
                 "expect_source_file_count": 17,
+                "max_artifact_age_hours": 12.0,
+                "json": False,
                 "artifact": "C:\\Temp\\atrium_host_bridge_windows_live.json",
             },
         )()
@@ -1498,7 +1673,70 @@ class AtriumCliEnvTests(unittest.TestCase):
         self.assertIn("b" * 64, command)
         self.assertIn("--expect-source-file-count", command)
         self.assertIn("17", command)
+        self.assertIn("--max-artifact-age-hours", command)
+        self.assertIn("12.0", command)
         self.assertEqual(command[-1], "C:\\Temp\\atrium_host_bridge_windows_live.json")
+
+    def test_automation_artifact_json_prints_pure_verifier_payload(self) -> None:
+        args = type(
+            "Args",
+            (),
+            {
+                "automation_action": "artifact",
+                "label": "windows",
+                "expect_parity_run_id": "atrium-run-1",
+                "expect_source_fingerprint": "a" * 64,
+                "expect_source_manifest_sha256": "b" * 64,
+                "expect_source_file_count": 17,
+                "max_artifact_age_hours": 12.0,
+                "json": True,
+                "artifact": "C:\\Temp\\atrium_host_bridge_windows_live.json",
+            },
+        )()
+        payload = {"ok": True, "label": "windows", "sourceFileCount": 17}
+        output = io.StringIO()
+        with (
+            mock.patch.object(atrium_cli, "ensure_repo_root"),
+            mock.patch.object(atrium_cli, "command_path", return_value="/bin/uv"),
+            mock.patch.object(atrium_cli, "run", return_value=atrium_cli.CommandResult(0, json.dumps(payload), "")) as run,
+            redirect_stdout(output),
+        ):
+            self.assertEqual(atrium_cli.command_automation(args), 0)
+
+        self.assertEqual(json.loads(output.getvalue()), payload)
+        self.assertNotIn("$ ", output.getvalue())
+        command = run.call_args.args[0]
+        self.assertIn("--max-artifact-age-hours", command)
+        self.assertIn("12.0", command)
+        self.assertEqual(command[-1], "C:\\Temp\\atrium_host_bridge_windows_live.json")
+
+    def test_automation_artifact_json_returns_verifier_failure_code(self) -> None:
+        args = type(
+            "Args",
+            (),
+            {
+                "automation_action": "artifact",
+                "label": "windows",
+                "expect_parity_run_id": "atrium-run-1",
+                "expect_source_fingerprint": None,
+                "expect_source_manifest_sha256": None,
+                "expect_source_file_count": None,
+                "max_artifact_age_hours": 24.0,
+                "json": True,
+                "artifact": "C:\\Temp\\atrium_host_bridge_windows_live.json",
+            },
+        )()
+        payload = {"ok": False, "findings": ["artifact is stale"]}
+        output = io.StringIO()
+        with (
+            mock.patch.object(atrium_cli, "ensure_repo_root"),
+            mock.patch.object(atrium_cli, "command_path", return_value="/bin/uv"),
+            mock.patch.object(atrium_cli, "run", return_value=atrium_cli.CommandResult(1, json.dumps(payload), "")),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(atrium_cli.command_automation(args), 1)
+
+        self.assertEqual(json.loads(output.getvalue()), payload)
 
     def test_automation_windows_live_proof_builds_powershell_command(self) -> None:
         args = type(
@@ -1593,8 +1831,12 @@ class AtriumCliEnvTests(unittest.TestCase):
         self.assertEqual(payload["source"]["sourceFileCount"], 18)
         self.assertEqual(payload["macosArtifact"]["parityRunId"], "atrium-run-1")
         self.assertIn(".\\atrium.ps1 automation windows-live-proof", payload["windowsProof"]["commands"]["liveProof"])
+        self.assertIn("--json", payload["windowsProof"]["commands"]["sourceValidate"])
+        self.assertIn("--max-artifact-age-hours 24.0", payload["windowsProof"]["commands"]["artifactValidate"])
+        self.assertIn("--json", payload["windowsProof"]["commands"]["artifactValidate"])
         self.assertIn("--source-manifest-sha256 " + "a" * 64, payload["windowsProof"]["commands"]["liveProof"])
         self.assertIn("./atrium automation report", payload["finalVerification"]["commands"]["report"])
+        self.assertIn("--max-artifact-age-hours 24.0", payload["finalVerification"]["commands"]["report"])
         self.assertIn("Windows proof handoff", output.getvalue())
 
     def test_automation_handoff_refuses_stale_macos_artifact(self) -> None:
