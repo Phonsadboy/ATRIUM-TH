@@ -15,6 +15,7 @@ SOURCE_FINGERPRINT_FILES = (
     "atrium",
     "atrium.cmd",
     "atrium.ps1",
+    "ops/README.md",
     "ops/atrium_cli.py",
     "ops/install_windows_native.ps1",
     "ops/macos_host_bridge_probe.py",

@@ -63,6 +63,7 @@ playwright-report/
 /documentation/
 *.md
 !/README.md
+!ops/README.md
 **/tests/
 **/test/
 **/test_*.py

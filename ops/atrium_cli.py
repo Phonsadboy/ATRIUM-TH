@@ -2839,6 +2839,19 @@ def summarize_parity_payload(payload: object) -> list[str]:
             text = _host_bridge_gap_text(gap)
             if text:
                 lines.append(f"HostBridge parity gap: {text}")
+    source = payload.get("currentSource") if isinstance(payload.get("currentSource"), dict) else payload.get("cliSource")
+    if isinstance(source, dict):
+        fingerprint = str(source.get("sourceFingerprint") or "")
+        git_head = str(source.get("gitHead") or "")
+        parts = []
+        if fingerprint:
+            parts.append(f"sourceFingerprint={fingerprint[:12]}")
+        if source.get("sourceFileCount") is not None:
+            parts.append(f"sourceFileCount={source.get('sourceFileCount')}")
+        if git_head:
+            parts.append(f"gitHead={git_head[:12]}")
+        if parts:
+            lines.append("HostBridge proof target: " + ", ".join(parts))
     contract = payload.get("contract")
     if not isinstance(contract, dict):
         lines.append("OpenClaw Windows contract: missing from backend payload")
@@ -4320,6 +4333,66 @@ def collect_automation_status_payload() -> tuple[bool, dict[str, object]]:
     return True, normalized
 
 
+def collect_openclaw_windows_proof_readiness_payload() -> dict[str, object]:
+    source_summary = current_source_summary()
+    automation_ok, automation_payload = collect_automation_status_payload()
+    if not automation_ok:
+        automation_payload = {"ok": False, **automation_payload}
+    commands = automation_payload.get("commands") if isinstance(automation_payload.get("commands"), dict) else {}
+    checklist = automation_payload.get("windowsProofOperatorChecklist")
+    if not isinstance(checklist, list):
+        checklist = build_windows_operator_checklist_from_commands(commands)
+    contract = automation_payload.get("contract") if isinstance(automation_payload.get("contract"), dict) else {}
+    report = automation_payload.get("report") if isinstance(automation_payload.get("report"), dict) else {}
+    local_artifacts = automation_payload.get("localArtifacts")
+    if not isinstance(local_artifacts, dict):
+        local_artifacts = collect_local_proof_artifacts(source_summary)
+    ok_mcp_probe, raw_mcp_probe, mcp_probe_payload = backend_json("/api/tools/mcp-gateway?probe=true", timeout=15.0)
+    mcp_probe = (
+        mcp_probe_payload
+        if ok_mcp_probe and isinstance(mcp_probe_payload, dict)
+        else {"ok": False, "error": raw_mcp_probe[:400]}
+    )
+    proof_blocker = mcp_probe.get("proofBlocker") if isinstance(mcp_probe.get("proofBlocker"), dict) else None
+    return {
+        "ok": automation_payload.get("ok") is True,
+        "status": automation_payload.get("status"),
+        "summary": automation_payload.get("summary"),
+        "source": {
+            key: source_summary.get(key)
+            for key in ("sourceFingerprint", "sourceManifestSha256", "sourceFileCount", "gitHead", "gitDirty")
+            if isinstance(source_summary, dict) and key in source_summary
+        },
+        "contractStatus": contract.get("status"),
+        "reportOk": report.get("ok"),
+        "reportPath": report.get("path") or report.get("reportPath"),
+        "mcpExternalWriteReady": mcp_probe.get("ready") is True,
+        "mcpProofBlocker": proof_blocker,
+        "localArtifacts": local_artifacts,
+        "windowsProofOperatorChecklist": checklist,
+        "commands": {
+            key: commands.get(key)
+            for key in (
+                "windowsSourceValidate",
+                "mcpGatewaySetupJson",
+                "mcpGatewayProbeJson",
+                "mcpGatewayStatusJson",
+                "nativeBrowserDesktopSmoke",
+                "windowsProbe",
+                "windowsLiveProofRunner",
+                "windowsArtifactValidateOnWindows",
+                "windowsArtifactCopyHint",
+                "acceptWindowsArtifact",
+                "automationReport",
+                "verify",
+            )
+            if isinstance(commands.get(key), str)
+        },
+        "remainingGaps": list(automation_payload.get("gaps") or [])[:24],
+        "proofRequirement": "OpenClaw-level Windows parity requires this readiness payload, current macOS and Windows live artifacts, write-capable MCP gateway proof, accept-windows, and a passing automation audit.",
+    }
+
+
 def command_permissions(args: argparse.Namespace) -> int:
     ensure_repo_root()
     action = args.permissions_action
@@ -5775,6 +5848,10 @@ def support_bundle_json_payloads() -> dict[str, object]:
         payloads["diagnostics/automation-status.json"] = automation_payload
     except Exception as exc:
         payloads["diagnostics/automation-status.json"] = {"ok": False, "error": str(exc)[:400]}
+    try:
+        payloads["diagnostics/openclaw-windows-proof-readiness.json"] = collect_openclaw_windows_proof_readiness_payload()
+    except Exception as exc:
+        payloads["diagnostics/openclaw-windows-proof-readiness.json"] = {"ok": False, "error": str(exc)[:400]}
     return payloads
 
 

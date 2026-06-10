@@ -1580,6 +1580,7 @@ class HostBridgeParityStatusResponse(Schema):
     status: HostBridgeParityStatus
     summary: str
     gaps: list[str] = Field(default_factory=list)
+    current_source: dict[str, Any] = Field(default_factory=dict)
     report: dict[str, Any] = Field(default_factory=dict)
     local: dict[str, Any] = Field(default_factory=dict)
     local_artifacts: dict[str, Any] = Field(default_factory=dict)

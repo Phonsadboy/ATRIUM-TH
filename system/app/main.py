@@ -4217,6 +4217,14 @@ def _host_bridge_source_fingerprint_status(value: object, current_source: dict[s
     return "stale"
 
 
+def _host_bridge_public_source_summary(current_source: dict[str, Any]) -> dict[str, Any]:
+    return {
+        key: current_source.get(key)
+        for key in ("sourceFingerprint", "sourceManifestSha256", "sourceFileCount", "gitHead", "gitDirty")
+        if key in current_source
+    }
+
+
 HOST_BRIDGE_REQUIRED_WINDOWS_PROOF_FACETS = (
     "browserOpen",
     "browserOpenIsolatedProfile",
@@ -4843,6 +4851,7 @@ def _host_bridge_openclaw_level_contract(
         and "diagnostics/provider-env.json" in cli_text
         and "diagnostics/tools-status.json" in cli_text
         and "diagnostics/automation-status.json" in cli_text
+        and "diagnostics/openclaw-windows-proof-readiness.json" in cli_text
         and "provider_reference:" in cli_text
         and "provider_env:" in cli_text
         and "summarize_provider_reference_payload(provider_reference_payload" in cli_text
@@ -5650,6 +5659,7 @@ def _host_bridge_parity_status_payload() -> dict[str, Any]:
         status=status,
         summary=summary,
         gaps=gaps,
+        current_source=_host_bridge_public_source_summary(current_source),
         report=report_payload,
         local=local_payload,
         local_artifacts=local_artifacts,
