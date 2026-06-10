@@ -1296,6 +1296,7 @@ export class ApiClient implements CompanyClient {
       if (!dup) arr.push(m)
       threads[m.threadId] = arr
     }
+    const orderNow = Date.now()
     for (const tid of Object.keys(threads)) {
       threads[tid] = [...threads[tid]]
         .map((m) => {
@@ -1305,7 +1306,7 @@ export class ApiClient implements CompanyClient {
           const seg = this.streamSegments.get(m.id)
           return seg && seg.length ? { ...m, segments: seg } : m
         })
-        .sort(compareChatOrder)
+        .sort((a, b) => compareChatOrder(a, b, orderNow))
     }
     return threads
   }
@@ -1319,11 +1320,13 @@ export class ApiClient implements CompanyClient {
     if (this.devHold) return // a local demo seed owns the store (DEV only)
     const replayAfterId = this.state.activity[0]?.id ?? null
     this.serverThreads = server.threads ?? {}
-    // drop finished streaming overlays once the snapshot carries the final
-    // (non-pending) message — prevents flicker / double render.
+    // drop streaming overlays once the snapshot carries a settled (non-pending)
+    // message — prevents flicker / double render. The server is the source of
+    // truth: an overlay that never received msg_done (e.g. backend restarted
+    // mid-stream) must not keep the bubble "streaming" forever.
     for (const [msgId, s] of this.streaming) {
       const serverMsg = (this.serverThreads[s.threadId] ?? []).find((x) => x.id === msgId)
-      if (s.done && serverMsg && !serverMsg.pending) this.streaming.delete(msgId)
+      if (serverMsg && !serverMsg.pending) this.streaming.delete(msgId)
     }
     this.optimistic = this.optimistic.filter((m) => {
       if (m.status === 'failed') return true

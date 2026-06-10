@@ -72,6 +72,8 @@ def normalize_cost_category(category: Any) -> tuple[str, str | None]:
     return "tool", raw or None
 EXECUTIVE_QUEUE_KINDS = {"chat_reply", TASK_REVIEW_REMINDER_KIND, "objective_run", "trigger_run"}
 AGENT_NAME_UPDATED_AT_KEY = "agentNameUpdatedAt"
+AI_CONFIG_UPDATED_AT_KEY = "aiConfigUpdatedAt"
+AI_CONFIG_FIELDS = ("providerId", "model", "thinkingEffort", "speed")
 DEFAULT_EXEC_AGENT_NAME = "ออตโต้"
 
 
@@ -287,6 +289,34 @@ def _agent_name_update_ts(dept: dict[str, Any]) -> int:
         return int(dept.get(AGENT_NAME_UPDATED_AT_KEY) or 0)
     except (TypeError, ValueError):
         return 0
+
+
+def _ai_config_update_ts(dept: dict[str, Any]) -> int:
+    try:
+        return int(dept.get(AI_CONFIG_UPDATED_AT_KEY) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _merge_department_ai_config_for_save(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
+    """Keep newer user-chosen AI config when stale runtime state is saved.
+
+    Long jobs hold a dept snapshot across LLM calls and save the whole dict at
+    the end (state/mood/memory updates); without this merge that write silently
+    reverts model/provider/effort/speed changes made while the job was running.
+    """
+    if str(current.get("id") or "") != str(incoming.get("id") or ""):
+        return incoming
+    current_ts = _ai_config_update_ts(current)
+    incoming_ts = _ai_config_update_ts(incoming)
+    if not current_ts or incoming_ts >= current_ts:
+        return incoming
+    merged = dict(incoming)
+    for field in AI_CONFIG_FIELDS:
+        if current.get(field) is not None:
+            merged[field] = current[field]
+    merged[AI_CONFIG_UPDATED_AT_KEY] = current_ts
+    return merged
 
 
 def _merge_department_agent_name_for_save(current: dict[str, Any], incoming: dict[str, Any]) -> dict[str, Any]:
@@ -989,7 +1019,9 @@ class Repo:
             row = T.Department(id=dept["id"], created_at=dept.get("createdAt", now_ms()), data=dept)
             self.s.add(row)
         else:
-            dept = _merge_department_agent_name_for_save(dict(row.data or {}), dept)
+            current = dict(row.data or {})
+            dept = _merge_department_agent_name_for_save(current, dept)
+            dept = _merge_department_ai_config_for_save(current, dept)
             row.data = dept
             row.created_at = dept.get("createdAt", row.created_at)
 

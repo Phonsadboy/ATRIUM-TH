@@ -363,6 +363,9 @@ class Settings(BaseSettings):
     # context exceeds this share of the model window; <= 0 disables. A trim also
     # queues compaction (reason "window_guard") so the smart path catches up.
     chat_context_window_guard_ratio: float = 0.80
+    # Auto-close agent replies stuck in pending with no queued/running chat_reply
+    # job and no live stream progress for this long; <= 0 disables the reaper.
+    stale_pending_reply_max_age_s: float = 900.0
     # <= 0 disables the app-level per-user chat rate gate.
     chat_rate_limit_per_minute: int = 0
     chat_budget_warning_ratio: float = 0.85

@@ -126,7 +126,15 @@ from .clock import day_key, now_ms
 from .config import get_settings
 from .context_budget import estimate_llm_context_tokens, model_auto_compact_context_tokens
 from .db.base import commit_and_release, dispose_db, init_db, session_scope
-from .db.repo import AGENT_NAME_UPDATED_AT_KEY, Repo, TOOL_CATALOG, full_autonomy_status, office_layout_context
+from .db.repo import (
+    AGENT_NAME_UPDATED_AT_KEY,
+    AI_CONFIG_FIELDS,
+    AI_CONFIG_UPDATED_AT_KEY,
+    Repo,
+    TOOL_CATALOG,
+    full_autonomy_status,
+    office_layout_context,
+)
 from .events import hub
 from .file_intake import (
     FilePreview,
@@ -8848,6 +8856,10 @@ async def _patch_department(repo: Repo, dept_id: str, patch: dict[str, Any]) -> 
     next_dept["model"] = model
     next_dept["thinkingEffort"] = effort
     next_dept["speed"] = coerce_model_speed(model, next_dept.get("speed", "standard"))
+    if any(field in clean_patch for field in AI_CONFIG_FIELDS):
+        # Stamp user-chosen AI config so stale runtime snapshots saved by
+        # long-running jobs cannot revert it (see _merge_department_ai_config_for_save).
+        next_dept[AI_CONFIG_UPDATED_AT_KEY] = now_ms()
     await repo.save_department(next_dept)
     from .org.capabilities import sync_department_capabilities
 

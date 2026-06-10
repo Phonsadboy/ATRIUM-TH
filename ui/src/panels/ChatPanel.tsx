@@ -215,11 +215,12 @@ function groupToolActivityMessages(messages: ChatMessage[]): ChatListItem[] {
 }
 
 function mergeMessages(history: ChatMessage[] | null, live: ChatMessage[]): ChatMessage[] {
-  if (!history) return [...live].sort(compareChatOrder)
+  const now = Date.now()
+  if (!history) return [...live].sort((a, b) => compareChatOrder(a, b, now))
   const byId = new Map<string, ChatMessage>()
   for (const message of history) byId.set(message.id, message)
   for (const message of live) byId.set(message.id, message)
-  return [...byId.values()].sort(compareChatOrder)
+  return [...byId.values()].sort((a, b) => compareChatOrder(a, b, now))
 }
 
 // Raw chronological compare — used for history-pagination cursors only;

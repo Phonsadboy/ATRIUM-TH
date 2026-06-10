@@ -2301,6 +2301,84 @@ async def _mark_chat_reply_timeout_retrying(
     })
 
 
+async def _close_stale_pending_replies(
+    repo: Repo,
+    *,
+    thread_id: str,
+    messages: list[dict[str, Any]],
+    keep_ids: set[str],
+    now: int,
+) -> int:
+    """Close agent replies stuck in pending with no live job or stream behind them.
+
+    Engine restarts and crashed jobs can strand pending bubbles forever; they pile
+    up at the bottom of the thread once live replies pin there.
+    """
+    settings = get_settings()
+    max_age_ms = int(max(0.0, float(getattr(settings, "stale_pending_reply_max_age_s", 0) or 0)) * 1000)
+    if max_age_ms <= 0:
+        return 0
+    stale = [
+        msg for msg in messages
+        if msg.get("pending")
+        and msg.get("role") != "user"
+        and str(msg.get("id") or "") not in keep_ids
+        and now - int(msg.get("ts") or 0) > max_age_ms
+    ]
+    if not stale:
+        return 0
+    active_reply_ids: set[str] = set()
+    with contextlib.suppress(Exception):
+        for job in await repo.active_jobs(limit=2000):
+            if str(job.get("kind") or "") != "chat_reply":
+                continue
+            payload = job.get("payload") or {}
+            if str(payload.get("threadId") or "") == thread_id:
+                active_reply_ids.add(str(payload.get("replyMessageId") or ""))
+    closed = 0
+    for msg in stale:
+        msg_id = str(msg.get("id") or "")
+        if not msg_id or msg_id in active_reply_ids:
+            continue
+        progress_at = chat_streams.last_progress_at(msg_id)
+        if progress_at and now - progress_at <= max_age_ms:
+            continue
+        text = (
+            str(msg.get("text") or "").strip()
+            or "การตอบนี้ค้างสถานะรอไว้นานโดยไม่มีงานทำงานอยู่ ระบบปิดให้อัตโนมัติ สั่งใหม่ได้เลย"
+        )
+        closed_msg = {
+            **msg,
+            "text": text,
+            "pending": False,
+            "status": "failed",
+            "completedAt": now,
+            "error": {
+                "code": "stale_pending_reply",
+                "detail": "pending reply had no active job or live stream",
+                "retryable": True,
+            },
+        }
+        await repo.update_message(closed_msg)
+        hub.pulse({
+            "kind": "msg_done",
+            "threadId": thread_id,
+            "msgId": msg_id,
+            "text": closed_msg["text"],
+            "error": "stale_pending_reply",
+        })
+        closed += 1
+    if closed:
+        with contextlib.suppress(Exception):
+            await repo.add_activity(_activity(
+                f"ปิดข้อความตอบค้าง {closed} รายการใน thread {thread_id} ที่ไม่มีงานหรือสตรีมทำงานอยู่แล้ว",
+                type_="system",
+                severity="warn",
+                ts=now,
+            ))
+    return closed
+
+
 def _job_timeout_retry_delay_ms(settings: Settings | None = None) -> int:
     settings = settings or get_settings()
     try:
@@ -2462,6 +2540,14 @@ async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int)
     turn_dept = _with_turn_speed(_with_turn_thinking_effort(dept, turn_thinking_effort), turn_speed)
 
     messages = await _thread_messages_for_live_prompt(repo, thread_id)
+    with contextlib.suppress(Exception):
+        await _close_stale_pending_replies(
+            repo,
+            thread_id=thread_id,
+            messages=messages,
+            keep_ids={reply_message_id},
+            now=now,
+        )
     existing_reply = next((m for m in messages if m.get("id") == reply_message_id), None)
     if existing_reply and not existing_reply.get("pending"):
         return
