@@ -4197,6 +4197,17 @@ def _host_bridge_load_json_file(path: Path) -> tuple[dict[str, Any] | None, str 
     return payload, None
 
 
+def _host_bridge_local_artifact_file_metadata(path: Path) -> dict[str, Any]:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return {}
+    return {
+        "artifactBytes": len(data),
+        "artifactSha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
 def _host_bridge_source_fingerprint_status(value: object, current_source: dict[str, Any]) -> str:
     current = current_source.get("sourceFingerprint")
     if not isinstance(value, str) or not value.strip():
@@ -4357,6 +4368,7 @@ def _host_bridge_local_proof_artifacts(current_source: dict[str, Any] | None = N
                 "sourceStatus": _host_bridge_source_fingerprint_status(fingerprint, source),
                 "generatedAt": payload.get("generatedAt"),
             })
+            item.update(_host_bridge_local_artifact_file_metadata(path))
             error_text = str(payload.get("error") or "").strip()
             if error_text:
                 item["error"] = error_text[:240]

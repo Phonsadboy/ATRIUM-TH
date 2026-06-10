@@ -2226,6 +2226,17 @@ def _load_json_file(path: Path) -> tuple[dict[str, object] | None, str | None]:
     return payload, None
 
 
+def _local_artifact_file_metadata(path: Path) -> dict[str, object]:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return {}
+    return {
+        "artifactBytes": len(data),
+        "artifactSha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
 def _source_fingerprint_status(value: object, current_source: dict[str, object]) -> str:
     current = current_source.get("sourceFingerprint")
     if not isinstance(value, str) or not value.strip():
@@ -2311,6 +2322,7 @@ def collect_local_proof_artifacts(current_source: dict[str, object] | None = Non
                 "sourceStatus": _source_fingerprint_status(fingerprint, source),
                 "generatedAt": payload.get("generatedAt"),
             })
+            item.update(_local_artifact_file_metadata(path))
             error_text = str(payload.get("error") or "").strip()
             if error_text:
                 item["error"] = error_text[:240]

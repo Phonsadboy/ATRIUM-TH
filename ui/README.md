@@ -1,110 +1,125 @@
-# React + TypeScript + Vite
+# ATRIUM UI
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+## ภาษาไทย
 
-## AI providers
+โฟลเดอร์นี้คือ React + TypeScript + Vite frontend ของ ATRIUM UI จะคุยกับ backend จริงผ่าน REST และ WebSocket เท่านั้น ค่าเริ่มต้นคือ backend local ที่ `http://127.0.0.1:8787`
 
-ATRIUM tracks AI provider, Claude model, and thinking effort per department.
-Claude Code is the default provider for testing and production work.
+ถ้าต้องการรันทั้งระบบ ให้เริ่มจาก [README หลัก](../README.md)
 
-```sh
-export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+### วิธีที่แนะนำ
+
+จาก repo root:
+
+```bash
+./atrium setup
+./atrium start
 ```
 
-The UI always talks to the real ATRIUM backend over REST + WebSocket. It
-defaults to the local system service on `http://127.0.0.1:8787`;
-override the location with:
+บน Windows native:
 
-```sh
-export VITE_ATRIUM_API_URL="http://127.0.0.1:8787"
+```powershell
+.\atrium.ps1 setup
+.\atrium.ps1 start
 ```
 
-Regenerate the backend contract types after changing FastAPI routes or Pydantic
-models:
+เปิด UI:
 
-```sh
+```text
+http://127.0.0.1:5173
+```
+
+### รัน UI เอง
+
+ใช้เมื่อ backend เปิดอยู่แล้ว:
+
+```bash
+cd ui
+pnpm install
+VITE_ATRIUM_API_URL="http://127.0.0.1:8787" pnpm dev --host 127.0.0.1 --port 5173
+```
+
+ถ้าใช้ PowerShell:
+
+```powershell
+cd ui
+pnpm install
+$env:VITE_ATRIUM_API_URL="http://127.0.0.1:8787"
+pnpm dev --host 127.0.0.1 --port 5173
+```
+
+### Commands
+
+```bash
+pnpm lint
+pnpm build
+pnpm preview
 pnpm contract:sync
 ```
 
-Configured models:
+รัน `pnpm contract:sync` หลังเปลี่ยน FastAPI routes หรือ Pydantic models เพื่ออัปเดต OpenAPI contract types ใน frontend
 
-- `claude-sonnet-4-6`
-- `claude-opus-4-7`
-- `claude-opus-4-8`
+### Provider UI Notes
 
-The create-department default is Claude Code `claude-sonnet-4-6` with thinking
-effort `high`.
+ATRIUM แสดง provider, model และ thinking effort ต่อแผนก ค่า provider/model จริงควรเช็กจาก backend ผ่าน `status --json`, `/api/runtime` และ `/api/provider-auth/status` ไม่ใช่เดาจาก UI อย่างเดียว
 
-Thinking uses Claude adaptive thinking where supported. The selectable effort
-levels are `off`, `low`, `medium`, `high`, `xhigh`, and `max`; `xhigh` is only
-offered for Opus 4.7/4.8 because Claude docs list it for those models.
+## English
 
-Currently, two official plugins are available:
+This folder contains the React + TypeScript + Vite frontend. The UI talks to the real ATRIUM backend through REST and WebSocket. The default local backend is `http://127.0.0.1:8787`.
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+For full-stack setup, start from the [root README](../README.md).
 
-## React Compiler
+### Recommended Path
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+From the repo root:
 
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```bash
+./atrium setup
+./atrium start
 ```
 
-You can also install [eslint-plugin-react-x](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://github.com/Rel1cx/eslint-react/tree/main/packages/plugins/eslint-plugin-react-dom) for React-specific lint rules:
+On Windows native:
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
-
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
+```powershell
+.\atrium.ps1 setup
+.\atrium.ps1 start
 ```
+
+Open:
+
+```text
+http://127.0.0.1:5173
+```
+
+### Manual UI Run
+
+Use this when the backend is already running:
+
+```bash
+cd ui
+pnpm install
+VITE_ATRIUM_API_URL="http://127.0.0.1:8787" pnpm dev --host 127.0.0.1 --port 5173
+```
+
+PowerShell:
+
+```powershell
+cd ui
+pnpm install
+$env:VITE_ATRIUM_API_URL="http://127.0.0.1:8787"
+pnpm dev --host 127.0.0.1 --port 5173
+```
+
+### Commands
+
+```bash
+pnpm lint
+pnpm build
+pnpm preview
+pnpm contract:sync
+```
+
+Run `pnpm contract:sync` after changing FastAPI routes or Pydantic models so frontend OpenAPI types stay current.
+
+### Provider UI Notes
+
+ATRIUM tracks provider, model, and thinking effort per department. Treat backend status as the source of truth: use `status --json`, `/api/runtime`, and `/api/provider-auth/status` before making runtime claims from the UI alone.

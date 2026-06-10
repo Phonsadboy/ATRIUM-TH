@@ -1300,6 +1300,8 @@ class HostBridgeParityReportTest(unittest.TestCase):
 
         self.assertTrue(summary["ok"])
         self.assertEqual(summary["label"], "windows")
+        self.assertGreater(summary["artifactBytes"], 0)
+        self.assertRegex(summary["artifactSha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(summary["hostPlatform"], "win32")
         self.assertEqual(summary["statusPlatform"], "win32")
         self.assertEqual(summary["sourceManifestSha256"], artifact["source"]["sourceManifestSha256"])

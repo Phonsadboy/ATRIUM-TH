@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -110,6 +111,14 @@ def _hex40(value: Any) -> bool:
     return isinstance(value, str) and len(value) == 40 and all(ch in "0123456789abcdef" for ch in value)
 
 
+def _artifact_file_metadata(path: Path) -> dict[str, Any]:
+    data = path.read_bytes()
+    return {
+        "artifactBytes": len(data),
+        "artifactSha256": hashlib.sha256(data).hexdigest(),
+    }
+
+
 def _append_basic_artifact_metadata_findings(
     data: dict[str, Any],
     findings: list[str],
@@ -161,6 +170,11 @@ def summarize_artifact(
             "findings": findings,
         }
     assert data is not None
+    try:
+        file_metadata = _artifact_file_metadata(path)
+    except OSError as exc:
+        file_metadata = {}
+        findings.append(f"artifact file metadata could not be read: {type(exc).__name__}: {exc}")
     expected_source_fingerprint = str(expect_source_fingerprint or "").strip()
     expected_source_manifest_sha256 = str(expect_source_manifest_sha256 or "").strip()
     generated_at = data.get("generatedAt")
@@ -206,6 +220,7 @@ def summarize_artifact(
             "path": str(path),
             "label": label,
             "findings": findings,
+            **file_metadata,
             "schemaVersion": data.get("schemaVersion"),
             "mode": data.get("mode"),
             "probeOk": data.get("ok"),
@@ -307,6 +322,7 @@ def summarize_artifact(
         "path": str(path),
         "label": label,
         "findings": findings,
+        **file_metadata,
         "schemaVersion": data.get("schemaVersion"),
         "mode": data.get("mode"),
         "probeOk": data.get("ok"),

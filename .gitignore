@@ -56,7 +56,21 @@ playwright-report/
 **/test-results/
 **/playwright-report/
 
+# Docs and tests excluded from lightweight snapshots
+/docs/
+/doc/
+/documentation/
+*.md
+!README.md
+**/tests/
+**/test/
+**/test_*.py
+**/*_test.py
+**/*.test.*
+**/*.spec.*
+
 # Runtime artifacts
+/.atrium/
 /data/
 system/data/
 system/.venv/
@@ -89,6 +103,13 @@ ops/WEB_RESEARCH_DESIGN.md
 ops/eval/
 ops/*.pid
 ops/*.log
+browser-control-profiles/
+browser-profiles/
+**/browser-control-profiles/
+**/browser-profiles/
+*.db-journal
+.coverage
+coverage.xml
 .playwright-cli/
 .pytest_cache/
 .atrium_compile_result.txt
