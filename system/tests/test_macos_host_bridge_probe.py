@@ -125,6 +125,72 @@ class MacOSHostBridgeProbeTest(unittest.TestCase):
         self.assertEqual(calls, ["calculator", "textedit"])
         self.assertEqual(result["checks"]["interactiveNativeActRuntimeBlock"], {"api": None, "chat": None})
 
+    def test_macos_live_probe_promotes_desktop_ready_only_after_native_proof(self) -> None:
+        probe = _load_macos_probe_module()
+
+        def fake_calculator(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return {
+                "desktopActClick": {"returnCode": 0, "usedNativeAction": True},
+                "nativeActionVerified": True,
+                "displayValueVerified": True,
+            }
+
+        def fake_textedit(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return {
+                "desktopActSetText": {"returnCode": 0, "usedNativeAction": True},
+                "nativeActionVerified": True,
+                "textValueVerified": True,
+            }
+
+        with (
+            mock.patch.object(
+                probe.HostBridge,
+                "status",
+                lambda _self: type(
+                    "Status",
+                    (),
+                    {
+                        "to_dict": lambda _status: {
+                            "platform": "darwin",
+                            "shellExecutable": "/bin/bash",
+                            "browserBridge": True,
+                            "desktopBridge": True,
+                            "desktopAutomationReady": False,
+                            "macosVisualPreflightChecks": {"foregroundSession": None, "accessibility": False},
+                        }
+                    },
+                )(),
+            ),
+            mock.patch.object(probe, "_routes", return_value={}),
+            mock.patch.object(probe, "_runtime_blocks", return_value={}),
+            mock.patch.object(probe, "_runtime_block_for", return_value={"api": None, "chat": None}),
+            mock.patch.object(probe, "_shell_probe", return_value={"containsExpected": True}),
+            mock.patch.object(visual_bridge, "list_browser_profiles", return_value={"profiles": []}),
+            mock.patch.object(visual_bridge, "execute_list_apps", return_value={"returnCode": 0, "running": []}),
+            mock.patch.object(
+                visual_bridge,
+                "execute_desktop_snapshot",
+                return_value={"returnCode": 0, "refCount": 1, "snapshotBackend": "native_ax"},
+            ),
+            mock.patch.object(probe, "_interactive_calculator_probe", fake_calculator),
+            mock.patch.object(probe, "_interactive_textedit_probe", fake_textedit),
+        ):
+            result = probe._live(
+                screenshot=False,
+                notification=False,
+                applescript_clipboard=False,
+                browser_url=None,
+                browser_profile="atrium",
+                interactive=True,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["status"]["desktopAutomationReady"])
+        self.assertFalse(result["status"]["desktopAutomationPreflightReady"])
+        self.assertEqual(result["status"]["desktopAutomationProofSource"], "live_native_ax_probe")
+        self.assertTrue(result["status"]["macosVisualPreflightChecks"]["foregroundSession"])
+        self.assertEqual(result["status"]["macosVisualPreflightPreProofChecks"]["accessibility"], False)
+
     def test_macos_live_probe_skips_interactive_when_native_ref_action_is_blocked(self) -> None:
         probe = _load_macos_probe_module()
 
@@ -234,14 +300,65 @@ class MacOSHostBridgeProbeTest(unittest.TestCase):
         self.assertEqual(captured_quit["processId"], 123)
         self.assertEqual(captured_quit["appName"], "Calculator")
 
-    def test_macos_calculator_probe_requires_digit_one_ref(self) -> None:
+    def test_macos_calculator_probe_uses_exposed_digit_ref_when_one_is_missing(self) -> None:
+        probe = _load_macos_probe_module()
+        captured: dict[str, object] = {}
+
+        def ok_result(*_args: object, **_kwargs: object) -> dict[str, object]:
+            return {"returnCode": 0, "stdout": "", "stderr": "", "processId": 123}
+
+        def fake_desktop_act(args: dict[str, object], _run_process: object) -> dict[str, object]:
+            captured.update(args)
+            return {
+                "returnCode": 0,
+                "usedNativeAction": True,
+                "nativeAttempt": {
+                    "returnCode": 0,
+                    "method": "accessibility",
+                    "inputMethod": "accessibility",
+                    "nativeStatus": "OK",
+                    "nativeAction": "AXPress",
+                },
+                "after": {
+                    "returnCode": 0,
+                    "snapshot": {"elements": [{"role": "AXStaticText", "value": "2"}]},
+                },
+            }
+
+        with (
+            mock.patch.object(visual_bridge, "execute_list_apps", lambda _args, _run_process: {"returnCode": 0, "running": [], "installed": []}),
+            mock.patch.object(visual_bridge, "execute_open_app", lambda _args, _run_process: {"returnCode": 0}),
+            mock.patch.object(visual_bridge, "execute_activate_app", ok_result),
+            mock.patch.object(
+                visual_bridge,
+                "execute_desktop_snapshot",
+                lambda _args, _run_process: {
+                    "returnCode": 0,
+                    "refCount": 1,
+                    "actionableRefCount": 1,
+                    "processId": 123,
+                    "snapshot": {"elements": [{"ref": "d2", "role": "AXButton", "name": "2", "nativeSupportedActions": ["click"], "axActions": ["AXPress"]}]},
+                },
+            ),
+            mock.patch.object(visual_bridge, "execute_desktop_act", fake_desktop_act),
+            mock.patch.object(visual_bridge, "execute_quit_app", lambda _args, _run_process: {"returnCode": 0, "quitVerified": True}),
+            mock.patch.object(probe.time, "sleep", lambda _seconds: None),
+        ):
+            result = probe._interactive_calculator_probe()
+
+        self.assertNotIn("error", result)
+        self.assertEqual(captured["ref"], "d2")
+        self.assertEqual(result["expectedDisplayValue"], "2")
+        self.assertTrue(result["displayValueVerified"])
+
+    def test_macos_calculator_probe_requires_digit_ref(self) -> None:
         probe = _load_macos_probe_module()
 
         def ok_result(*_args: object, **_kwargs: object) -> dict[str, object]:
             return {"returnCode": 0, "stdout": "", "stderr": "", "processId": 123}
 
         def fail_desktop_act(*_args: object, **_kwargs: object) -> dict[str, object]:
-            raise AssertionError("Calculator probe must not click a fallback button when digit 1 is missing")
+            raise AssertionError("Calculator probe must not click a fallback button when digit refs are missing")
 
         with (
             mock.patch.object(visual_bridge, "execute_list_apps", lambda _args, _run_process: {"returnCode": 0, "running": [], "installed": []}),
@@ -264,7 +381,7 @@ class MacOSHostBridgeProbeTest(unittest.TestCase):
         ):
             result = probe._interactive_calculator_probe()
 
-        self.assertEqual(result["error"], "desktop.snapshot did not expose the Calculator digit 1 ref for desktop.act")
+        self.assertEqual(result["error"], "desktop.snapshot did not expose a Calculator digit ref for desktop.act")
 
     def test_macos_textedit_probe_continues_native_action_when_activation_degrades(self) -> None:
         probe = _load_macos_probe_module()

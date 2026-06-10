@@ -22,6 +22,66 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 WINDOWS_INTERACTIVE_NATIVE_TEXT = "ATRIUM Windows ValuePattern probe ไทย"
 
 
+def _powershell_braces_are_balanced(script: str) -> bool:
+    depth = 0
+    in_single = False
+    in_double = False
+    in_line_comment = False
+    in_block_comment = False
+    i = 0
+    while i < len(script):
+        ch = script[i]
+        nxt = script[i + 1] if i + 1 < len(script) else ""
+        if in_line_comment:
+            if ch in "\r\n":
+                in_line_comment = False
+            i += 1
+            continue
+        if in_block_comment:
+            if ch == "#" and nxt == ">":
+                in_block_comment = False
+                i += 2
+                continue
+            i += 1
+            continue
+        if in_single:
+            if ch == "'" and nxt == "'":
+                i += 2
+                continue
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if in_double:
+            if ch == "`":
+                i += 2
+                continue
+            if ch == '"':
+                in_double = False
+            i += 1
+            continue
+        if ch == "<" and nxt == "#":
+            in_block_comment = True
+            i += 2
+            continue
+        if ch == "#":
+            in_line_comment = True
+            i += 1
+            continue
+        if ch == "'":
+            in_single = True
+        elif ch == '"':
+            in_double = True
+        elif ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth < 0:
+                return False
+        i += 1
+    return depth == 0 and not in_single and not in_double and not in_block_comment
+
+
 def _fake_png(width: int = 100, height: int = 80) -> bytes:
     return (
         b"\x89PNG\r\n\x1a\n"
@@ -183,6 +243,8 @@ def _verified_parity_proofs() -> dict[str, dict[str, bool]]:
             "windowsForegroundActivation": True,
             "windowsUnicodeTyping": True,
             "windowsKeyboardShortcut": True,
+            "mcpExternalWriteReady": True,
+            "windowsLiveProofRunner": True,
             "notepadNativeAct": True,
             "clipboardRoundTrip": True,
         },
@@ -256,17 +318,85 @@ def _verified_parity_report(
 
 
 class WindowsHostBridgeTest(unittest.TestCase):
+    def test_windows_live_proof_runner_has_balanced_powershell_blocks(self) -> None:
+        script = (REPO_ROOT / "ops" / "windows_host_bridge_live_proof.ps1").read_text(encoding="utf-8")
+
+        self.assertTrue(_powershell_braces_are_balanced(script))
+
+    def test_windows_native_installer_prints_repo_directory_handoff(self) -> None:
+        script = (REPO_ROOT / "ops" / "install_windows_native.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("function ConvertTo-PowerShellSingleQuotedLiteral", script)
+        self.assertIn("Run the next commands from the repo directory", script)
+        self.assertIn("Set-Location -LiteralPath $installPathLiteral", script)
+        self.assertIn('cd /d ""$installFullPath"""', script)
+        self.assertIn(".\\atrium.ps1 doctor --json", script)
+        self.assertIn(".\\atrium.ps1 report --bundle", script)
+
     def test_windows_live_proof_runner_refreshes_common_paths_and_reports_cli_next_step(self) -> None:
         script = (REPO_ROOT / "ops" / "windows_host_bridge_live_proof.ps1").read_text(encoding="utf-8")
 
         self.assertIn("function Add-PathIfExists", script)
         self.assertIn("AppData\\Roaming\\npm", script)
+        self.assertIn("PowerShell\\7", script)
         self.assertIn("$UvCommand = Get-Command uv", script)
         self.assertIn("& $UvPath @Arguments", script)
         self.assertIn("SourceManifestSha256", script)
         self.assertIn("SourceFileCount", script)
         self.assertIn("--expect-source-manifest-sha256", script)
         self.assertIn("--expect-source-file-count", script)
+        self.assertIn("function Get-LiveProofPreflight", script)
+        self.assertIn("function Write-LiveProofFailureArtifact", script)
+        self.assertIn("function ConvertTo-PosixSingleQuotedLiteral", script)
+        self.assertIn("function ConvertTo-PowerShellSingleQuotedLiteral", script)
+        self.assertIn("function Get-LiveProofFailureNextSteps", script)
+        self.assertIn("[string][char]39", script)
+        self.assertIn("partialArtifact", script)
+        self.assertIn("failedStage", script)
+        self.assertIn("nextSteps = Get-LiveProofFailureNextSteps -FailedStage $FailedStage", script)
+        self.assertIn("'mcp_external_write' { @('.\\atrium.ps1 tools mcp-gateway --json', '.\\atrium.ps1 tools mcp-probe --json') }", script)
+        self.assertIn(".\\atrium.ps1 report --bundle", script)
+        self.assertIn("$existingArtifact = Get-Content -LiteralPath $OutputPath -Raw | ConvertFrom-Json -Depth 64", script)
+        self.assertIn("$CurrentStage = 'source_validate'", script)
+        self.assertIn("$CurrentStage = 'mcp_external_write'", script)
+        self.assertIn("$CurrentStage = 'windows_full_probe'", script)
+        self.assertIn("$CurrentStage = 'attach_mcp_proof'", script)
+        self.assertIn("$CurrentStage = 'attach_runner_proof'", script)
+        self.assertIn("$CurrentStage = 'artifact_validate'", script)
+        self.assertIn("-FailedStage $CurrentStage", script)
+        self.assertIn("function Get-McpExternalWriteProof", script)
+        self.assertIn("function Add-McpExternalWriteProofToArtifact", script)
+        self.assertIn("function Add-WindowsLiveProofRunnerToArtifact", script)
+        self.assertIn("MCP external-write readiness is required", script)
+        self.assertIn("setupCommand=.\\atrium.ps1 tools mcp-gateway --json", script)
+        self.assertIn("& $atriumScript tools mcp-probe --json", script)
+        self.assertIn("probeCommand=.\\atrium.ps1 tools mcp-probe --json", script)
+        self.assertIn("gatewayHealthOk", script)
+        self.assertIn("stage = 'mcp_external_write'", script)
+        self.assertIn("proofFacet = 'mcpExternalWriteReady'", script)
+        self.assertIn("probe = $true", script)
+        self.assertIn("mcpExternalWriteReady", script)
+        self.assertIn("windowsLiveProofRunner", script)
+        self.assertIn("failureStages = @(", script)
+        self.assertIn("readinessGates = [ordered]@{", script)
+        self.assertIn("browserDesktopSmoke = 'windows_full_probe'", script)
+        self.assertIn("ops/windows_host_bridge_live_proof.ps1", script)
+        self.assertIn(".\\atrium.ps1 automation windows-live-proof", script)
+        self.assertIn("Preferred gate: copy this artifact", script)
+        self.assertIn("automation accept-windows", script)
+        self.assertIn("--windows-source-path $OutputPathForPosixShell", script)
+        self.assertIn("--windows-source-path $OutputPathForPowerShell", script)
+        self.assertNotIn("<this Windows artifact path>", script)
+        self.assertIn("Manual verifier fallback", script)
+        self.assertIn("windows_live_proof_failed", script)
+        self.assertIn("windows_live_preflight", script)
+        self.assertIn("sourceFingerprint = $SourceFingerprint.ToLowerInvariant()", script)
+        self.assertIn("sourceManifestSha256 = $SourceManifestSha256.ToLowerInvariant()", script)
+        self.assertIn("sourceFileCount = $SourceFileCount", script)
+        self.assertIn("sessionName", script)
+        self.assertIn("isElevated", script)
+        self.assertIn("Get-CommandSource 'docker'", script)
+        self.assertIn("Set-Content -LiteralPath $OutputPath", script)
         self.assertIn("$RepoRoot = [System.IO.Path]::GetFullPath((Join-Path $ScriptDirectory '..'))", script)
         self.assertIn("'system/pyproject.toml'", script)
         self.assertIn("Set-Location -LiteralPath $RepoRoot", script)
@@ -2157,11 +2287,13 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertEqual(connectors["browser"]["proofStatus"], "local_blocked")
         self.assertIn("profile discovery ready", connectors["browser"]["proofGaps"][0])
         self.assertIn("./atrium automation report", connectors["browser"]["proofGaps"][-1])
+        self.assertIn("--max-artifact-age-hours 24.0", connectors["browser"]["proofGaps"][-1])
         self.assertEqual(connectors["desktop"]["status"], "blocked_by_runtime")
         self.assertTrue(connectors["desktop"]["readReady"])
         self.assertFalse(connectors["desktop"]["writeReady"])
         self.assertEqual(connectors["desktop"]["proofStatus"], "local_blocked")
         self.assertIn("./atrium automation report", connectors["desktop"]["proofGaps"][-1])
+        self.assertIn("--max-artifact-age-hours 24.0", connectors["desktop"]["proofGaps"][-1])
 
     def test_connector_catalog_reports_windows_visual_preflight_failure(self) -> None:
         class FakeStatus:
@@ -2302,6 +2434,8 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertIn("verified macOS+Windows full parity report", connectors["desktop"]["proofSummary"])
         self.assertIn("./atrium automation report", connectors["browser"]["proofGaps"][-1])
         self.assertIn("./atrium automation report", connectors["desktop"]["proofGaps"][-1])
+        self.assertIn("--max-artifact-age-hours 24.0", connectors["browser"]["proofGaps"][-1])
+        self.assertIn("--max-artifact-age-hours 24.0", connectors["desktop"]["proofGaps"][-1])
         self.assertEqual(connectors["local_file"]["proofStatus"], "not_required")
 
     def test_connector_catalog_marks_ready_host_bridge_as_cross_os_verified_from_persisted_report(self) -> None:
@@ -2339,6 +2473,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertIn("host-bridge-parity-report.json", connectors["browser"]["proofSummary"])
         self.assertEqual(connectors["browser"]["proofDetails"]["sourceFingerprint"], "a" * 64)
         self.assertEqual(connectors["browser"]["proofDetails"]["proofId"], report["proofId"])
+        self.assertEqual(connectors["browser"]["proofDetails"]["currentSourceFileCount"], len(main_module.SOURCE_FINGERPRINT_FILES))
         self.assertEqual(connectors["desktop"]["proofDetails"]["gitHead"], "b" * 40)
         self.assertEqual(connectors["browser"]["proofDetails"]["artifactSha256"]["macos"], "1" * 64)
         self.assertEqual(connectors["browser"]["proofDetails"]["artifactBytes"]["windows"], 2048)
@@ -2949,7 +3084,48 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_unverified")
         self.assertIn("current HostBridge source", " ".join(connectors["browser"]["proofGaps"]))
         self.assertEqual(connectors["browser"]["proofDetails"]["currentSourceFingerprint"], "c" * 64)
+        self.assertEqual(connectors["browser"]["proofDetails"]["currentSourceFileCount"], len(main_module.SOURCE_FINGERPRINT_FILES))
         self.assertEqual(connectors["desktop"]["proofDetails"]["currentGitDirty"], True)
+
+    def test_connector_catalog_rejects_verified_report_when_current_source_file_count_changed(self) -> None:
+        class FakeStatus:
+            def to_dict(self) -> dict[str, object]:
+                return {
+                    "platform": "win32",
+                    "browserBridge": True,
+                    "browserAutomationReady": True,
+                    "desktopBridge": True,
+                    "desktopAutomationReady": True,
+                    "isolatedBrowserProfileReady": True,
+                    "browserPlaywrightReady": True,
+                }
+
+        class FakeHostBridge:
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def status(self) -> FakeStatus:
+                return FakeStatus()
+
+        fake_profiles = {"browserApp": {"name": "Microsoft Edge", "path": "C:/Program Files/Microsoft/Edge/Application/msedge.exe"}}
+        connectors = self._connector_catalog_for_test(
+            FakeHostBridge,
+            fake_profiles,
+            parity_report=_verified_parity_report(),
+            current_source={
+                "sourceFingerprint": "a" * 64,
+                "sourceManifestSha256": "a" * 64,
+                "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES) + 1,
+                "gitHead": "b" * 40,
+                "gitDirty": False,
+            },
+        )
+
+        self.assertEqual(connectors["browser"]["proofStatus"], "cross_os_unverified")
+        self.assertEqual(connectors["desktop"]["proofStatus"], "cross_os_unverified")
+        gaps = " ".join(connectors["browser"]["proofGaps"])
+        self.assertIn("sourceFileCount does not match current HostBridge source", gaps)
+        self.assertEqual(connectors["browser"]["proofDetails"]["currentSourceFileCount"], len(main_module.SOURCE_FINGERPRINT_FILES) + 1)
 
     def test_connector_catalog_refuses_verified_report_when_current_local_runtime_is_blocked(self) -> None:
         class FakeStatus:
@@ -3171,6 +3347,8 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertEqual(payload["status"], "local_blocked")
         self.assertIn("loginwindow", " ".join(payload["gaps"]))
         self.assertEqual(payload["local"]["platform"], "darwin")
+        self.assertIn("localArtifacts", payload)
+        self.assertIn("windowsLocal", payload["localArtifacts"])
         self.assertEqual(payload["local"]["desktop"]["proofStatus"], "local_blocked")
         self.assertEqual(payload["local"]["macosVisualPreflight"]["ok"], False)
         self.assertEqual(payload["contract"]["target"], "openclaw_level_windows_host_parity")
@@ -3208,6 +3386,8 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertIn("--expect-source-file-count", payload["commands"]["macosProbe"])
         self.assertIn(payload["commands"]["sourceFileCount"], payload["commands"]["macosProbe"])
         self.assertIn(payload["commands"]["parityRunId"], payload["commands"]["macosProbe"])
+        self.assertIn("./atrium automation smoke", payload["commands"]["macosSmoke"])
+        self.assertIn("/tmp/atrium_host_bridge_macos_smoke.json", payload["commands"]["macosSmoke"])
         self.assertIn("ops/host_bridge_artifact_summary.py", payload["commands"]["macosArtifactValidate"])
         self.assertIn("--label macos", payload["commands"]["macosArtifactValidate"])
         self.assertIn(payload["commands"]["parityRunId"], payload["commands"]["macosArtifactValidate"])
@@ -3226,11 +3406,15 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertIn("--expect-source-file-count", payload["commands"]["windowsProbe"])
         self.assertIn(payload["commands"]["sourceFileCount"], payload["commands"]["windowsProbe"])
         self.assertIn(payload["commands"]["parityRunId"], payload["commands"]["windowsProbe"])
+        self.assertIn("C:\\Temp\\atrium_host_bridge_windows_probe.json", payload["commands"]["windowsProbe"])
+        self.assertIn(".\\atrium.ps1 automation smoke", payload["commands"]["nativeBrowserDesktopSmoke"])
+        self.assertIn("C:\\Temp\\atrium_host_bridge_windows_smoke.json", payload["commands"]["nativeBrowserDesktopSmoke"])
         self.assertIn(".\\atrium.ps1 automation windows-live-proof", payload["commands"]["windowsLiveProofRunner"])
         self.assertIn("--parity-run-id", payload["commands"]["windowsLiveProofRunner"])
         self.assertIn("--source-fingerprint", payload["commands"]["windowsLiveProofRunner"])
         self.assertIn("--source-manifest-sha256", payload["commands"]["windowsLiveProofRunner"])
         self.assertIn("--source-file-count", payload["commands"]["windowsLiveProofRunner"])
+        self.assertIn("--max-artifact-age-hours 24.0", payload["commands"]["windowsLiveProofRunner"])
         self.assertIn(payload["commands"]["parityRunId"], payload["commands"]["windowsLiveProofRunner"])
         self.assertIn(payload["commands"]["sourceFingerprint"], payload["commands"]["windowsLiveProofRunner"])
         self.assertIn(payload["commands"]["sourceManifestSha256"], payload["commands"]["windowsLiveProofRunner"])
@@ -3260,12 +3444,297 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertIn(payload["commands"]["sourceFileCount"], payload["commands"]["windowsArtifactValidateLocal"])
         self.assertIn("--max-artifact-age-hours 24.0", payload["commands"]["windowsArtifactValidateLocal"])
         self.assertIn("--json", payload["commands"]["windowsArtifactValidateLocal"])
+        self.assertIn("./atrium automation accept-windows", payload["commands"]["acceptWindowsArtifact"])
+        self.assertIn("/tmp/atrium_host_bridge_windows_live.json", payload["commands"]["acceptWindowsArtifact"])
+        self.assertIn("--handoff /tmp/atrium_windows_handoff.json", payload["commands"]["acceptWindowsArtifact"])
+        self.assertIn("--max-artifact-age-hours 24.0", payload["commands"]["acceptWindowsArtifact"])
+        self.assertIn("--windows-source-path 'C:\\Temp\\atrium_host_bridge_windows_live.json'", payload["commands"]["acceptWindowsArtifact"])
         self.assertIn("--windows /tmp/atrium_host_bridge_windows_live.json", payload["commands"]["automationReport"])
         self.assertIn("--max-artifact-age-hours 24.0", payload["commands"]["automationReport"])
         self.assertIn("--windows-source-path 'C:\\Temp\\atrium_host_bridge_windows_live.json'", payload["commands"]["automationReport"])
         self.assertIn("ops/host_bridge_parity_report.py", payload["commands"]["legacyParityReport"])
         self.assertIn("--max-artifact-age-hours 24.0", payload["commands"]["legacyParityReport"])
         self.assertIn("--output system/data/host-bridge-parity-report.json", payload["commands"]["legacyParityReport"])
+
+    def test_host_bridge_parity_commands_reuse_current_handoff_run_id(self) -> None:
+        source = {
+            "sourceFingerprint": "a" * 64,
+            "sourceManifestSha256": "a" * 64,
+            "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES),
+        }
+        commands = main_module._host_bridge_parity_commands(
+            "darwin",
+            source,
+            {
+                "handoff": {
+                    "usable": True,
+                    "sourceStatus": "current",
+                    "parityRunId": "atrium-handoff-run",
+                }
+            },
+        )
+
+        self.assertEqual(commands["parityRunId"], "atrium-handoff-run")
+        self.assertIn("atrium-handoff-run", commands["windowsLiveProofRunner"])
+        self.assertIn("atrium-handoff-run", commands["windowsArtifactValidateOnWindows"])
+
+    def test_host_bridge_parity_commands_ignore_stale_handoff_run_id(self) -> None:
+        source = {
+            "sourceFingerprint": "a" * 64,
+            "sourceManifestSha256": "a" * 64,
+            "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES),
+        }
+        commands = main_module._host_bridge_parity_commands(
+            "darwin",
+            source,
+            {
+                "handoff": {
+                    "usable": False,
+                    "sourceStatus": "stale",
+                    "parityRunId": "atrium-old-run",
+                }
+            },
+        )
+
+        self.assertNotEqual(commands["parityRunId"], "atrium-old-run")
+        self.assertRegex(commands["parityRunId"], r"^atrium-\d+-[0-9a-f-]{36}$")
+
+    def test_host_bridge_local_proof_artifacts_enriches_missing_windows_copy_step(self) -> None:
+        current_source = {
+            "sourceFingerprint": "a" * 64,
+            "sourceManifestSha256": "a" * 64,
+            "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES),
+        }
+        macos_payload = {
+            "ok": True,
+            "mode": "live",
+            "parityRunId": "atrium-run-1",
+            "generatedAt": 123,
+            "source": {"sourceFingerprint": "a" * 64},
+        }
+        handoff_payload = {
+            "ok": True,
+            "kind": "atrium.hostBridge.windowsProofHandoff",
+            "generatedAt": 124,
+            "source": {"sourceFingerprint": "a" * 64},
+            "macosArtifact": {"parityRunId": "atrium-run-1"},
+            "windowsProof": {
+                "outputPath": "C:\\Temp\\atrium_host_bridge_windows_live.json",
+                "copyInstruction": "Copy C:\\Temp\\atrium_host_bridge_windows_live.json from Windows",
+                "proofFacetCount": 2,
+                "requiredProofFacets": ["mcpExternalWriteReady", "windowsLiveProofRunner"],
+                "commands": {
+                    "liveProof": ".\\atrium.ps1 automation windows-live-proof --parity-run-id 'atrium-run-1'",
+                    "artifactValidate": ".\\atrium.ps1 automation artifact --label windows",
+                },
+                "operatorChecklist": [
+                    {"step": 1, "id": "native_setup_start", "command": ".\\atrium.ps1 setup --yes; .\\atrium.ps1 start; .\\atrium.ps1 status --json"},
+                    {"step": 2, "id": "native_permissions", "command": ".\\atrium.ps1 permissions status --json; .\\atrium.ps1 permissions set full_auto --agent-full-access true; .\\atrium.ps1 permissions status --json"},
+                    {"step": 3, "id": "native_provider_ai_tools", "command": ".\\atrium.ps1 provider status --probe --json; .\\atrium.ps1 provider reference --json; .\\atrium.ps1 provider env --json; .\\atrium.ps1 tools status --json; .\\atrium.ps1 tools catalog --json", "loginCommands": [".\\atrium.ps1 provider login chatgpt", ".\\atrium.ps1 provider login claude-code"]},
+                    {"step": 4, "id": "native_logs_report", "command": ".\\atrium.ps1 logs --json; .\\atrium.ps1 report --bundle"},
+                    {"step": 5, "id": "native_stop_restart", "command": ".\\atrium.ps1 stop; .\\atrium.ps1 restart --force; .\\atrium.ps1 status --json"},
+                    {"step": 6, "id": "mcp_gateway_status", "command": ".\\atrium.ps1 tools mcp-gateway --json; .\\atrium.ps1 tools mcp-probe --json; .\\atrium.ps1 tools status --json"},
+                    {"step": 7, "id": "native_browser_desktop_smoke", "command": ".\\atrium.ps1 automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium --output C:\\Temp\\atrium_host_bridge_windows_smoke.json"},
+                    {"step": 8, "id": "source_validate", "command": ".\\atrium.ps1 automation source --json"},
+                    {"step": 9, "id": "windows_live_proof", "command": ".\\atrium.ps1 automation windows-live-proof --parity-run-id 'atrium-run-1'"},
+                    {"step": 10, "id": "artifact_validate_on_windows", "command": ".\\atrium.ps1 automation artifact --label windows"},
+                    {"step": 11, "id": "copy_to_repo_host", "from": "C:\\Temp\\atrium_host_bridge_windows_live.json", "to": "/tmp/atrium_host_bridge_windows_live.json"},
+                    {"step": 12, "id": "generate_report", "command": "./atrium automation report"},
+                    {"step": 13, "id": "audit_gate", "command": "./atrium automation audit"},
+                ],
+            },
+        }
+
+        def fake_load(path: Path) -> tuple[dict[str, object] | None, str | None]:
+            path_text = str(path)
+            if path_text == "/tmp/atrium_host_bridge_macos_live.json":
+                return macos_payload, None
+            if path_text == "/tmp/atrium_windows_handoff.json":
+                return handoff_payload, None
+            if path_text == "/tmp/atrium_host_bridge_windows_live.json":
+                return None, "missing"
+            return None, "missing"
+
+        with mock.patch.object(main_module, "_host_bridge_load_json_file", side_effect=fake_load):
+            artifacts = main_module._host_bridge_local_proof_artifacts(current_source)
+
+        self.assertEqual(artifacts["macos"]["sourceStatus"], "current")
+        self.assertTrue(artifacts["macos"]["usable"])
+        self.assertEqual(artifacts["handoff"]["sourceStatus"], "current")
+        self.assertEqual(artifacts["handoff"]["contractStatus"], "stale")
+        self.assertFalse(artifacts["handoff"]["usable"])
+        self.assertTrue(artifacts["handoff"]["refreshRequired"])
+        self.assertEqual(artifacts["handoff"]["proofFacetCount"], 2)
+        self.assertEqual(artifacts["handoff"]["requiredProofFacets"], ["mcpExternalWriteReady", "windowsLiveProofRunner"])
+        self.assertFalse(artifacts["windowsLocal"]["exists"])
+        self.assertEqual(artifacts["windowsLocal"]["status"], "missing")
+        self.assertEqual(artifacts["windowsLocal"]["sourceStatus"], "current")
+        self.assertEqual(artifacts["windowsLocal"]["expectedContractStatus"], "stale")
+        self.assertEqual(artifacts["windowsLocal"]["contractStatus"], "stale")
+        self.assertFalse(artifacts["windowsLocal"]["usable"])
+        self.assertTrue(artifacts["windowsLocal"]["refreshRequired"])
+        self.assertEqual(artifacts["windowsLocal"]["expectedProofFacetCount"], 2)
+        self.assertEqual(artifacts["windowsLocal"]["requiredProofFacets"], ["mcpExternalWriteReady", "windowsLiveProofRunner"])
+        self.assertEqual(artifacts["windowsLocal"]["copySourcePath"], "C:\\Temp\\atrium_host_bridge_windows_live.json")
+        self.assertEqual(artifacts["windowsLocal"]["expectedParityRunId"], "atrium-run-1")
+        self.assertEqual(
+            [item["id"] for item in artifacts["windowsLocal"]["operatorChecklist"]],
+            [
+                "native_setup_start",
+                "native_permissions",
+                "native_provider_ai_tools",
+                "native_logs_report",
+                "native_stop_restart",
+                "mcp_gateway_status",
+                "native_browser_desktop_smoke",
+                "source_validate",
+                "windows_live_proof",
+                "artifact_validate_on_windows",
+                "copy_to_repo_host",
+                "generate_report",
+                "audit_gate",
+            ],
+        )
+        self.assertIn("windows-live-proof", artifacts["windowsLocal"]["liveProofCommand"])
+        self.assertIn("automation artifact", artifacts["windowsLocal"]["validateOnWindowsCommand"])
+
+    def test_host_bridge_local_proof_artifacts_marks_stale_handoff_unusable(self) -> None:
+        current_source = {
+            "sourceFingerprint": "b" * 64,
+            "sourceManifestSha256": "b" * 64,
+            "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES),
+        }
+        macos_payload = {
+            "ok": True,
+            "mode": "live",
+            "parityRunId": "atrium-run-1",
+            "generatedAt": 123,
+            "source": {"sourceFingerprint": "a" * 64},
+        }
+        handoff_payload = {
+            "ok": True,
+            "kind": "atrium.hostBridge.windowsProofHandoff",
+            "generatedAt": 124,
+            "source": {"sourceFingerprint": "a" * 64},
+            "macosArtifact": {"parityRunId": "atrium-run-1"},
+            "windowsProof": {
+                "outputPath": "C:\\Temp\\atrium_host_bridge_windows_live.json",
+                "copyInstruction": "Copy C:\\Temp\\atrium_host_bridge_windows_live.json from Windows",
+                "proofFacetCount": 2,
+                "requiredProofFacets": ["mcpExternalWriteReady", "windowsLiveProofRunner"],
+                "commands": {
+                    "liveProof": ".\\atrium.ps1 automation windows-live-proof --parity-run-id 'atrium-run-1'",
+                    "artifactValidate": ".\\atrium.ps1 automation artifact --label windows",
+                },
+            },
+        }
+
+        def fake_load(path: Path) -> tuple[dict[str, object] | None, str | None]:
+            path_text = str(path)
+            if path_text == "/tmp/atrium_host_bridge_macos_live.json":
+                return macos_payload, None
+            if path_text == "/tmp/atrium_windows_handoff.json":
+                return handoff_payload, None
+            if path_text == "/tmp/atrium_host_bridge_windows_live.json":
+                return None, "missing"
+            return None, "missing"
+
+        with mock.patch.object(main_module, "_host_bridge_load_json_file", side_effect=fake_load):
+            artifacts = main_module._host_bridge_local_proof_artifacts(current_source)
+
+        self.assertEqual(artifacts["macos"]["sourceStatus"], "stale")
+        self.assertFalse(artifacts["macos"]["usable"])
+        self.assertTrue(artifacts["macos"]["refreshRequired"])
+        self.assertEqual(artifacts["handoff"]["sourceStatus"], "stale")
+        self.assertFalse(artifacts["handoff"]["usable"])
+        self.assertTrue(artifacts["handoff"]["refreshRequired"])
+        self.assertEqual(artifacts["handoff"]["proofFacetCount"], 2)
+        self.assertEqual(artifacts["windowsLocal"]["expectedProofFacetCount"], 2)
+        self.assertEqual(artifacts["windowsLocal"]["sourceStatus"], "stale")
+        self.assertFalse(artifacts["windowsLocal"]["usable"])
+        self.assertTrue(artifacts["windowsLocal"]["refreshRequired"])
+        self.assertEqual(artifacts["windowsLocal"]["expectedSourceFingerprint"], "a" * 64)
+
+    def test_host_bridge_local_proof_artifacts_reports_failed_checks(self) -> None:
+        current_source = {
+            "sourceFingerprint": "a" * 64,
+            "sourceManifestSha256": "a" * 64,
+            "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES),
+        }
+        macos_payload = {
+            "ok": False,
+            "mode": "live",
+            "parityRunId": "atrium-run-1",
+            "generatedAt": 123,
+            "source": {"sourceFingerprint": "a" * 64},
+            "checks": {
+                "interactiveCalculator": {"error": "desktop.snapshot did not expose Calculator"},
+                "browserOpen": {"returnCode": 0},
+            },
+        }
+
+        def fake_load(path: Path) -> tuple[dict[str, object] | None, str | None]:
+            if str(path) == "/tmp/atrium_host_bridge_macos_live.json":
+                return macos_payload, None
+            return None, "missing"
+
+        with mock.patch.object(main_module, "_host_bridge_load_json_file", side_effect=fake_load):
+            artifacts = main_module._host_bridge_local_proof_artifacts(current_source)
+
+        self.assertEqual(artifacts["macos"]["sourceStatus"], "current")
+        self.assertFalse(artifacts["macos"]["usable"])
+        self.assertEqual(artifacts["macos"]["failedChecks"], ["interactiveCalculator"])
+
+    def test_host_bridge_local_proof_artifacts_preserves_windows_live_failure_artifact(self) -> None:
+        current_source = {
+            "sourceFingerprint": "c" * 64,
+            "sourceManifestSha256": "c" * 64,
+            "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES),
+        }
+        failure_payload = {
+            "ok": False,
+            "mode": "windows_live_proof_failed",
+            "parityRunId": "atrium-run-failed",
+            "generatedAt": 1781020000000,
+            "error": "Windows HostBridge live proof requires an interactive desktop session, not Services.",
+            "failedStage": "interactive_session",
+            "nextSteps": {
+                "failedStage": "interactive_session",
+                "commands": [".\\atrium.ps1 status --json"],
+            },
+            "partialArtifact": {"preserved": False},
+            "preflight": {
+                "sourceFingerprint": "c" * 64,
+                "sourceManifestSha256": "c" * 64,
+                "sourceFileCount": len(main_module.SOURCE_FINGERPRINT_FILES),
+                "os": {
+                    "isWindows": True,
+                    "sessionName": "Services",
+                    "isElevated": False,
+                },
+            },
+        }
+
+        def fake_load(path: Path) -> tuple[dict[str, object] | None, str | None]:
+            if str(path) == "/tmp/atrium_host_bridge_windows_live.json":
+                return failure_payload, None
+            return None, "missing"
+
+        with mock.patch.object(main_module, "_host_bridge_load_json_file", side_effect=fake_load):
+            artifacts = main_module._host_bridge_local_proof_artifacts(current_source)
+
+        self.assertTrue(artifacts["windowsLocal"]["exists"])
+        self.assertFalse(artifacts["windowsLocal"]["ok"])
+        self.assertFalse(artifacts["windowsLocal"]["usable"])
+        self.assertEqual(artifacts["windowsLocal"]["mode"], "windows_live_proof_failed")
+        self.assertEqual(artifacts["windowsLocal"]["sourceStatus"], "current")
+        self.assertEqual(artifacts["windowsLocal"]["failedChecks"], ["windows_live_proof_failed"])
+        self.assertEqual(artifacts["windowsLocal"]["failureStage"], "interactive_session")
+        self.assertEqual(artifacts["windowsLocal"]["failureNextSteps"]["failedStage"], "interactive_session")
+        self.assertFalse(artifacts["windowsLocal"]["failurePartialArtifact"]["preserved"])
+        self.assertEqual(artifacts["windowsLocal"]["error"], "Windows HostBridge live proof requires an interactive desktop session, not Services.")
+        self.assertEqual(artifacts["windowsLocal"]["preflight"]["sessionName"], "Services")
+        self.assertTrue(artifacts["windowsLocal"]["preflight"]["isWindows"])
 
     def test_host_bridge_parity_status_accepts_verified_report_and_endpoint_handler(self) -> None:
         class FakeStatus:
@@ -3328,10 +3797,34 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertEqual(payload["report"]["proofId"], report["proofId"])
         self.assertEqual(payload["report"]["parityRunId"], "parity-run-1")
         self.assertEqual(payload["report"]["artifactSha256"]["windows"], "2" * 64)
+        self.assertTrue(payload["nativeParityMatrix"]["nativeOnly"])
+        self.assertTrue(payload["nativeParityMatrix"]["windowsNativeHostOnly"])
+        matrix_surfaces = {item["id"] for item in payload["nativeParityMatrix"]["surfaces"]}
+        self.assertIn("provider_login", matrix_surfaces)
+        self.assertIn("browser_desktop_tools", matrix_surfaces)
+        provider_surface = next(item for item in payload["nativeParityMatrix"]["surfaces"] if item["id"] == "provider_login")
+        self.assertIn(".\\atrium.ps1 provider disconnect chatgpt", provider_surface["windows"])
+        ai_tools_surface = next(item for item in payload["nativeParityMatrix"]["surfaces"] if item["id"] == "ai_tools")
+        self.assertIn(".\\atrium.ps1 tools mcp-probe --json", ai_tools_surface["windows"])
         self.assertEqual(payload["contract"]["status"], "cross_os_verified")
         self.assertTrue(payload["contract"]["noSilentDegradation"])
         self.assertTrue(payload["contract"]["windowsNativePrimary"])
         self.assertTrue(payload["contract"]["windowsNativeOnly"])
+        runtime_requirement = next(
+            item for item in payload["contract"]["apiSurfaceRequirements"]
+            if item["id"] == "runtime_status"
+        )
+        self.assertTrue(runtime_requirement["registered"])
+        self.assertTrue(runtime_requirement["currentDetails"]["nativeRuntimeField"])
+        self.assertTrue(runtime_requirement["currentDetails"]["nativeRuntimeHelper"])
+        macos_lifecycle_requirement = next(
+            item for item in payload["contract"]["localRequirements"]
+            if item["id"] == "macos_native_lifecycle"
+        )
+        self.assertFalse(macos_lifecycle_requirement["currentHostApplies"])
+        self.assertTrue(macos_lifecycle_requirement["currentReady"])
+        self.assertIn("./atrium automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium", macos_lifecycle_requirement["requiredEvidence"])
+        self.assertIn("./atrium report --bundle", macos_lifecycle_requirement["requiredEvidence"])
         lifecycle_requirement = next(
             item for item in payload["contract"]["localRequirements"]
             if item["id"] == "windows_native_lifecycle"
@@ -3344,16 +3837,36 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertTrue(lifecycle_requirement["currentDetails"]["installWindowsNativeSafety"])
         self.assertTrue(lifecycle_requirement["currentDetails"]["atriumCli"])
         self.assertTrue(lifecycle_requirement["currentDetails"]["pidFiles"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["entrypointDiagnostics"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["openclawLifecycleProofPackage"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["doctorJson"])
         self.assertTrue(lifecycle_requirement["currentDetails"]["statusJson"])
         self.assertTrue(lifecycle_requirement["currentDetails"]["python3Validated"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["wingetRetry"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["lifecycleCommands"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["startReadinessGate"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["nativeCommandHints"])
         self.assertTrue(lifecycle_requirement["currentDetails"]["logsJson"])
         self.assertTrue(lifecycle_requirement["currentDetails"]["supportBundle"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["supportBundleMcpGateway"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["supportBundleMcpProbe"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["nativeNextChecks"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["nativeParityMatrix"])
+        self.assertTrue(lifecycle_requirement["currentDetails"]["permissionsCommandSurface"])
         self.assertTrue(lifecycle_requirement["currentDetails"]["selfUpdateRestart"])
         self.assertIn(".\\atrium.ps1 status --json", lifecycle_requirement["requiredEvidence"])
+        self.assertIn(".\\atrium.ps1 stop", lifecycle_requirement["requiredEvidence"])
+        self.assertIn(".\\atrium.ps1 doctor --json", lifecycle_requirement["requiredEvidence"])
         self.assertIn(".\\atrium.ps1 logs --json", lifecycle_requirement["requiredEvidence"])
         self.assertIn(".\\atrium.ps1 report --bundle", lifecycle_requirement["requiredEvidence"])
+        self.assertIn(".\\atrium.ps1 permissions status --json", lifecycle_requirement["requiredEvidence"])
+        self.assertIn(".\\atrium.ps1 permissions set full_auto --agent-full-access true", lifecycle_requirement["requiredEvidence"])
         self.assertIn("runnable Python 3 validation in .\\atrium.ps1 setup", lifecycle_requirement["requiredEvidence"])
         self.assertIn("UI self-update restart through .\\atrium.ps1 restart --force", lifecycle_requirement["requiredEvidence"])
+        self.assertIn("start readiness gate with backend/frontend port owners and redacted diagnostics", lifecycle_requirement["requiredEvidence"])
+        self.assertIn("OpenClaw lifecycle proof checklist in entrypoint payload", lifecycle_requirement["requiredEvidence"])
+        self.assertIn("guided setup next-check checklist", lifecycle_requirement["requiredEvidence"])
+        self.assertIn("OS-native setup and blocked-command next-step hints", lifecycle_requirement["requiredEvidence"])
         entrypoint_requirement = next(
             item for item in payload["contract"]["localRequirements"]
             if item["id"] == "windows_native_entrypoints"
@@ -3361,10 +3874,34 @@ class WindowsHostBridgeTest(unittest.TestCase):
         entrypoint_evidence = " ".join(str(item) for item in entrypoint_requirement["requiredEvidence"])
         self.assertIn("atrium.cmd", entrypoint_evidence)
         self.assertIn("pwsh fallback", entrypoint_evidence)
+        self.assertIn("exit-code preservation", entrypoint_evidence)
+        self.assertIn("standard PowerShell install-path fallback", entrypoint_evidence)
+        self.assertIn("fresh install one-liner with standard PowerShell install-path fallback", entrypoint_evidence)
+        self.assertIn("installer PowerShell/pwsh setup handoff", entrypoint_evidence)
+        self.assertIn("post-start readiness diagnostics in entrypoint payload", entrypoint_evidence)
+        self.assertIn("OpenClaw lifecycle proof checklist in entrypoint payload", entrypoint_evidence)
+        self.assertIn("guided setup next-check checklist", entrypoint_evidence)
+        self.assertIn("native installer next-check commands for provider/tools/automation/report", entrypoint_evidence)
         self.assertIn("ops/atrium_cli.py", entrypoint_requirement["requiredEvidence"])
+        self.assertTrue(entrypoint_requirement["currentDetails"]["standardPowerShellPathFallback"])
+        self.assertTrue(entrypoint_requirement["currentDetails"]["freshInstallOneLiner"])
         self.assertTrue(entrypoint_requirement["currentDetails"]["installWindowsNativeBaseSafety"])
         self.assertTrue(entrypoint_requirement["currentDetails"]["installWindowsNativeSetupRunner"])
         self.assertTrue(entrypoint_requirement["currentDetails"]["installWindowsNativeSafety"])
+        self.assertTrue(entrypoint_requirement["currentDetails"]["entrypointDiagnostics"])
+        self.assertTrue(entrypoint_requirement["currentDetails"]["openclawLifecycleProofPackage"])
+        native_only_requirement = next(
+            item for item in payload["contract"]["localRequirements"]
+            if item["id"] == "windows_native_only_dependency_scan"
+        )
+        self.assertTrue(native_only_requirement["currentReady"])
+        self.assertEqual(native_only_requirement["currentDetails"]["hitCount"], 0)
+        self.assertIn("README.md", native_only_requirement["currentDetails"]["checkedScopes"])
+        self.assertIn("ops/install_windows_native.ps1", native_only_requirement["currentDetails"]["checkedScopes"])
+        self.assertIn("ops/atrium_cli.py", native_only_requirement["currentDetails"]["checkedScopes"])
+        self.assertIn("system/app/main.py", native_only_requirement["currentDetails"]["checkedScopes"])
+        self.assertIn("ops/windows_host_bridge_probe.py", native_only_requirement["currentDetails"]["checkedScopes"])
+        self.assertIn("ui/src/panels/console/ConnectorsPanel.tsx", native_only_requirement["currentDetails"]["checkedScopes"])
         provider_tools_requirement = next(
             item for item in payload["contract"]["localRequirements"]
             if item["id"] == "windows_native_provider_ai_tools"
@@ -3374,14 +3911,35 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertTrue(provider_tools_requirement["currentDetails"]["commandTools"])
         self.assertTrue(provider_tools_requirement["currentDetails"]["providerStatusJson"])
         self.assertTrue(provider_tools_requirement["currentDetails"]["providerStatusJsonRedaction"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["providerLogin"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["providerDisconnect"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["providerReferenceEnv"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["providerTargets"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["providerBackendEndpoints"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["chatgptStartEndpoint"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["chatgptDisconnectEndpoint"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["claudeCodeStartEndpoint"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["claudeCodeDisconnectEndpoint"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["providerWaitPolling"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["claudeCodeInteractiveLogin"])
         self.assertTrue(provider_tools_requirement["currentDetails"]["windowsUrlOpenNative"])
         self.assertIn(".\\atrium.ps1 provider status --probe --json", provider_tools_requirement["requiredEvidence"])
+        self.assertIn(".\\atrium.ps1 provider reference --json", provider_tools_requirement["requiredEvidence"])
+        self.assertIn(".\\atrium.ps1 provider env --json", provider_tools_requirement["requiredEvidence"])
+        self.assertIn(".\\atrium.ps1 provider disconnect claude-code", provider_tools_requirement["requiredEvidence"])
         self.assertIn("native Windows URL opener for provider OAuth", provider_tools_requirement["requiredEvidence"])
         self.assertTrue(provider_tools_requirement["currentDetails"]["toolsStatusJson"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["toolsMcpGatewayJson"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["toolsMcpProbeJson"])
         self.assertTrue(provider_tools_requirement["currentDetails"]["toolsCatalogJson"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["providerAuthReferenceEndpoint"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["providerAuthEnvEndpoint"])
         self.assertIn(".\\atrium.ps1 tools status --json", provider_tools_requirement["requiredEvidence"])
+        self.assertIn(".\\atrium.ps1 tools mcp-gateway --json", provider_tools_requirement["requiredEvidence"])
+        self.assertIn(".\\atrium.ps1 tools mcp-probe --json", provider_tools_requirement["requiredEvidence"])
         self.assertIn(".\\atrium.ps1 tools catalog --json", provider_tools_requirement["requiredEvidence"])
         self.assertTrue(provider_tools_requirement["currentDetails"]["toolCatalogEndpoint"])
+        self.assertTrue(provider_tools_requirement["currentDetails"]["mcpGatewayEndpoint"])
         command_gate_requirement = next(
             item for item in payload["contract"]["localRequirements"]
             if item["id"] == "openclaw_audit_report_commands"
@@ -3390,10 +3948,20 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertTrue(command_gate_requirement["currentDetails"]["automationAudit"])
         self.assertTrue(command_gate_requirement["currentDetails"]["automationStatusJson"])
         self.assertTrue(command_gate_requirement["currentDetails"]["automationHandoff"])
+        self.assertTrue(command_gate_requirement["currentDetails"]["automationWindowsProbe"])
+        self.assertTrue(command_gate_requirement["currentDetails"]["automationWindowsLiveProof"])
         self.assertTrue(command_gate_requirement["currentDetails"]["automationReport"])
+        self.assertTrue(command_gate_requirement["currentDetails"]["artifactFreshnessGate"])
         self.assertTrue(command_gate_requirement["currentDetails"]["defaultReportPath"])
         self.assertIn(".\\atrium.ps1 automation status --json", command_gate_requirement["requiredEvidence"])
         self.assertIn(".\\atrium.ps1 automation handoff --macos <macos-json>", command_gate_requirement["requiredEvidence"])
+        self.assertIn(".\\atrium.ps1 automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium", command_gate_requirement["requiredEvidence"])
+        self.assertIn(".\\atrium.ps1 automation windows-probe --full", command_gate_requirement["requiredEvidence"])
+        self.assertIn(".\\atrium.ps1 automation windows-live-proof --parity-run-id <run-id>", command_gate_requirement["requiredEvidence"])
+        self.assertIn(
+            ".\\atrium.ps1 automation report --macos <macos-json> --windows <copied-windows-json> --max-artifact-age-hours 24.0",
+            command_gate_requirement["requiredEvidence"],
+        )
         self.assertTrue(all(item["currentReady"] for item in payload["contract"]["reportRequirements"]))
         report_requirement_ids = {item["id"] for item in payload["contract"]["reportRequirements"]}
         self.assertIn("proof_id_bound_to_artifacts", report_requirement_ids)
@@ -3417,8 +3985,15 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertEqual(payload["connectors"][1]["proofStatus"], "cross_os_verified")
         self.assertEqual(payload["commands"]["automationReport"], payload["commands"]["report"])
         self.assertIn(".\\atrium.ps1 automation report", payload["commands"]["automationReport"])
-        self.assertEqual(payload["commands"]["verify"], ".\\atrium.ps1 automation audit")
-        self.assertIn("system/data/host-bridge-parity-report.json", payload["commands"]["legacyParityReport"])
+
+    def test_windows_native_only_scan_flags_non_native_fallback_terms(self) -> None:
+        bad_term = "non-native windows fallback"
+        scan = main_module._windows_native_only_text_scan({"README.md": f"Use {bad_term} for Windows."})
+
+        self.assertFalse(scan["ok"])
+        self.assertEqual(scan["hitCount"], 1)
+        self.assertEqual(scan["hits"][0]["scope"], "README.md")
+        self.assertEqual(scan["hits"][0]["term"], bad_term)
 
     def test_host_bridge_parity_status_reports_openclaw_contract_gaps_when_report_proof_is_verified(self) -> None:
         class FakeStatus:
@@ -3568,6 +4143,29 @@ class WindowsHostBridgeTest(unittest.TestCase):
         self.assertTrue(mcp_requirement["degradedByLocalFallback"])
         self.assertFalse(mcp_requirement["ready"])
         self.assertIn("ATRIUM_MCP_GATEWAY_URL", " ".join(mcp_requirement["externalWriteRequires"]))
+        self.assertTrue(mcp_requirement["currentDetails"]["localFallbackOnly"])
+        self.assertFalse(mcp_requirement["currentDetails"]["gatewayConfigured"])
+        self.assertFalse(mcp_requirement["currentDetails"]["externalWriteReady"])
+        self.assertIn("ATRIUM_MCP_GATEWAY_URL", mcp_requirement["currentDetails"]["requiredEnvironment"])
+        self.assertEqual(mcp_requirement["currentDetails"]["setupCommand"], ".\\atrium.ps1 tools mcp-gateway --json")
+        self.assertEqual(mcp_requirement["currentDetails"]["probeCommand"], ".\\atrium.ps1 tools mcp-probe --json")
+        self.assertIn("/api/tools/mcp-gateway?probe=true", mcp_requirement["currentDetails"]["statusCommand"])
+
+    def test_mcp_gateway_status_payload_marks_windows_live_proof_blocker_stage(self) -> None:
+        settings = main_module.get_settings().model_copy(update={
+            "mcp_gateway_url": "",
+            "mcp_gateway_token": "",
+            "mcp_enabled_servers": "",
+        })
+        with mock.patch.object(main_module, "get_settings", lambda: settings):
+            payload = main_module._mcp_gateway_status_payload(probe=True)
+
+        self.assertFalse(payload["ready"])
+        self.assertTrue(payload["proofBlocker"]["blocked"])
+        self.assertEqual(payload["proofBlocker"]["stage"], "mcp_external_write")
+        self.assertEqual(payload["proofBlocker"]["runner"], "ops/windows_host_bridge_live_proof.ps1")
+        self.assertEqual(payload["proofBlocker"]["proofFacet"], "mcpExternalWriteReady")
+        self.assertIn("ATRIUM_MCP_GATEWAY_URL", " ".join(payload["proofBlocker"]["requirements"]))
 
     def test_openclaw_level_contract_refuses_broken_cmd_entrypoint(self) -> None:
         host_bridge_status = {
@@ -3605,28 +4203,71 @@ class WindowsHostBridgeTest(unittest.TestCase):
             if path_text.endswith("install_windows_native.ps1"):
                 return (
                     "Assert-SafeInstallPath\nTest-Python3Available\nInstall-PythonIfMissing\n"
-                    "Invoke-Native\n$LASTEXITCODE\nPython3*\nPython312\nPython311\nOneDrive\nDesktop\nDocuments\nDownloads\n"
+                    "Invoke-Native\nInvoke-WingetInstall\n$LASTEXITCODE\nwinget source update\nPython3*\nPython312\nPython311\nOneDrive\nDesktop\nDocuments\nDownloads\n"
+                    "Exe = \"python3\"\n"
                     "Test-BrowserInstalled\nInstall-WingetPackageIfMissing\nDocker.DockerDesktop\nGoogle.Chrome\n"
                     "BraveSoftware\nChromium\nAnthropic.ClaudeCode\ncorepack enable failed\n"
-                    "corepack pnpm activation failed\nClaude Code npm install failed\n\".\\atrium.ps1\"\n\"setup\"\n\"--yes\"\n"
+                    "corepack pnpm activation failed\nClaude Code npm install failed\nNo supported browser is available yet\n\".\\atrium.ps1\"\n\"setup\"\n\"--yes\"\n"
+                    "ConvertTo-PowerShellSingleQuotedLiteral\nRun the next commands from the repo directory\n"
+                    "Set-Location -LiteralPath $installPathLiteral\ncd /d \"\"$installFullPath\"\"\"\n"
+                    ".\\atrium.ps1 start\n.\\atrium.ps1 stop\n"
+                    ".\\atrium.ps1 provider reference --json\n.\\atrium.ps1 provider env --json\n"
+                    ".\\atrium.ps1 permissions status --json\n.\\atrium.ps1 permissions set full_auto --agent-full-access true\n"
+                    ".\\atrium.ps1 tools mcp-gateway --json\n.\\atrium.ps1 tools mcp-probe --json\n"
+                    ".\\atrium.ps1 automation source --json\n"
+                    ".\\atrium.ps1 automation windows-live-proof --parity-run-id <run-id> --source-fingerprint <fingerprint> --source-manifest-sha256 <manifest> --source-file-count <count> --max-artifact-age-hours 24.0\n"
+                    ".\\atrium.ps1 automation artifact --label windows --max-artifact-age-hours 24.0\n"
+                    "raw diagnostic; automation smoke is the normal native smoke command\n"
+                    ".\\atrium.ps1 automation smoke\n"
+                    ".\\atrium.ps1 automation windows-probe --full\n"
                 )
             if path_text.endswith("atrium_cli.py"):
                 return (
-                    "BACKEND_PID\nUI_PID\npid_detail\nwindows_process_details\nwindows_process_status\nreport_command_path\ndef command_provider\n"
+                    "BACKEND_PID\nUI_PID\npid_detail\nwindows_process_identity\nprocessIdentity\n"
+                    "windows_process_details\nwindows_process_status\nwindows_popen_command\nsubprocess.list2cmdline\n\".cmd\", \".bat\"\nreport_command_path\n"
+                    "def command_start\ndef command_start_windows\ndef command_stop\ndef command_restart\n"
+                    "start.set_defaults(func=command_start)\nstop.set_defaults(func=command_stop)\nrestart.set_defaults(func=command_restart)\n"
+                    "windows_stop_process_tree\nwindows_stop_process(\ndef command_provider\n"
+                    "postStartReadiness\nnativeInstallerNextChecks\n"
+                    "windows_openclaw_lifecycle_commands\nopenclawLifecycleProof\nnativeStart\nnativeStop\nnativeRestart\n"
+                    "nativeStatusJson\nnativeLogsJson\nnativeReportBundle\nnativePermissionsStatusJson\nnativePermissionsSetFullAuto\n"
+                    "nativeProviderStatusProbeJson\nnativeProviderReferenceJson\nnativeProviderEnvJson\nnativeProviderLoginChatGPT\nnativeProviderLoginClaudeCode\n"
+                    "nativeProviderDisconnectChatGPT\nnativeProviderDisconnectClaudeCode\n"
+                    "nativeToolsStatusJson\nnativeToolsCatalogJson\nmcpGatewaySetupJson\nmcpGatewayProbeJson\nnativeBrowserDesktopSmoke\nnative_setup_start\nnative_permissions\nnative_provider_ai_tools\naccountSwitchCommands\nnative_logs_report\nnative_stop_restart\nmcp_gateway_status\nnative_browser_desktop_smoke\n"
+                    "windows.entrypoints.openclawLifecycleProof.ok\nopenclawLifecycleProof.checklist\n"
+                    "def collect_doctor_payload\ndoctor.add_argument(\"--json\"\nredact_json_value(collect_doctor_payload())\ndef collect_docker_payload\n"
                     "def collect_status_payload\nstatus.add_argument(\"--json\"\nredact_json_value(collect_status_payload())\n"
+                    "toolCatalog\nhostBridgeSource\nlocalProofArtifacts\nnativeNextChecks\nnativeParityMatrix\n"
                     "def command_report\n--bundle\nzipfile.ZipFile\nsupport-report.txt\n"
-                    "diagnostics/status.json\ndiagnostics/process.json\ndiagnostics/logs.json\n"
+                    "diagnostics/doctor.json\ndiagnostics/status.json\ndiagnostics/process.json\ndiagnostics/windows-runtime.json\ndiagnostics/windows-entrypoints.json\ndiagnostics/logs.json\n"
+                    "diagnostics/native-next-checks.json\ndiagnostics/native-parity-matrix.json\ndiagnostics/docker.json\ndiagnostics/host-bridge-source.json\ndiagnostics/local-proof-artifacts.json\n"
                     "diagnostics/permission-mode.json\ndiagnostics/provider-status.json\n"
+                    "diagnostics/provider-reference.json\ndiagnostics/provider-env.json\n"
                     "diagnostics/tools-status.json\ndiagnostics/automation-status.json\nlogs/{label}.log\n"
+                    "provider_reference:\nprovider_env:\nsummarize_provider_reference_payload(provider_reference_payload\nsummarize_provider_env_payload(provider_env_payload\n"
                     "def command_logs\nlogs.add_argument(\"--json\"\nRun .\\\\atrium.ps1 start to create native\nredact_text\n"
                     "def collect_automation_status_payload\nnormalized[\"permissionMode\"]\n\"localArtifacts\"\n"
+                    "def command_permissions\npermissions_status.add_argument(\"--json\"\npermissions_set.add_argument(\"mode\"\npermissions_set.add_argument(\"--agent-full-access\"\nbackend_json_request(\"/api/permissions/mode\", method=\"PATCH\"\n"
                     "automation_permission.local_artifacts\nOwner Permissions\nLocal Proof Artifacts\nsummarize_full_autonomy\n"
-                    "def command_tools\nprovider_status.add_argument(\"--probe\"\n"
+                    "def command_tools\nmcp_gateway_setup_payload\ntools_mcp_gateway\nprovider_status.add_argument(\"--probe\"\n"
                     "provider_status.add_argument(\"--json\"\nredact_json_value\n"
+                    "provider_reference.add_argument(\"--json\"\nprovider_env.add_argument(\"--json\"\n"
+                    "summarize_provider_reference_payload\nsummarize_provider_env_payload\n"
+                    "\"chatgpt\": \"chatgpt\"\n\"chatgpt-account\": \"chatgpt\"\n\"claude\": \"claude-code\"\n\"claude-code\": \"claude-code\"\n"
+                    "provider_login.add_argument\nprovider_auth_start_path(target)\nauthorizationUrl\nopen_url(authorization_url.strip())\n"
+                    "wait_provider_ready(target\nrun_interactive([claude, \"auth\", \"login\", \"--claudeai\"]\n"
+                    "provider_auth_disconnect_path(target)\nprovider_disconnect.add_argument\nprovider_disconnect_summary(target, result)\n"
                     "getattr(os, \"startfile\"\nStart-Process -FilePath\nps_single_quote(url)\n"
-                    "/api/provider-auth/status\n/api/tools/catalog\n/api/connectors\n"
+                    "/api/provider-auth/status\n/api/provider-auth/reference\n/api/provider-auth/env\n/api/tools/catalog\n/api/connectors\n"
                     "/api/runtime\n/api/permissions/mode\n/api/host-bridge/parity\n"
-                    "summarize_tool_catalog_payload\naction == \"audit\"\naction == \"artifact\"\naction == \"report\"\n"
+                    "def run_winget_install\n\"source\", \"update\"\n--accept-source-agreements\n--accept-package-agreements\n"
+                    "Docker.DockerDesktop\nGoogle.Chrome\nAnthropic.ClaudeCode\nwinget install failed after source refresh\n"
+                    "ATRIUM did not become ready within\nBackend :8787 listener\nFrontend :5173 listener\n"
+                    "def print_post_start_readiness\nPost-start Readiness\n"
+                    "status --json\nlogs --json\n"
+                    "start_hint = local_cli_command(\"start\")\nwinget packages\nstart native Windows services\n"
+                    "summarize_tool_catalog_payload\naction == \"audit\"\naction == \"artifact\"\naction == \"handoff\"\naction == \"report\"\nautomation_sub.add_parser(\"smoke\"\n"
+                    "action == \"smoke\"\naction == \"windows-probe\"\naction == \"windows-live-proof\"\n--max-artifact-age-hours\n"
                     "HOST_BRIDGE_PARITY_REPORT\nops/host_bridge_parity_report.py\n"
                     "--skip-current-source-check\nonly allowed for offline historical audits written to a custom --output path\n"
                     "OpenClaw Windows contract\n"
@@ -3685,6 +4326,7 @@ class WindowsHostBridgeTest(unittest.TestCase):
                 "proofId": "a" * 64,
                 "expectedProofId": "a" * 64,
                 "currentSourceFingerprint": "b" * 64,
+                "currentSourceManifestSha256": "b" * 64,
                 "currentGitHead": "c" * 40,
                 "parityRunId": "parity-run-1",
             },
@@ -3701,9 +4343,12 @@ class WindowsHostBridgeTest(unittest.TestCase):
         artifact_requirement = next(item for item in contract["reportRequirements"] if item["id"] == "artifact_hash_and_size_recorded")
         source_requirement = next(item for item in contract["reportRequirements"] if item["id"] == "source_file_provenance_recorded")
         host_requirement = next(item for item in contract["reportRequirements"] if item["id"] == "host_identity_recorded")
+        proof_id_requirement = next(item for item in contract["reportRequirements"] if item["id"] == "proof_id_bound_to_artifacts")
         self.assertFalse(artifact_requirement["currentReady"])
         self.assertFalse(source_requirement["currentReady"])
         self.assertFalse(host_requirement["currentReady"])
+        self.assertFalse(proof_id_requirement["currentReady"])
+        self.assertIsNone(proof_id_requirement["currentDetails"].get("currentSourceFileCount"))
 
     def test_openclaw_command_surface_refuses_missing_report_gate(self) -> None:
         self.assertFalse(main_module._openclaw_windows_command_surface_ready('action == "audit"'))
@@ -3741,7 +4386,11 @@ class WindowsHostBridgeTest(unittest.TestCase):
             'action == "artifact"\n'
             'action == "handoff"\n'
             'action == "report"\n'
+            'action == "smoke"\n'
+            'action == "windows-probe"\n'
+            'action == "windows-live-proof"\n'
             'automation_status.add_argument("--json"\n'
+            '--max-artifact-age-hours\n'
             'HOST_BRIDGE_PARITY_REPORT\n'
             'ops/host_bridge_parity_report.py\n'
             '--skip-current-source-check\n'

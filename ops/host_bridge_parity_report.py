@@ -32,6 +32,18 @@ WINDOWS_INTERACTIVE_TYPE_TEXT = "ATRIUM Windows HostBridge probe ไทย"
 WINDOWS_INTERACTIVE_NATIVE_TEXT = "ATRIUM Windows ValuePattern probe ไทย"
 WINDOWS_INTERACTIVE_SESSION_NAMES = {"console"}
 WINDOWS_INTERACTIVE_SESSION_PREFIXES = ("rdp-", "ica-")
+WINDOWS_LIVE_PROOF_FAILURE_STAGES = {
+    "source_validate",
+    "mcp_external_write",
+    "windows_full_probe",
+    "artifact_validate",
+}
+WINDOWS_LIVE_PROOF_READINESS_GATES = {
+    "source": "source_validate",
+    "mcpExternalWrite": "mcp_external_write",
+    "browserDesktopSmoke": "windows_full_probe",
+    "artifactValidation": "artifact_validate",
+}
 
 OS_LABELS = {
     "macos": "darwin",
@@ -87,12 +99,71 @@ def _nested(data: dict[str, Any], *path: str) -> Any:
     return current
 
 
+def _artifact_source_value(data: dict[str, Any], key: str) -> Any:
+    nested = _nested(data, "source", key)
+    if isinstance(nested, str) and nested.strip():
+        return nested
+    if isinstance(nested, int) and not isinstance(nested, bool):
+        return nested
+    top_level = data.get(key)
+    if isinstance(top_level, str) and top_level.strip():
+        return top_level
+    if isinstance(top_level, int) and not isinstance(top_level, bool):
+        return top_level
+    preflight = data.get("preflight") if isinstance(data.get("preflight"), dict) else {}
+    preflight_value = preflight.get(key)
+    if isinstance(preflight_value, str) and preflight_value.strip():
+        return preflight_value
+    if isinstance(preflight_value, int) and not isinstance(preflight_value, bool):
+        return preflight_value
+    return top_level
+
+
+def _artifact_source_fingerprint(data: dict[str, Any]) -> Any:
+    return _artifact_source_value(data, "sourceFingerprint")
+
+
+def _live_proof_failure_details(label: str, data: dict[str, Any]) -> dict[str, Any] | None:
+    if data.get("mode") != "windows_live_proof_failed":
+        return None
+    preflight = data.get("preflight") if isinstance(data.get("preflight"), dict) else {}
+    os_preflight = preflight.get("os") if isinstance(preflight.get("os"), dict) else {}
+    error = str(data.get("error") or "Windows live proof runner failed before producing a full proof artifact.").strip()
+    finding = f"{label}: Windows live proof runner failed before full proof artifact was produced: {error}"
+    return {
+        "finding": finding,
+        "error": error,
+        "failedStage": data.get("failedStage"),
+        "partialArtifact": data.get("partialArtifact") if isinstance(data.get("partialArtifact"), dict) else None,
+        "nextSteps": data.get("nextSteps") if isinstance(data.get("nextSteps"), dict) else None,
+        "preflight": {
+            "sessionName": os_preflight.get("sessionName"),
+            "isWindows": os_preflight.get("isWindows"),
+            "isElevated": os_preflight.get("isElevated"),
+        },
+        "sourceFingerprint": _artifact_source_fingerprint(data),
+        "sourceManifestSha256": _artifact_source_value(data, "sourceManifestSha256"),
+        "sourceFileCount": _artifact_source_value(data, "sourceFileCount"),
+    }
+
+
 def _dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _list_contains_all(value: Any, expected: set[str]) -> bool:
+    if not isinstance(value, list):
+        return False
+    present = {item for item in value if isinstance(item, str)}
+    return expected.issubset(present)
+
+
 def _positive_int(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def _positive_number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0
 
 
 def _hex64(value: Any) -> bool:
@@ -208,6 +279,53 @@ def _windows_clipboard_round_trip_proof(value: Any) -> bool:
         and item.get("textBytes") == len(WINDOWS_INTERACTIVE_NATIVE_TEXT.encode("utf-8"))
         and item.get("expectedLength") == len(WINDOWS_INTERACTIVE_NATIVE_TEXT)
         and item.get("expectedBytes") == len(WINDOWS_INTERACTIVE_NATIVE_TEXT.encode("utf-8"))
+    )
+
+
+def _windows_mcp_external_write_proof(value: Any) -> bool:
+    item = _dict(value)
+    requirements = item.get("externalWriteRequires")
+    return (
+        item.get("ok") is True
+        and item.get("verified") is True
+        and item.get("returnCode") == 0
+        and item.get("stage") == "mcp_external_write"
+        and item.get("proofFacet") == "mcpExternalWriteReady"
+        and item.get("probe") is True
+        and item.get("ready") is True
+        and item.get("gatewayHealthOk") is True
+        and item.get("id") == "mcp"
+        and item.get("readReady") is True
+        and item.get("writeReady") is True
+        and item.get("localFallback") is False
+        and isinstance(requirements, list)
+        and not requirements
+        and item.get("probeCommand") == r".\atrium.ps1 tools mcp-probe --json"
+        and item.get("setupCommand") == r".\atrium.ps1 tools mcp-gateway --json"
+    )
+
+
+def _windows_live_proof_runner_attestation(data: dict[str, Any]) -> bool:
+    runner = _dict(_nested(data, "checks", "windowsLiveProofRunner"))
+    gates = _dict(runner.get("readinessGates"))
+    output_path = str(runner.get("outputPath") or "").strip()
+    repo_root = str(runner.get("repoRoot") or "").strip()
+    max_artifact_age_hours = runner.get("maxArtifactAgeHours")
+    return (
+        runner.get("ok") is True
+        and runner.get("verified") is True
+        and runner.get("runner") == "ops/windows_host_bridge_live_proof.ps1"
+        and runner.get("command") == r".\atrium.ps1 automation windows-live-proof"
+        and bool(repo_root)
+        and bool(output_path)
+        and _positive_number(max_artifact_age_hours)
+        and max_artifact_age_hours <= DEFAULT_MAX_ARTIFACT_AGE_HOURS
+        and _list_contains_all(runner.get("failureStages"), WINDOWS_LIVE_PROOF_FAILURE_STAGES)
+        and all(gates.get(key) == value for key, value in WINDOWS_LIVE_PROOF_READINESS_GATES.items())
+        and runner.get("parityRunId") == data.get("parityRunId")
+        and runner.get("sourceFingerprint") == _artifact_source_fingerprint(data)
+        and runner.get("sourceManifestSha256") == _artifact_source_value(data, "sourceManifestSha256")
+        and runner.get("sourceFileCount") == _artifact_source_value(data, "sourceFileCount")
     )
 
 
@@ -400,6 +518,8 @@ def _proof_summary(label: str, data: dict[str, Any]) -> dict[str, bool]:
             and _windows_unicode_type_proof(_nested(checks, "interactiveDesktop", "type")),
             "windowsKeyboardShortcut": _nested(checks, "interactiveDesktop", "selectAllKeypressVerified") is True
             and _windows_keypress_proof(_nested(checks, "interactiveDesktop", "keypress"), "a", ["control"]),
+            "mcpExternalWriteReady": _windows_mcp_external_write_proof(checks.get("mcpExternalWriteReady")),
+            "windowsLiveProofRunner": _windows_live_proof_runner_attestation(data),
             "notepadNativeAct": _windows_native_action_proof(
                 _nested(checks, "interactiveDesktop", "desktopActSetText"),
                 "ValuePattern",
@@ -514,6 +634,36 @@ def _check_artifact_metadata(
     git_head = source.get("gitHead")
     if not _hex40(git_head):
         findings.append(f"{label}: artifact gitHead is missing or invalid")
+    if not _valid_parity_run_id(data.get("parityRunId")):
+        findings.append(
+            f"{label}: artifact parityRunId is missing or invalid; rerun both full probes with the same --parity-run-id"
+        )
+
+
+def _check_failure_artifact_metadata(
+    label: str,
+    data: dict[str, Any],
+    findings: list[str],
+    *,
+    now_ms: int,
+    max_artifact_age_hours: float,
+) -> None:
+    if data.get("schemaVersion") != PROBE_SCHEMA_VERSION:
+        findings.append(f"{label}: artifact schemaVersion must be {PROBE_SCHEMA_VERSION}, got {data.get('schemaVersion')!r}")
+    generated_at = data.get("generatedAt")
+    if not isinstance(generated_at, int):
+        findings.append(f"{label}: artifact generatedAt is missing or invalid")
+    else:
+        if generated_at > now_ms + 5 * 60 * 1000:
+            findings.append(f"{label}: artifact generatedAt is in the future")
+        if max_artifact_age_hours > 0:
+            max_age_ms = int(max_artifact_age_hours * 60 * 60 * 1000)
+            age_ms = now_ms - generated_at
+            if age_ms > max_age_ms:
+                findings.append(
+                    f"{label}: artifact is stale; regenerate the Windows live proof failure artifact. "
+                    f"ageHours={age_ms / 3600000:.1f}; maxAgeHours={max_artifact_age_hours:.1f}"
+                )
     if not _valid_parity_run_id(data.get("parityRunId")):
         findings.append(
             f"{label}: artifact parityRunId is missing or invalid; rerun both full probes with the same --parity-run-id"
@@ -674,6 +824,10 @@ def _check_windows(data: dict[str, Any], findings: list[str]) -> None:
         and _windows_keypress_proof(_nested(checks, "interactiveDesktop", "keypress"), "a", ["control"])
     ):
         findings.append("windows: keyboard shortcut mapping proof is missing")
+    if not _windows_mcp_external_write_proof(checks.get("mcpExternalWriteReady")):
+        findings.append("windows: MCP external-write readiness proof is missing")
+    if not _windows_live_proof_runner_attestation(data):
+        findings.append("windows: Windows live proof runner attestation is missing")
     if not (
         _windows_native_action_proof(_nested(checks, "interactiveDesktop", "desktopActSetText"), "ValuePattern")
         and _nested(checks, "interactiveDesktop", "nativeValueVerified") is True
@@ -691,7 +845,7 @@ def _check_source_consistency(loaded: dict[str, dict[str, Any]], results: dict[s
     if set(loaded) != set(OS_LABELS):
         return
     source_fingerprints = {
-        label: _nested(data, "source", "sourceFingerprint")
+        label: _artifact_source_fingerprint(data)
         for label, data in loaded.items()
     }
     if all(isinstance(value, str) and value for value in source_fingerprints.values()):
@@ -733,6 +887,34 @@ def _check_source_consistency(loaded: dict[str, dict[str, Any]], results: dict[s
                 if label in results:
                     results[label]["ok"] = False
                     results[label].setdefault("findings", []).append(finding)
+    source_manifests = {
+        label: _artifact_source_value(data, "sourceManifestSha256")
+        for label, data in loaded.items()
+    }
+    if all(isinstance(value, str) and value for value in source_manifests.values()):
+        unique_manifests = set(source_manifests.values())
+        if len(unique_manifests) != 1:
+            detail = ", ".join(f"{label}={value}" for label, value in sorted(source_manifests.items()))
+            finding = f"source manifest mismatch: macOS and Windows artifacts were generated from different source manifests ({detail})"
+            findings.append(finding)
+            for label in OS_LABELS:
+                if label in results:
+                    results[label]["ok"] = False
+                    results[label].setdefault("findings", []).append(finding)
+    source_file_counts = {
+        label: _artifact_source_value(data, "sourceFileCount")
+        for label, data in loaded.items()
+    }
+    if all(_positive_int(value) for value in source_file_counts.values()):
+        unique_file_counts = set(source_file_counts.values())
+        if len(unique_file_counts) != 1:
+            detail = ", ".join(f"{label}={value}" for label, value in sorted(source_file_counts.items()))
+            finding = f"source file count mismatch: macOS and Windows artifacts were generated from different source file sets ({detail})"
+            findings.append(finding)
+            for label in OS_LABELS:
+                if label in results:
+                    results[label]["ok"] = False
+                    results[label].setdefault("findings", []).append(finding)
 
 
 def _check_current_source_consistency(
@@ -744,11 +926,37 @@ def _check_current_source_consistency(
     current_fingerprint = current_source.get("sourceFingerprint")
     if _hex64(current_fingerprint):
         for label, data in loaded.items():
-            fingerprint = _nested(data, "source", "sourceFingerprint")
+            fingerprint = _artifact_source_fingerprint(data)
             if _hex64(fingerprint) and fingerprint != current_fingerprint:
                 finding = (
                     f"{label}: artifact sourceFingerprint does not match current HostBridge source "
                     f"(artifact={fingerprint}, current={current_fingerprint})"
+                )
+                findings.append(finding)
+                if label in results:
+                    results[label]["ok"] = False
+                    results[label].setdefault("findings", []).append(finding)
+    current_manifest_sha256 = current_source.get("sourceManifestSha256")
+    if _hex64(current_manifest_sha256):
+        for label, data in loaded.items():
+            manifest_sha256 = _artifact_source_value(data, "sourceManifestSha256")
+            if _hex64(manifest_sha256) and manifest_sha256 != current_manifest_sha256:
+                finding = (
+                    f"{label}: artifact sourceManifestSha256 does not match current HostBridge source "
+                    f"(artifact={manifest_sha256}, current={current_manifest_sha256})"
+                )
+                findings.append(finding)
+                if label in results:
+                    results[label]["ok"] = False
+                    results[label].setdefault("findings", []).append(finding)
+    current_file_count = current_source.get("sourceFileCount")
+    if _positive_int(current_file_count):
+        for label, data in loaded.items():
+            source_file_count = _artifact_source_value(data, "sourceFileCount")
+            if _positive_int(source_file_count) and source_file_count != current_file_count:
+                finding = (
+                    f"{label}: artifact sourceFileCount does not match current HostBridge source "
+                    f"(artifact={source_file_count}, current={current_file_count})"
                 )
                 findings.append(finding)
                 if label in results:
@@ -835,6 +1043,47 @@ def evaluate_artifacts(
             }
             continue
         loaded_artifacts[label] = data
+        failure_details = _live_proof_failure_details(label, data)
+        if failure_details is not None:
+            item_findings.append(str(failure_details["finding"]))
+            _check_failure_artifact_metadata(
+                label,
+                data,
+                item_findings,
+                now_ms=current_time_ms,
+                max_artifact_age_hours=max_artifact_age_hours,
+            )
+            findings.extend(item_findings)
+            results[label] = {
+                "present": True,
+                "path": str(path),
+                "artifactSourcePath": source_path,
+                "proofSchemaVersion": PROOF_SCHEMA_VERSION,
+                **file_metadata,
+                "ok": False,
+                "mode": data.get("mode"),
+                "schemaVersion": data.get("schemaVersion"),
+                "generatedAt": data.get("generatedAt"),
+                "parityRunId": data.get("parityRunId"),
+                "sourceFingerprint": failure_details.get("sourceFingerprint"),
+                "sourceManifestSha256": failure_details.get("sourceManifestSha256"),
+                "sourceFileCount": failure_details.get("sourceFileCount"),
+                "sourceFileProvenanceCount": 0,
+                "gitHead": _nested(data, "source", "gitHead"),
+                "hostFingerprint": None,
+                "hostPlatform": None,
+                "hostName": None,
+                "probeOk": data.get("ok"),
+                "platform": None,
+                "proofs": _proof_summary(label, data),
+                "failureError": failure_details.get("error"),
+                "failureStage": failure_details.get("failedStage"),
+                "failurePartialArtifact": failure_details.get("partialArtifact"),
+                "failureNextSteps": failure_details.get("nextSteps"),
+                "failurePreflight": failure_details.get("preflight"),
+                "findings": item_findings,
+            }
+            continue
         _check_common(
             label,
             data,

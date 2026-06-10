@@ -230,6 +230,45 @@ class BrowserPlaywrightToolsTest(unittest.TestCase):
         self.assertEqual(result["backend"], "playwright")
         self.assertEqual(result["profile"], "atrium")
 
+    def test_browser_playwright_default_runner_terminates_process_tree_on_timeout(self) -> None:
+        class FakeProcess:
+            pid = 4242
+            returncode = None
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def communicate(self, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired(["node", "helper"], timeout, output=b"partial stdout", stderr=None)
+                self.returncode = -9
+                return b"partial stdout", b""
+
+            def poll(self):
+                return None
+
+            def wait(self, timeout=None):
+                self.returncode = -15
+                return self.returncode
+
+        fake_process = FakeProcess()
+        with (
+            mock.patch.object(visual_bridge.subprocess, "Popen", return_value=fake_process),
+            mock.patch.object(visual_bridge, "_terminate_process_tree") as terminate,
+        ):
+            result = visual_bridge._run_browser_playwright_process(
+                ["node", "helper", "{}"],
+                cwd=Path("/tmp"),
+                timeout=0.01,
+                env={},
+            )
+
+        terminate.assert_called_once_with(fake_process)
+        self.assertTrue(result["timeout"])
+        self.assertTrue(result["processTreeTerminated"])
+        self.assertEqual(result["stdout"], "partial stdout")
+
     def test_execute_browser_act_rejects_user_profile_without_running_process(self) -> None:
         def fail_run(*_args, **_kwargs):
             raise AssertionError("browser.act with user profile should not execute a process")

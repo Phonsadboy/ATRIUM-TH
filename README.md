@@ -64,6 +64,30 @@ cd ~/Projects/ai-company
 ./atrium setup
 ```
 
+คำสั่งตรวจหลังติดตั้ง:
+
+```bash
+./atrium doctor --json
+./atrium status --json
+./atrium provider status --probe --json
+./atrium provider reference --json
+./atrium provider env --json
+./atrium provider login chatgpt
+./atrium provider login claude-code
+./atrium provider disconnect chatgpt
+./atrium provider disconnect claude-code
+./atrium permissions status --json
+./atrium permissions set full_auto --agent-full-access true
+./atrium tools status --json
+./atrium tools mcp-gateway --json
+./atrium tools mcp-probe --json
+./atrium tools catalog --json
+./atrium automation status --commands
+./atrium automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium --output /tmp/atrium_host_bridge_macos_smoke.json
+./atrium logs --json
+./atrium report --bundle
+```
+
 สคริปต์จะเตรียมเครื่อง, ติดตั้ง dependency ที่ขาด, bootstrap full stack, start backend/frontend, ตรวจสถานะ และเปิด browser ไปที่ `http://127.0.0.1:5173`
 
 #### วิธีที่ 2: ให้ Codex/Claude ทำให้
@@ -75,7 +99,7 @@ cd ~/Projects/ai-company
 ใช้ path ~/Projects/ai-company
 ห้ามวาง repo ใน iCloud Drive, Desktop หรือ Documents ที่ sync กับ iCloud
 ให้ clone repo ถ้ายังไม่มี แล้วรัน ./atrium setup --yes
-ตรวจสอบให้จบด้วย ./atrium status
+ตรวจสอบให้จบด้วย ./atrium provider status --probe --json, ./atrium permissions status --json, ./atrium tools status --json, ./atrium tools mcp-gateway --json, ./atrium tools mcp-probe --json, ./atrium automation status --commands, ./atrium automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium, ./atrium status --json และ ./atrium report --bundle
 เป้าหมายคือเปิด http://127.0.0.1:5173 ให้ใช้งานได้จริง
 ห้ามขอหรือพิมพ์ password, API key, OAuth token หรือ secret ในแชต
 ถ้าต้องเปิด Docker Desktop, ใส่รหัสเครื่อง, login provider หรือกด macOS permission ให้บอกฉันชัดเจนแล้วรอ
@@ -84,12 +108,12 @@ cd ~/Projects/ai-company
 ### Windows Native PowerShell
 
 Windows native path ใช้ PowerShell เป็นตัวควบคุม backend/frontend โดยตรง รองรับทั้ง Windows PowerShell และ PowerShell 7 (`pwsh`) ใน CLI diagnostics และใช้ Docker Desktop สำหรับ Postgres/Ollama ในเฟสแรก
-มี `atrium.cmd` เป็น shim สำหรับ Windows Terminal/cmd.exe ที่เรียก `.\atrium.ps1` ด้วย ExecutionPolicy Bypass ให้เอง และ fallback ไป `pwsh.exe` ถ้า Windows PowerShell ไม่อยู่ใน PATH แต่คำสั่งหลักในเอกสารยังใช้ PowerShell โดยตรง
+มี `atrium.cmd` เป็น shim สำหรับ Windows Terminal/cmd.exe ที่เรียก `.\atrium.ps1` ด้วย ExecutionPolicy Bypass ให้เอง, fallback ไป `pwsh.exe`, Windows PowerShell System32/SysWOW64 หรือ path มาตรฐานของ PowerShell 7 ถ้า PATH ไม่ครบ และคืน exit code ของคำสั่งจริง แต่คำสั่งหลักในเอกสารยังใช้ PowerShell โดยตรง
 
 ถ้ายังไม่ได้ clone repo ให้เปิด PowerShell แล้วรัน installer native:
 
 ```powershell
-$script="$env:TEMP\atrium-windows-native-install.ps1"; Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/Phonsadboy/ATRIUM-TH/main/ops/install_windows_native.ps1" -OutFile $script; powershell -ExecutionPolicy Bypass -File $script
+$script="$env:TEMP\atrium-windows-native-install.ps1"; Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/Phonsadboy/ATRIUM-TH/main/ops/install_windows_native.ps1" -OutFile $script; $runner=@("powershell.exe","powershell","pwsh.exe","pwsh") | ForEach-Object { Get-Command $_ -ErrorAction SilentlyContinue } | Select-Object -First 1; $runnerPath=if($runner){if($runner.Source){$runner.Source}else{$runner.Name}}; if(-not $runnerPath){$runnerPath=@("$PSHOME\powershell.exe","$PSHOME\pwsh.exe","$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe","$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe","$env:ProgramFiles\PowerShell\7\pwsh.exe","${env:ProgramFiles(x86)}\PowerShell\7\pwsh.exe") | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1}; if(-not $runnerPath){throw "PowerShell is required"}; & $runnerPath -NoProfile -ExecutionPolicy Bypass -File $script
 ```
 
 ถ้าต้องการข้ามบางส่วนชั่วคราว ใช้ flag เช่น `-NoStart`, `-SkipDockerInstall`, `-SkipBrowserInstall`, หรือ `-SkipClaudeCodeInstall`
@@ -104,6 +128,7 @@ $script="$env:TEMP\atrium-windows-native-install.ps1"; Invoke-WebRequest -UseBas
 
 ```powershell
 .\atrium.ps1 doctor
+.\atrium.ps1 doctor --json
 .\atrium.ps1 bootstrap --full
 .\atrium.ps1 start
 .\atrium.ps1 restart
@@ -113,17 +138,28 @@ $script="$env:TEMP\atrium-windows-native-install.ps1"; Invoke-WebRequest -UseBas
 .\atrium.ps1 tools catalog --json
 .\atrium.ps1 provider status --probe
 .\atrium.ps1 provider status --probe --json
+.\atrium.ps1 provider reference
+.\atrium.ps1 provider reference --json
+.\atrium.ps1 provider env
+.\atrium.ps1 provider env --json
 .\atrium.ps1 provider login chatgpt
 .\atrium.ps1 provider login claude-code
 .\atrium.ps1 provider disconnect chatgpt
+.\atrium.ps1 provider disconnect claude-code
+.\atrium.ps1 permissions status
+.\atrium.ps1 permissions status --json
+.\atrium.ps1 permissions set full_auto --agent-full-access true
 .\atrium.ps1 automation status --commands
 .\atrium.ps1 automation status --json
 .\atrium.ps1 automation source
 .\atrium.ps1 automation audit
 .\atrium.ps1 automation handoff --macos <macos-json>
-.\atrium.ps1 automation windows-live-proof --parity-run-id <run-id> --source-fingerprint <fingerprint> --source-manifest-sha256 <manifest> --source-file-count <count>
-.\atrium.ps1 automation artifact --label windows --expect-parity-run-id <run-id> --json <windows-json>
-.\atrium.ps1 automation report --macos <macos-json> --windows <copied-windows-json>
+.\atrium.ps1 automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium --output C:\Temp\atrium_host_bridge_windows_smoke.json
+.\atrium.ps1 automation windows-live-proof --parity-run-id <run-id> --source-fingerprint <fingerprint> --source-manifest-sha256 <manifest> --source-file-count <count> --max-artifact-age-hours 24.0
+.\atrium.ps1 automation artifact --label windows --expect-parity-run-id <run-id> --expect-source-fingerprint <fingerprint> --expect-source-manifest-sha256 <manifest> --expect-source-file-count <count> --max-artifact-age-hours 24.0 --json <windows-json>
+.\atrium.ps1 automation accept-windows <copied-windows-json> --handoff <handoff-json> --max-artifact-age-hours 24.0
+.\atrium.ps1 automation report --macos <macos-json> --windows <copied-windows-json> --max-artifact-age-hours 24.0
+.\atrium.ps1 automation windows-probe --full --browser-url http://127.0.0.1:5173 --browser-profile atrium --output C:\Temp\atrium_host_bridge_windows_probe.json  # raw diagnostic; automation smoke is the normal native smoke command
 .\atrium.ps1 status
 .\atrium.ps1 status --json
 .\atrium.ps1 logs
@@ -133,25 +169,31 @@ $script="$env:TEMP\atrium-windows-native-install.ps1"; Invoke-WebRequest -UseBas
 .\atrium.ps1 stop
 ```
 
-Windows native setup จะพยายามเตรียม Git, Python 3 ที่รันได้จริง, Node.js, uv, pnpm, Docker Desktop, Chrome/Edge/Brave/Chromium, Claude Code CLI, dependencies, env, backend/frontend และเปิด `http://127.0.0.1:5173` ถ้าติด UAC, firewall, Docker first-run หรือ provider login ให้ผู้ใช้กดยืนยันเองแล้วรันคำสั่งเดิมซ้ำ ทั้ง installer และ `.\atrium.ps1 setup` จะตรวจ Python 3 แบบรันจริง ไม่เชื่อแค่ Windows Store alias และจะเพิ่ม PATH ที่จำเป็นทั้งใน session ปัจจุบันและ user PATH เพื่อให้ PowerShell ใหม่ยังเรียก `uv`, `pnpm`, `docker`, `claude` และ `.\atrium.ps1` workflow ได้ต่อ
+Windows native setup จะพยายามเตรียม Git, Python 3 ที่รันได้จริง, Node.js, uv, pnpm, Docker Desktop, Chrome/Edge/Brave/Chromium, Claude Code CLI, dependencies, env, backend/frontend และเปิด `http://127.0.0.1:5173` ถ้าติด UAC, firewall, Docker first-run หรือ provider login ให้ผู้ใช้กดยืนยันเองแล้วรันคำสั่งเดิมซ้ำ ทั้ง fresh-install one-liner, installer และ `.\atrium.ps1 setup` จะตรวจ/เลือก Windows PowerShell หรือ PowerShell 7 ที่พบจริง รวมถึง path มาตรฐานเมื่อ PATH ไม่ครบ, ตรวจ Python 3 แบบรันจริง ไม่เชื่อแค่ Windows Store alias และจะเพิ่ม PATH ที่จำเป็นทั้งใน session ปัจจุบันและ user PATH เพื่อให้ PowerShell ใหม่ยังเรียก `uv`, `pnpm`, `docker`, `claude` และ `.\atrium.ps1` workflow ได้ต่อ
+`.\atrium.ps1 doctor --json` และ `.\atrium.ps1 status --json` จะรวม Windows runtime, Windows entrypoint, AI tool catalog, HostBridge source และ local proof artifact diagnostics เพื่อเห็น wrapper/installer/live-proof runner readiness ก่อนเริ่ม debug backend หรือตอนตรวจ start/stop/restart
 installer จะหยุดทันทีถ้า dependency install, `git clone` หรือ `.\atrium.ps1 setup` ออกด้วย non-zero exit code เพื่อไม่ให้สรุปว่าติดตั้งสำเร็จทั้งที่ runtime ยังไม่พร้อม
+ถ้า `winget` source ยังไม่พร้อม installer และ `.\atrium.ps1 setup` จะ refresh source แล้ว retry dependency install ให้อัตโนมัติหนึ่งครั้ง
 ถ้า browser install ถูก policy ของเครื่องบล็อก ให้ติดตั้ง Chrome, Edge, Brave หรือ Chromium เอง แล้วรัน `.\atrium.ps1 automation status --commands` เพื่อดู browser/desktop gap ต่อ
 
 `.\atrium.ps1 start` จะพยายามเปิด Docker Desktop และรอ Docker ให้พร้อมก่อนเริ่ม Postgres/Ollama ถ้า Docker ยังไม่พร้อมจะหยุดพร้อม next step ชัดเจนแทนการปล่อยให้ backend fail เงียบ ๆ
+หลังสั่ง start แล้ว backend/frontend ต้องพร้อมภายในเวลาที่กำหนด ถ้าไม่พร้อม CLI จะหยุดพร้อม backend/frontend port owner, log path และคำสั่ง `status --json`/`logs --json` สำหรับ debug จาก Windows PowerShell
+เมื่อ backend/frontend พร้อมแล้ว `start` จะสรุป post-start readiness ของ runtime, provider auth, owner permission, AI tool catalog, connectors และ automation permission ทันที เพื่อให้เห็นว่าระบบพร้อมใช้งานครบหรือยังจาก PowerShell เดียว
 
 `.\atrium.ps1 stop` และ `.\atrium.ps1 restart` ใช้ PID files และหยุด process tree ของ frontend/backend บน Windows เพื่อช่วยลด process ลูกหรือ port listener ค้างหลัง restart
+Windows launcher จะ wrap `.cmd`/`.bat` shims เช่น `pnpm.cmd` ผ่าน `cmd.exe` เพื่อให้ PID ownership, process tree stop และ logs เสถียรกว่าเวลาเรียกจาก PowerShell
 ถ้า backend/frontend ถูกเปิดจาก terminal หรือ tool อื่น `.\atrium.ps1 status` จะยังแสดง listener จริง ส่วน `stop/restart` จะควบคุมเฉพาะ process ที่ ATRIUM native launcher เปิดและมี PID file เท่านั้น
 
 `.\atrium.ps1 tools status` และ `.\atrium.ps1 tools catalog` ตรวจ AI tool registry, tool catalog, risk/executor summary และ connector readiness จาก backend โดยตรง; เพิ่ม `--json` เพื่อส่ง redacted machine-readable diagnostics
 
-`.\atrium.ps1 provider status --probe` ตรวจ ChatGPT account และ Claude Code account จาก backend truth; เพิ่ม `--json` เพื่อดู redacted provider-auth payload สำหรับ debug ส่วน `.\atrium.ps1 provider login ...` เริ่ม login จาก PowerShell โดยตรงและรอจน provider พร้อมถ้าทำได้
+`.\atrium.ps1 provider status --probe` ตรวจ ChatGPT account และ Claude Code account จาก backend truth; เพิ่ม `--json` เพื่อดู redacted provider-auth payload สำหรับ debug ส่วน `provider reference` และ `provider env` แสดง credential meaning/env readiness แบบ read-only และ redacted จาก PowerShell โดยไม่พิมพ์ secret ส่วน `.\atrium.ps1 provider login ...` เริ่ม login จาก PowerShell โดยตรงและรอจน provider พร้อมถ้าทำได้
 
-`.\atrium.ps1 automation status --commands` แสดงสถานะ browser/desktop HostBridge, owner permission mode และคำสั่ง parity proof ที่ต้องใช้; เพิ่ม `--json` เพื่อดึง automation permission/parity state แบบ redacted จาก PowerShell ส่วน `automation handoff --macos <macos-json>` validate macOS artifact กับ source ปัจจุบันแล้วเขียน packet คำสั่ง Windows/report/audit สำหรับส่งต่อ โดยยังไม่ถือว่า verified; `automation windows-live-proof` เป็น runner สำหรับ Windows interactive desktop session ที่ตรวจ source fingerprint, source manifest, file count, รัน full live probe และ validate artifact ก่อนส่งกลับมาทำ cross-OS report; `automation artifact` ใช้ validate proof artifact ผ่าน native CLI
-OpenClaw-level gate ยังนับ MCP external tools เป็น required surface: local MCP fallback ใช้ดูสถานะ/อ่านข้อมูลบางส่วนได้ แต่ไม่ถือว่าผ่าน external-write parity จนกว่า MCP gateway จะพร้อม
+`.\atrium.ps1 permissions status` และ `.\atrium.ps1 permissions set full_auto --agent-full-access true` ทำให้ Windows ตั้ง/ตรวจ owner automation permission mode ผ่าน PowerShell ได้เองหลังผู้ใช้ให้ Full Access ใน Codex/Claude Code แล้ว
+`.\atrium.ps1 automation status --commands` แสดงสถานะ browser/desktop HostBridge, owner permission mode และคำสั่ง parity proof ที่ต้องใช้; เพิ่ม `--json` เพื่อดึง automation permission/parity state แบบ redacted จาก PowerShell ส่วน `automation smoke` เป็นคำสั่ง native เดียวสำหรับ smoke browser/desktop tools บน Windows หรือ macOS ก่อน proof เต็ม, `automation handoff --macos <macos-json>` validate macOS artifact กับ source ปัจจุบันแล้วเขียน packet คำสั่ง Windows/report/audit สำหรับส่งต่อ โดยยังไม่ถือว่า verified; `automation windows-live-proof` เป็น runner สำหรับ Windows interactive desktop session ที่ตรวจ source fingerprint, source manifest, file count, รัน full live probe และ validate artifact ก่อนส่งกลับมาทำ cross-OS report; `automation artifact` ใช้ validate proof artifact ผ่าน native CLI และควรใช้ `--max-artifact-age-hours 24.0 --json` ใน proof handoff เพื่อไม่ยอมรับ artifact เก่า; หลัง copy Windows artifact กลับ repo host ให้ใช้ `automation accept-windows <copied-windows-json> --handoff <handoff-json>` เป็น gate หลัก เพราะคำสั่งนี้ validate, import, install report และ audit ในขั้นเดียวก่อนยอมให้ claim OpenClaw-level
+OpenClaw-level gate ยังนับ MCP external tools เป็น required surface: local MCP fallback ใช้ดูสถานะ/อ่านข้อมูลบางส่วนได้ แต่ไม่ถือว่าผ่าน external-write parity จนกว่า `tools mcp-probe --json` ยืนยันว่า MCP gateway พร้อมจริง
 
-`.\atrium.ps1 status` และ `.\atrium.ps1 report` จะรวมสถานะ AI tools, provider auth, permission mode, connector readiness, browser/desktop HostBridge, full-autonomy permission, local proof artifact freshness และ cross-OS parity gap เพื่อให้เห็นว่า Windows native automation พร้อมจริงหรือยัง; `status --json` แยก PID ownership/log path ของ backend/frontend แบบ machine-readable และ `logs --json` ใช้เก็บ runtime/log truth แบบ redacted ได้จาก PowerShell
-ถ้าสั่งอัปเดตระบบจาก UI บน Windows backend จะ schedule restart ผ่าน `.\atrium.ps1 restart --force` ใน PowerShell และเขียนผลไว้ที่ `system/logs/self-update-restart.log`
-`report` จะรวม Docker CLI/Compose/daemon status, automation proof commands และ redact secret ก่อนพิมพ์ออกมา; `report --bundle` จะสร้าง zip ที่มี redacted support report, backend/frontend logs และ diagnostics JSON สำหรับ status/process/logs/permission/provider/tools/automation เพื่อส่ง debug
+`.\atrium.ps1 status` และ `.\atrium.ps1 report` จะรวมสถานะ AI tools, provider auth, permission mode, connector readiness, browser/desktop HostBridge, full-autonomy permission, Windows automation preflight checks, Windows entrypoint file truth, local proof artifact freshness และ cross-OS parity gap เพื่อให้เห็นว่า Windows native automation พร้อมจริงหรือยัง; `status --json` แยก PID ownership/process identity/log path, Windows runtime, Windows entrypoint readiness, tool catalog, HostBridge source และ local proof artifacts ของ backend/frontend แบบ machine-readable และ `logs --json` ใช้เก็บ runtime/log truth แบบ redacted ได้จาก PowerShell
+ถ้าสั่งอัปเดตระบบจาก UI บน Windows backend จะ schedule restart ผ่าน `.\atrium.ps1 restart --force` ใน PowerShell, หา PowerShell จาก PATH หรือ standard install path และเขียนผลไว้ที่ `system/logs/self-update-restart.log`
+`report` จะรวม Docker CLI/Compose/daemon status, automation proof commands และ redact secret ก่อนพิมพ์ออกมา; `report --bundle` จะสร้าง zip ที่มี redacted support report, backend/frontend logs และ diagnostics JSON สำหรับ doctor/status/process/windows-runtime/windows-entrypoints/native-next-checks/native-parity-matrix/docker/host-bridge-source/local-proof-artifacts/logs/runtime/connectors/tools-catalog/tools-mcp-gateway/tools-mcp-probe/host-bridge-parity/permission/provider/tools/automation เพื่อส่ง debug
 
 ห้ามวาง repo/runtime ใน OneDrive, Desktop, Documents หรือ Downloads เพราะ database, Docker volume, `node_modules`, virtualenv และ runtime files ไม่ควรอยู่ในโฟลเดอร์ sync หรือ user-folder ที่โดน policy บ่อย
 
@@ -164,8 +206,8 @@ OpenClaw-level gate ยังนับ MCP external tools เป็น required 
 ใช้ .\atrium.ps1 เป็น runtime-control path หลัก
 เตรียม Docker Desktop สำหรับ Docker-backed services และ Claude Code CLI สำหรับ Claude account provider ถ้าจำเป็น
 clone repo ไว้ในโฟลเดอร์ที่ไม่ใช่ OneDrive, Desktop, Documents หรือ Downloads
-หลังติดตั้งให้รัน .\atrium.ps1 setup --yes แล้วตรวจด้วย .\atrium.ps1 provider status --probe, .\atrium.ps1 automation status --commands, .\atrium.ps1 automation audit และ .\atrium.ps1 status
-ห้ามสรุปว่า Windows เป็น OpenClaw-level จนกว่าจะติดตั้ง live macOS/Windows proof artifacts ด้วย .\atrium.ps1 automation report แล้ว .\atrium.ps1 automation audit ผ่าน
+หลังติดตั้งให้รัน .\atrium.ps1 setup --yes แล้วตรวจด้วย .\atrium.ps1 provider status --probe, .\atrium.ps1 provider reference --json, .\atrium.ps1 provider env --json, .\atrium.ps1 permissions status --json, .\atrium.ps1 permissions set full_auto --agent-full-access true, .\atrium.ps1 tools status --json, .\atrium.ps1 tools mcp-gateway --json, .\atrium.ps1 tools mcp-probe --json, .\atrium.ps1 automation status --commands, .\atrium.ps1 automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium, .\atrium.ps1 automation audit, .\atrium.ps1 status --json และ .\atrium.ps1 report --bundle
+ห้ามสรุปว่า Windows เป็น OpenClaw-level จนกว่าจะติดตั้ง live macOS/Windows proof artifacts ด้วย .\atrium.ps1 automation accept-windows <copied-windows-json> --handoff <handoff-json> --max-artifact-age-hours 24.0 หรือ report+audit path ที่เทียบเท่า แล้ว .\atrium.ps1 automation audit ผ่าน
 เป้าหมายคือเปิด http://127.0.0.1:5173 จาก Windows browser ให้ใช้งานได้จริง
 ห้ามขอหรือพิมพ์ password, API key, OAuth token หรือ secret ในแชต
 ถ้าต้อง restart Windows, เปิด Docker Desktop, กด UAC/firewall หรือ login provider ให้บอกฉันชัดเจนแล้วรอ
@@ -327,6 +369,30 @@ cd ~/Projects/ai-company
 ./atrium setup
 ```
 
+Post-install checks:
+
+```bash
+./atrium doctor --json
+./atrium status --json
+./atrium provider status --probe --json
+./atrium provider reference --json
+./atrium provider env --json
+./atrium provider login chatgpt
+./atrium provider login claude-code
+./atrium provider disconnect chatgpt
+./atrium provider disconnect claude-code
+./atrium permissions status --json
+./atrium permissions set full_auto --agent-full-access true
+./atrium tools status --json
+./atrium tools mcp-gateway --json
+./atrium tools mcp-probe --json
+./atrium tools catalog --json
+./atrium automation status --commands
+./atrium automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium --output /tmp/atrium_host_bridge_macos_smoke.json
+./atrium logs --json
+./atrium report --bundle
+```
+
 #### Option 2: Codex/Claude Assisted
 
 Open Codex or Claude Code in Coding/Code mode with Full Access and send:
@@ -336,7 +402,7 @@ Install ATRIUM on macOS from https://github.com/Phonsadboy/ATRIUM-TH.git.
 Use ~/Projects/ai-company.
 Do not place the repo in iCloud Drive, Desktop, or Documents if those folders sync with iCloud.
 Clone the repo if needed, then run ./atrium setup --yes.
-Finish by running ./atrium status.
+Finish by running ./atrium provider status --probe --json, ./atrium permissions status --json, ./atrium tools status --json, ./atrium tools mcp-gateway --json, ./atrium tools mcp-probe --json, ./atrium automation status --commands, ./atrium automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium, ./atrium status --json, and ./atrium report --bundle.
 The goal is to open http://127.0.0.1:5173 and make the full stack usable.
 Never ask for or print passwords, API keys, OAuth tokens, or secrets in chat.
 If Docker Desktop, machine password, provider login, or macOS permission approval is needed, tell me exactly what to do and wait.
@@ -348,6 +414,7 @@ From a Windows checkout, run:
 
 ```powershell
 .\atrium.ps1 doctor
+.\atrium.ps1 doctor --json
 .\atrium.ps1 bootstrap --full
 .\atrium.ps1 setup
 .\atrium.ps1 start
@@ -358,17 +425,28 @@ From a Windows checkout, run:
 .\atrium.ps1 tools catalog --json
 .\atrium.ps1 provider status --probe
 .\atrium.ps1 provider status --probe --json
+.\atrium.ps1 provider reference
+.\atrium.ps1 provider reference --json
+.\atrium.ps1 provider env
+.\atrium.ps1 provider env --json
 .\atrium.ps1 provider login chatgpt
 .\atrium.ps1 provider login claude-code
 .\atrium.ps1 provider disconnect chatgpt
+.\atrium.ps1 provider disconnect claude-code
+.\atrium.ps1 permissions status
+.\atrium.ps1 permissions status --json
+.\atrium.ps1 permissions set full_auto --agent-full-access true
 .\atrium.ps1 automation status --commands
 .\atrium.ps1 automation status --json
 .\atrium.ps1 automation source
 .\atrium.ps1 automation audit
 .\atrium.ps1 automation handoff --macos <macos-json>
-.\atrium.ps1 automation windows-live-proof --parity-run-id <run-id> --source-fingerprint <fingerprint> --source-manifest-sha256 <manifest> --source-file-count <count>
-.\atrium.ps1 automation artifact --label windows --expect-parity-run-id <run-id> --json <windows-json>
-.\atrium.ps1 automation report --macos <macos-json> --windows <copied-windows-json>
+.\atrium.ps1 automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium --output C:\Temp\atrium_host_bridge_windows_smoke.json
+.\atrium.ps1 automation windows-live-proof --parity-run-id <run-id> --source-fingerprint <fingerprint> --source-manifest-sha256 <manifest> --source-file-count <count> --max-artifact-age-hours 24.0
+.\atrium.ps1 automation artifact --label windows --expect-parity-run-id <run-id> --expect-source-fingerprint <fingerprint> --expect-source-manifest-sha256 <manifest> --expect-source-file-count <count> --max-artifact-age-hours 24.0 --json <windows-json>
+.\atrium.ps1 automation accept-windows <copied-windows-json> --handoff <handoff-json> --max-artifact-age-hours 24.0
+.\atrium.ps1 automation report --macos <macos-json> --windows <copied-windows-json> --max-artifact-age-hours 24.0
+.\atrium.ps1 automation windows-probe --full --browser-url http://127.0.0.1:5173 --browser-profile atrium --output C:\Temp\atrium_host_bridge_windows_probe.json  # raw diagnostic; automation smoke is the normal native smoke command
 .\atrium.ps1 status
 .\atrium.ps1 status --json
 .\atrium.ps1 logs
@@ -379,24 +457,30 @@ From a Windows checkout, run:
 ```
 
 The native path controls backend/frontend directly from PowerShell, accepts Windows PowerShell or PowerShell 7 (`pwsh`) for CLI diagnostics, and uses Docker Desktop for Postgres/Ollama.
-`atrium.cmd` is also available for Windows Terminal/cmd.exe and forwards to `.\atrium.ps1` with ExecutionPolicy Bypass, falling back to `pwsh.exe` when Windows PowerShell is not on PATH; the documented primary path remains PowerShell.
-The installer and `.\atrium.ps1 setup` verify a runnable Python 3 command rather than trusting the Windows Store alias, refresh PATH for the current session, and persist common user PATH entries for `uv`, `pnpm`, `docker`, and `claude` so a new PowerShell can keep using the same native workflow.
+`atrium.cmd` is also available for Windows Terminal/cmd.exe and forwards to `.\atrium.ps1` with ExecutionPolicy Bypass, falls back to `pwsh.exe`, Windows PowerShell System32/SysWOW64, or standard PowerShell 7 install paths when PATH is incomplete, and preserves the real command exit code; the documented primary path remains PowerShell.
+The Windows launcher wraps `.cmd`/`.bat` shims such as `pnpm.cmd` through `cmd.exe` so PID ownership, process-tree stop, and logs stay attached to the native launcher.
+The fresh-install one-liner, installer, and `.\atrium.ps1 setup` use the available Windows PowerShell or PowerShell 7 executable, including standard install paths when PATH is incomplete, verify a runnable Python 3 command rather than trusting the Windows Store alias, refresh PATH for the current session, and persist common user PATH entries for `uv`, `pnpm`, `docker`, and `claude` so a new PowerShell can keep using the same native workflow.
+`.\atrium.ps1 doctor --json` and `.\atrium.ps1 status --json` include Windows runtime, Windows entrypoint, AI tool catalog, HostBridge source, and local proof artifact diagnostics so wrapper, installer, and live-proof runner readiness are visible before backend debugging or start/stop/restart checks.
 The installer also fails fast when dependency install, `git clone`, or `.\atrium.ps1 setup` exits non-zero, so a failed runtime setup is not reported as complete.
+If a `winget` source is stale or not initialized, the installer and `.\atrium.ps1 setup` refresh sources and retry the dependency install once.
 If browser installation is blocked by local policy, install Chrome, Edge, Brave, or Chromium manually, then run `.\atrium.ps1 automation status --commands` to inspect remaining browser/desktop gaps.
 `.\atrium.ps1 start` attempts to open Docker Desktop and wait for Docker before starting Postgres/Ollama; if Docker is still blocked, it stops with an explicit next step instead of letting the backend fail later.
+After start, backend/frontend must become ready within the configured wait window. If they do not, the CLI stops with backend/frontend port owners, log paths, and `status --json`/`logs --json` diagnostics from native PowerShell.
+Once backend/frontend are reachable, `start` prints post-start readiness for runtime, provider auth, owner permission, AI tool catalog, connectors, and automation permission from the same native PowerShell flow.
 `.\atrium.ps1 tools status` and `.\atrium.ps1 tools catalog` inspect the AI tool registry, tool catalog, risk/executor summary, and connector readiness directly from the backend; add `--json` for redacted machine-readable diagnostics.
-`.\atrium.ps1 provider ...` manages ChatGPT account and Claude Code account readiness from the native terminal; add `--json` to `provider status --probe` for a redacted debug payload.
-`.\atrium.ps1 automation ...` exposes HostBridge browser/desktop readiness, source provenance handoff, a Windows proof handoff packet from a validated macOS artifact, native artifact validation, the preferred Windows live proof runner, the cross-OS report installer, and the OpenClaw-level audit gate from the same native entrypoint.
-The OpenClaw-level gate treats MCP external tools as a required surface: local MCP fallback can provide read/status guidance, but it does not satisfy external-write parity until the MCP gateway is healthy.
+`.\atrium.ps1 provider ...` manages ChatGPT account and Claude Code account readiness from the native terminal; add `--json` to `provider status --probe`, `provider reference`, or `provider env` for redacted debug payloads that are safe to include in Windows support handoff.
+`.\atrium.ps1 permissions status` and `.\atrium.ps1 permissions set full_auto --agent-full-access true` let Windows inspect or update owner automation permission mode from PowerShell after the user grants local Full Access in Codex/Claude Code.
+`.\atrium.ps1 automation ...` exposes HostBridge browser/desktop readiness, a cross-OS `automation smoke` command for native browser/desktop smoke diagnostics, source provenance handoff, a Windows proof handoff packet from a validated macOS artifact, native artifact validation, the preferred Windows live proof runner, the repo-side `accept-windows` import/report/audit gate, the cross-OS report installer, and the OpenClaw-level audit gate from the same native entrypoint. For parity claims, artifact validation and report installation should use `--max-artifact-age-hours 24.0`; the generated handoff/status commands include this gate.
+The OpenClaw-level gate treats MCP external tools as a required surface: local MCP fallback can provide read/status guidance, but it does not satisfy external-write parity until `tools mcp-probe --json` proves the MCP gateway is healthy.
 `.\atrium.ps1 automation status --commands` prints browser/desktop HostBridge readiness, owner permission mode, and parity proof commands; add `--json` to capture redacted automation permission/parity state from PowerShell.
-`.\atrium.ps1 status` and `.\atrium.ps1 report` include AI tool, provider-auth, permission mode, connector, browser/desktop HostBridge, full-autonomy permission, local proof artifact freshness, and cross-OS parity readiness summaries; `status --json` exposes backend/frontend PID ownership and log paths as machine-readable data, while `logs --json` captures redacted runtime/log truth from PowerShell.
-When the UI self-update flow runs on Windows, ATRIUM schedules restart through `.\atrium.ps1 restart --force` in PowerShell and writes the result to `system/logs/self-update-restart.log`.
-`report` includes Docker CLI/Compose/daemon status, automation proof commands, and redacts secrets before printing; `report --bundle` writes a redacted zip with the support report, backend/frontend logs, and status/process/logs/permission/provider/tools/automation diagnostics JSON for debugging.
+`.\atrium.ps1 status` and `.\atrium.ps1 report` include AI tool, provider-auth, permission mode, connector, browser/desktop HostBridge, full-autonomy permission, Windows automation preflight checks, Windows entrypoint file truth, local proof artifact freshness, and cross-OS parity readiness summaries; `status --json` exposes backend/frontend PID ownership, process identity, log paths, Windows runtime, Windows entrypoint readiness, tool catalog, HostBridge source, and local proof artifacts as machine-readable data, while `logs --json` captures redacted runtime/log truth from PowerShell.
+When the UI self-update flow runs on Windows, ATRIUM schedules restart through `.\atrium.ps1 restart --force`, resolves PowerShell from PATH or standard install paths, and writes the result to `system/logs/self-update-restart.log`.
+`report` includes Docker CLI/Compose/daemon status, automation proof commands, and redacts secrets before printing; `report --bundle` writes a redacted zip with the support report, backend/frontend logs, and doctor/status/process/windows-runtime/windows-entrypoints/native-next-checks/native-parity-matrix/logs/runtime/connectors/tools-catalog/tools-mcp-gateway/tools-mcp-probe/host-bridge-parity/permission/provider/tools/automation diagnostics JSON for debugging.
 
 For a fresh native Windows install before the repo exists:
 
 ```powershell
-$script="$env:TEMP\atrium-windows-native-install.ps1"; Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/Phonsadboy/ATRIUM-TH/main/ops/install_windows_native.ps1" -OutFile $script; powershell -ExecutionPolicy Bypass -File $script
+$script="$env:TEMP\atrium-windows-native-install.ps1"; Invoke-WebRequest -UseBasicParsing "https://raw.githubusercontent.com/Phonsadboy/ATRIUM-TH/main/ops/install_windows_native.ps1" -OutFile $script; $runner=@("powershell.exe","powershell","pwsh.exe","pwsh") | ForEach-Object { Get-Command $_ -ErrorAction SilentlyContinue } | Select-Object -First 1; $runnerPath=if($runner){if($runner.Source){$runner.Source}else{$runner.Name}}; if(-not $runnerPath){$runnerPath=@("$PSHOME\powershell.exe","$PSHOME\pwsh.exe","$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe","$env:SystemRoot\SysWOW64\WindowsPowerShell\v1.0\powershell.exe","$env:ProgramFiles\PowerShell\7\pwsh.exe","${env:ProgramFiles(x86)}\PowerShell\7\pwsh.exe") | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1}; if(-not $runnerPath){throw "PowerShell is required"}; & $runnerPath -NoProfile -ExecutionPolicy Bypass -File $script
 ```
 
 Temporary skip flags are available: `-NoStart`, `-SkipDockerInstall`, `-SkipBrowserInstall`, and `-SkipClaudeCodeInstall`.
@@ -410,7 +494,7 @@ Install ATRIUM on Windows native PowerShell from https://github.com/Phonsadboy/A
 Use .\atrium.ps1 as the main runtime-control path.
 Prepare Docker Desktop for Docker-backed services and Claude Code CLI for the Claude account provider if needed.
 Clone the repo into a folder outside OneDrive, Desktop, Documents, and Downloads.
-After setup, run .\atrium.ps1 setup --yes and verify with .\atrium.ps1 provider status --probe, .\atrium.ps1 automation status --commands, .\atrium.ps1 automation audit, and .\atrium.ps1 status. Do not claim OpenClaw-level Windows parity until live macOS/Windows proof artifacts have been installed with .\atrium.ps1 automation report and audit passes.
+After setup, run .\atrium.ps1 setup --yes and verify with .\atrium.ps1 provider status --probe, .\atrium.ps1 provider reference --json, .\atrium.ps1 provider env --json, .\atrium.ps1 permissions status --json, .\atrium.ps1 permissions set full_auto --agent-full-access true, .\atrium.ps1 tools status --json, .\atrium.ps1 tools mcp-gateway --json, .\atrium.ps1 tools mcp-probe --json, .\atrium.ps1 automation status --commands, .\atrium.ps1 automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium, .\atrium.ps1 automation audit, .\atrium.ps1 status --json, and .\atrium.ps1 report --bundle. Do not claim OpenClaw-level Windows parity until live macOS/Windows proof artifacts have been installed with .\atrium.ps1 automation accept-windows <copied-windows-json> --handoff <handoff-json> --max-artifact-age-hours 24.0, or an equivalent report+audit path, and audit passes.
 The goal is to open http://127.0.0.1:5173 from a Windows browser and make the full stack usable.
 Never ask for or print passwords, API keys, OAuth tokens, or secrets in chat.
 If Windows restart, Docker Desktop, UAC/firewall approval, or provider login is needed, tell me exactly what to do and wait.

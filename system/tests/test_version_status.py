@@ -182,6 +182,90 @@ class VersionStatusTest(unittest.TestCase):
         self.assertIn(".\\atrium.ps1 restart --force", command[-1])
         self.assertIn("self-update-restart.log", command[-1])
 
+    def test_windows_update_restart_can_use_pwsh_exe(self) -> None:
+        from app import main
+
+        with TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "atrium.ps1").write_text("param($Command)\n", encoding="utf-8")
+            with (
+                mock.patch.object(main.sys, "platform", "win32"),
+                mock.patch.object(main, "_powershell_command", return_value="pwsh.exe"),
+                mock.patch.object(main.subprocess, "Popen") as popen,
+            ):
+                result = main._schedule_version_restart(repo)
+
+        self.assertTrue(result["scheduled"])
+        command = popen.call_args.args[0]
+        self.assertEqual(command[0], "pwsh.exe")
+        self.assertIn(".\\atrium.ps1 restart --force", command[-1])
+
+    def test_windows_update_restart_finds_standard_powershell_path(self) -> None:
+        from app import main
+
+        def fake_exists(path: Path) -> bool:
+            return str(path).replace("\\", "/").endswith("Windows/System32/WindowsPowerShell/v1.0/powershell.exe")
+
+        with (
+            mock.patch.object(main.sys, "platform", "win32"),
+            mock.patch.object(main.shutil, "which", return_value=None),
+            mock.patch.object(Path, "exists", fake_exists),
+            mock.patch.dict(main.os.environ, {"SystemRoot": "C:/Windows"}, clear=False),
+        ):
+            self.assertEqual(
+                main._powershell_command(),
+                "C:/Windows/System32/WindowsPowerShell/v1.0/powershell.exe",
+            )
+
+    def test_native_runtime_status_exposes_windows_operator_commands(self) -> None:
+        from app import main
+
+        payload = main._native_runtime_status_payload(
+            "win32",
+            {"browserAutomationReady": True, "desktopAutomationReady": True, "interactiveSession": True},
+        )
+
+        self.assertTrue(payload["nativeOnly"])
+        self.assertTrue(payload["windowsNative"])
+        self.assertTrue(payload["windowsNativePrimary"])
+        self.assertTrue(payload["windowsNativeHostOnly"])
+        commands = payload["commands"]
+        self.assertEqual(commands["start"], ".\\atrium.ps1 start")
+        self.assertEqual(commands["stop"], ".\\atrium.ps1 stop")
+        self.assertIn(".\\atrium.ps1 provider login chatgpt", commands["providerLoginChatGPT"])
+        self.assertIn(".\\atrium.ps1 tools mcp-gateway --json", commands["toolsMcpGateway"])
+        self.assertIn(".\\atrium.ps1 tools mcp-probe --json", commands["toolsMcpProbe"])
+        self.assertIn(".\\atrium.ps1 permissions set full_auto", commands["permissionsFullAuto"])
+        self.assertEqual(commands["automationSource"], ".\\atrium.ps1 automation source --json")
+        self.assertIn(".\\atrium.ps1 automation handoff --macos", commands["automationHandoff"])
+        self.assertIn(".\\atrium.ps1 automation report --macos", commands["automationReport"])
+        self.assertIn("--max-artifact-age-hours 24.0", commands["automationReport"])
+        self.assertIn(".\\atrium.ps1 automation windows-probe --full", commands["automationWindowsProbe"])
+        self.assertIn(".\\atrium.ps1 automation windows-live-proof", commands["automationWindowsLiveProof"])
+        self.assertIn("--max-artifact-age-hours 24.0", commands["automationWindowsLiveProof"])
+        self.assertIn(".\\atrium.ps1 automation artifact --label windows", commands["automationWindowsArtifactValidate"])
+        self.assertIn("C:\\Temp\\atrium_host_bridge_windows_live.json", commands["automationWindowsArtifactValidate"])
+        self.assertIn(".\\atrium.ps1 automation accept-windows", commands["automationAcceptWindows"])
+        self.assertIn("<copied-windows-json>", commands["automationAcceptWindows"])
+
+    def test_native_runtime_status_keeps_macos_commands_host_native(self) -> None:
+        from app import main
+
+        payload = main._native_runtime_status_payload("darwin", {})
+
+        commands = payload["commands"]
+        self.assertFalse(payload["windowsNative"])
+        self.assertEqual(commands["start"], "./atrium start")
+        self.assertEqual(commands["stop"], "./atrium stop")
+        self.assertEqual(commands["automationSource"], "./atrium automation source --json")
+        self.assertIn("./atrium automation handoff --macos", commands["automationHandoff"])
+        self.assertIn("./atrium automation report --macos", commands["automationReport"])
+        self.assertIn("./atrium automation smoke", commands["automationSmoke"])
+        self.assertNotIn("automationWindowsProbe", commands)
+        self.assertNotIn("automationWindowsLiveProof", commands)
+        self.assertNotIn("automationWindowsArtifactValidate", commands)
+        self.assertNotIn("automationAcceptWindows", commands)
+
     def test_update_stops_before_fetch_when_backup_fails(self) -> None:
         from app import main
 

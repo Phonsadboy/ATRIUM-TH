@@ -1484,7 +1484,20 @@ def _can_restart_with_screen() -> bool:
 
 
 def _powershell_command() -> str | None:
-    return shutil.which("powershell.exe") or shutil.which("powershell") or shutil.which("pwsh")
+    for name in ("powershell.exe", "powershell", "pwsh.exe", "pwsh"):
+        resolved = shutil.which(name)
+        if resolved:
+            return resolved
+    if sys.platform == "win32":
+        for candidate in (
+            Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe",
+            Path(os.environ.get("SystemRoot", "C:/Windows")) / "SysWOW64" / "WindowsPowerShell" / "v1.0" / "powershell.exe",
+            Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "PowerShell" / "7" / "pwsh.exe",
+            Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")) / "PowerShell" / "7" / "pwsh.exe",
+        ):
+            if candidate.exists():
+                return str(candidate)
+    return None
 
 
 def _ps_single_quote(value: str) -> str:
@@ -3149,6 +3162,43 @@ def _external_write_requirements_with_gateway_health(settings: Any, gateway_heal
     return requirements
 
 
+def _mcp_gateway_status_payload(*, probe: bool = False) -> dict[str, Any]:
+    settings = get_settings()
+    gateway_health = _mcp_gateway_health(settings, probe=probe)
+    requirements = _external_write_requirements_with_gateway_health(settings, gateway_health)
+    endpoint = _mcp_gateway_endpoint()
+    ready = bool(endpoint and gateway_health.get("ok") is True and not requirements)
+    connector = {
+        "id": "mcp",
+        "status": "configured" if ready else ("blocked_by_runtime" if endpoint else "available"),
+        "readReady": bool(not endpoint or gateway_health.get("ok") is True),
+        "writeReady": ready,
+        "localFallback": not bool(endpoint),
+        "externalWriteRequires": requirements,
+    }
+    return {
+        "ok": True,
+        "ready": ready,
+        "probe": probe,
+        "connector": connector,
+        "gatewayHealth": gateway_health,
+        "requirements": requirements,
+        "proofBlocker": {
+            "blocked": not ready,
+            "stage": "mcp_external_write",
+            "runner": "ops/windows_host_bridge_live_proof.ps1",
+            "proofFacet": "mcpExternalWriteReady",
+            "requirements": requirements,
+        },
+        "requiredBefore": "windows-live-proof",
+        "successCondition": "MCP probe reports ready=true, gatewayHealth.ok=true, writeReady=true, localFallback=false, and externalWriteRequires=[]",
+        "verifyCommands": [
+            "curl -fsS 'http://127.0.0.1:8787/api/tools/mcp-gateway?probe=true'",
+            ".\\atrium.ps1 tools mcp-probe --json",
+        ],
+    }
+
+
 def _docker_executable() -> str | None:
     for candidate in (
         "docker",
@@ -3408,7 +3458,7 @@ def _host_bridge_command_hint(text: str, host_platform: str | None = None) -> st
 
 def _host_bridge_parity_proof_gap(host_platform: str | None = None) -> str:
     return _host_bridge_command_hint(
-        "Run ./atrium automation report with verified macOS and Windows --full probe artifacts, "
+        "Run ./atrium automation report --max-artifact-age-hours 24.0 with verified macOS and Windows --full probe artifacts, "
         "then ./atrium automation audit, before claiming cross-OS HostBridge parity.",
         host_platform,
     )
@@ -3459,6 +3509,8 @@ _REQUIRED_HOST_BRIDGE_PROOF_FACETS = {
         "windowsForegroundActivation": "Windows Notepad foreground activation proof",
         "windowsUnicodeTyping": "Windows Unicode typing proof",
         "windowsKeyboardShortcut": "Windows keyboard shortcut mapping proof",
+        "mcpExternalWriteReady": "Windows MCP external-write readiness proof",
+        "windowsLiveProofRunner": "Windows live proof runner attestation",
         "notepadNativeAct": "Windows Notepad native UIAutomation ValuePattern text proof",
         "clipboardRoundTrip": "Windows Notepad clipboard round-trip proof",
     },
@@ -3661,6 +3713,8 @@ def _host_bridge_parity_report_proof(settings: Any) -> dict[str, Any]:
         findings.append("Persisted parity report sourceFingerprint mismatch; regenerate both macOS and Windows full probe artifacts from the same HostBridge source.")
     if len(source_manifest_shas) == 2 and len(set(source_manifest_shas.values())) != 1:
         findings.append("Persisted parity report sourceManifestSha256 mismatch; regenerate both macOS and Windows full probe artifacts from the same HostBridge source.")
+    if len(source_file_counts) == 2 and len(set(source_file_counts.values())) != 1:
+        findings.append("Persisted parity report sourceFileCount mismatch; regenerate both macOS and Windows full probe artifacts from the same HostBridge source file set.")
     if len(git_heads) == 2 and len(set(git_heads.values())) != 1:
         findings.append("Persisted parity report gitHead mismatch; regenerate both macOS and Windows full probe artifacts from the same commit.")
     if len(parity_run_ids) == 2 and len(set(parity_run_ids.values())) != 1:
@@ -3692,9 +3746,11 @@ def _host_bridge_parity_report_proof(settings: Any) -> dict[str, Any]:
         current_source = host_bridge_source_provenance()
         current_fingerprint = current_source.get("sourceFingerprint")
         current_manifest_sha = current_source.get("sourceManifestSha256")
+        current_file_count = current_source.get("sourceFileCount")
         current_git_head = current_source.get("gitHead")
         details["currentSourceFingerprint"] = current_fingerprint
         details["currentSourceManifestSha256"] = current_manifest_sha
+        details["currentSourceFileCount"] = current_file_count
         details["currentGitHead"] = current_git_head
         details["currentGitDirty"] = current_source.get("gitDirty")
         expected_proof_id = host_bridge_parity_proof_id(results, current_source, enforce_current_source=True)
@@ -3716,6 +3772,13 @@ def _host_bridge_parity_report_proof(settings: Any) -> dict[str, Any]:
             if proved_manifest_sha != current_manifest_sha:
                 findings.append(
                     "Persisted parity report sourceManifestSha256 does not match current HostBridge source; "
+                    "regenerate macOS and Windows full probe artifacts from the current checkout."
+                )
+        if isinstance(current_file_count, int) and len(source_file_counts) == 2:
+            proved_file_count = next(iter(source_file_counts.values()))
+            if proved_file_count != current_file_count:
+                findings.append(
+                    "Persisted parity report sourceFileCount does not match current HostBridge source; "
                     "regenerate macOS and Windows full probe artifacts from the current checkout."
                 )
         if isinstance(current_git_head, str) and len(git_heads) == 2:
@@ -3811,21 +3874,46 @@ def _host_bridge_contract_gap_names(contract: dict[str, Any]) -> list[str]:
     return gaps
 
 
-def _host_bridge_parity_commands(host_platform: str | None = None) -> dict[str, str]:
-    parity_run_id = f"atrium-{now_ms()}-{uuid.uuid4()}"
-    source = host_bridge_source_provenance()
+def _host_bridge_parity_commands(
+    host_platform: str | None = None,
+    current_source: dict[str, Any] | None = None,
+    local_artifacts: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    handoff = local_artifacts.get("handoff") if isinstance(local_artifacts, dict) else None
+    handoff_run_id = handoff.get("parityRunId") if isinstance(handoff, dict) else None
+    if (
+        isinstance(handoff_run_id, str)
+        and handoff_run_id.strip()
+        and isinstance(handoff, dict)
+        and handoff.get("usable") is True
+        and handoff.get("sourceStatus") == "current"
+    ):
+        parity_run_id = handoff_run_id
+    else:
+        parity_run_id = f"atrium-{now_ms()}-{uuid.uuid4()}"
+    source = current_source if isinstance(current_source, dict) else host_bridge_source_provenance()
     source_fingerprint = str(source.get("sourceFingerprint") or "")
     source_manifest_sha = str(source.get("sourceManifestSha256") or source_fingerprint)
     source_file_count = source.get("sourceFileCount")
     macos_artifact = "/tmp/atrium_host_bridge_macos_live.json"
+    macos_smoke_artifact = "/tmp/atrium_host_bridge_macos_smoke.json"
     windows_handoff_artifact = "/tmp/atrium_windows_handoff.json"
     windows_artifact_on_windows = "C:\\Temp\\atrium_host_bridge_windows_live.json"
+    windows_smoke_artifact = "C:\\Temp\\atrium_host_bridge_windows_smoke.json"
+    windows_probe_artifact = "C:\\Temp\\atrium_host_bridge_windows_probe.json"
     windows_artifact_local = "/tmp/atrium_host_bridge_windows_live.json"
     output = "system/data/host-bridge-parity-report.json"
     quoted_windows_source = shlex.quote(windows_artifact_on_windows)
     report_command = (
         f"{_host_bridge_parity_report_command(host_platform)} "
         f"--macos {macos_artifact} --windows {windows_artifact_local} "
+        "--max-artifact-age-hours 24.0 "
+        f"--windows-source-path {quoted_windows_source}"
+    )
+    accept_windows_command = (
+        f"{_atrium_launcher_for_platform(host_platform)} automation accept-windows "
+        f"{windows_artifact_local} "
+        f"--handoff {windows_handoff_artifact} "
         "--max-artifact-age-hours 24.0 "
         f"--windows-source-path {quoted_windows_source}"
     )
@@ -3854,10 +3942,17 @@ def _host_bridge_parity_commands(host_platform: str | None = None) -> dict[str, 
             ".\\atrium.ps1 automation source "
             f"{windows_source_validate_args} --json"
         ),
+        "mcpGatewaySetupJson": ".\\atrium.ps1 tools mcp-gateway --json",
+        "mcpGatewayProbeJson": ".\\atrium.ps1 tools mcp-probe --json",
+        "mcpGatewayStatusJson": ".\\atrium.ps1 tools status --json",
         "macosProbe": (
             "uv --project system run python ops/macos_host_bridge_probe.py "
             f"--full --parity-run-id {parity_run_id} "
             f"{source_validate_args} --output {macos_artifact}"
+        ),
+        "macosSmoke": (
+            "./atrium automation smoke --browser-url http://127.0.0.1:5173 "
+            f"--browser-profile atrium --output {macos_smoke_artifact}"
         ),
         "macosArtifact": macos_artifact,
         "macosArtifactValidate": (
@@ -3874,7 +3969,11 @@ def _host_bridge_parity_commands(host_platform: str | None = None) -> dict[str, 
         "windowsProbe": (
             ".\\atrium.ps1 automation windows-probe "
             f"--full --parity-run-id {parity_run_id} "
-            f"{windows_source_validate_args} --output {windows_artifact_on_windows}"
+            f"{windows_source_validate_args} --output {windows_probe_artifact}"
+        ),
+        "nativeBrowserDesktopSmoke": (
+            ".\\atrium.ps1 automation smoke --browser-url http://127.0.0.1:5173 "
+            f"--browser-profile atrium --output {windows_smoke_artifact}"
         ),
         "windowsLiveProofRunner": (
             ".\\atrium.ps1 automation windows-live-proof "
@@ -3882,6 +3981,7 @@ def _host_bridge_parity_commands(host_platform: str | None = None) -> dict[str, 
             f"--source-fingerprint {source_fingerprint} "
             f"--source-manifest-sha256 {source_manifest_sha} "
             f"--source-file-count {source_file_count} "
+            "--max-artifact-age-hours 24.0 "
             f"--output {windows_artifact_on_windows}"
         ),
         "windowsArtifactValidateOnWindows": (
@@ -3900,6 +4000,7 @@ def _host_bridge_parity_commands(host_platform: str | None = None) -> dict[str, 
             f"--label windows --expect-parity-run-id {parity_run_id} "
             f"{source_validate_args} --max-artifact-age-hours 24.0 --json {windows_artifact_local}"
         ),
+        "acceptWindowsArtifact": accept_windows_command,
         "report": report_command,
         "automationReport": report_command,
         "verify": _host_bridge_parity_audit_command(host_platform),
@@ -3911,13 +4012,456 @@ def _host_bridge_parity_commands(host_platform: str | None = None) -> dict[str, 
     }
 
 
+def _host_bridge_native_parity_matrix(host_platform: str | None, commands: dict[str, str]) -> dict[str, Any]:
+    launcher = _atrium_launcher_for_platform(host_platform)
+    surfaces = [
+        {
+            "id": "install",
+            "label": "Native install and setup",
+            "macos": ["./atrium setup --yes", "ops/install_macos.sh"],
+            "windows": [".\\atrium.ps1 setup --yes", "ops/install_windows_native.ps1"],
+        },
+        {
+            "id": "lifecycle",
+            "label": "Start, stop, restart, and process truth",
+            "macos": ["./atrium start", "./atrium stop", "./atrium restart", "./atrium status --json"],
+            "windows": [".\\atrium.ps1 start", ".\\atrium.ps1 stop", ".\\atrium.ps1 restart --force", ".\\atrium.ps1 status --json"],
+        },
+        {
+            "id": "runtime_status",
+            "label": "Runtime and provider readiness status",
+            "macos": ["./atrium doctor --json", "./atrium status --json", "./atrium provider status --probe --json"],
+            "windows": [".\\atrium.ps1 doctor --json", ".\\atrium.ps1 status --json", ".\\atrium.ps1 provider status --probe --json"],
+        },
+        {
+            "id": "provider_login",
+            "label": "Provider login, account switch, and credential reference",
+            "macos": [
+                "./atrium provider reference --json",
+                "./atrium provider env --json",
+                "./atrium provider login chatgpt",
+                "./atrium provider login claude-code",
+                "./atrium provider disconnect chatgpt",
+                "./atrium provider disconnect claude-code",
+            ],
+            "windows": [
+                ".\\atrium.ps1 provider reference --json",
+                ".\\atrium.ps1 provider env --json",
+                ".\\atrium.ps1 provider login chatgpt",
+                ".\\atrium.ps1 provider login claude-code",
+                ".\\atrium.ps1 provider disconnect chatgpt",
+                ".\\atrium.ps1 provider disconnect claude-code",
+            ],
+        },
+        {
+            "id": "ai_tools",
+            "label": "AI tool registry, catalog, and MCP gateway",
+            "macos": ["./atrium tools status --json", "./atrium tools mcp-gateway --json", "./atrium tools mcp-probe --json", "./atrium tools catalog --json"],
+            "windows": [".\\atrium.ps1 tools status --json", ".\\atrium.ps1 tools mcp-gateway --json", ".\\atrium.ps1 tools mcp-probe --json", ".\\atrium.ps1 tools catalog --json"],
+        },
+        {
+            "id": "browser_desktop_tools",
+            "label": "Browser and desktop automation tools",
+            "macos": [
+                "./atrium automation status --commands",
+                str(commands.get("macosSmoke") or "./atrium automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium"),
+                str(commands.get("macosProbe") or "uv --project system run python ops/macos_host_bridge_probe.py --full"),
+            ],
+            "windows": [
+                ".\\atrium.ps1 automation status --commands",
+                str(commands.get("nativeBrowserDesktopSmoke") or ".\\atrium.ps1 automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium"),
+                str(commands.get("windowsLiveProofRunner") or ".\\atrium.ps1 automation windows-live-proof"),
+            ],
+        },
+        {
+            "id": "logs_support_report",
+            "label": "Logs and support report",
+            "macos": ["./atrium logs --json", "./atrium report --bundle"],
+            "windows": [".\\atrium.ps1 logs --json", ".\\atrium.ps1 report --bundle"],
+        },
+        {
+            "id": "automation_permission",
+            "label": "Owner automation permission and OpenClaw audit gate",
+            "macos": ["./atrium permissions status --json", "./atrium permissions set full_auto --agent-full-access true", f"{launcher} automation audit"],
+            "windows": [".\\atrium.ps1 permissions status --json", ".\\atrium.ps1 permissions set full_auto --agent-full-access true", ".\\atrium.ps1 automation audit"],
+        },
+    ]
+    return {
+        "host": host_platform or sys.platform,
+        "launcher": launcher,
+        "nativeOnly": True,
+        "windowsNativeHostOnly": True,
+        "evidenceType": "api_command_surface; live Windows proof artifact is still required for final parity",
+        "surfaces": surfaces,
+    }
+
+
+def _native_runtime_status_payload(host_platform: str | None, host_bridge: dict[str, Any] | None = None) -> dict[str, Any]:
+    platform_name = str(host_platform or sys.platform)
+    launcher = _atrium_launcher_for_platform(platform_name)
+    is_windows = platform_name == "win32"
+    bridge = host_bridge if isinstance(host_bridge, dict) else {}
+    commands = {
+        "doctorJson": f"{launcher} doctor --json",
+        "statusJson": f"{launcher} status --json",
+        "logsJson": f"{launcher} logs --json",
+        "reportBundle": f"{launcher} report --bundle",
+        "providerStatus": f"{launcher} provider status --probe --json",
+        "providerReference": f"{launcher} provider reference --json",
+        "providerEnv": f"{launcher} provider env --json",
+        "providerLoginChatGPT": f"{launcher} provider login chatgpt",
+        "providerLoginClaudeCode": f"{launcher} provider login claude-code",
+        "providerDisconnectChatGPT": f"{launcher} provider disconnect chatgpt",
+        "providerDisconnectClaudeCode": f"{launcher} provider disconnect claude-code",
+        "toolsStatus": f"{launcher} tools status --json",
+        "toolsMcpGateway": f"{launcher} tools mcp-gateway --json",
+        "toolsMcpProbe": f"{launcher} tools mcp-probe --json",
+        "toolsCatalog": f"{launcher} tools catalog --json",
+        "permissionsStatus": f"{launcher} permissions status --json",
+        "permissionsFullAuto": f"{launcher} permissions set full_auto --agent-full-access true",
+        "automationStatus": f"{launcher} automation status --commands",
+        "automationSource": f"{launcher} automation source --json",
+        "automationHandoff": f"{launcher} automation handoff --macos <macos-json>",
+        "automationSmoke": (
+            f"{launcher} automation smoke --browser-url http://127.0.0.1:5173 "
+            "--browser-profile atrium"
+        ),
+        "automationReport": (
+            f"{launcher} automation report --macos <macos-json> "
+            "--windows <copied-windows-json> --max-artifact-age-hours 24.0"
+        ),
+        "automationAudit": f"{launcher} automation audit",
+    }
+    if is_windows:
+        commands["start"] = ".\\atrium.ps1 start"
+        commands["stop"] = ".\\atrium.ps1 stop"
+        commands["restart"] = ".\\atrium.ps1 restart --force"
+        commands["automationWindowsProbe"] = (
+            ".\\atrium.ps1 automation windows-probe --full "
+            "--browser-url http://127.0.0.1:5173 --browser-profile atrium "
+            "--output C:\\Temp\\atrium_host_bridge_windows_probe.json"
+        )
+        commands["automationWindowsLiveProof"] = (
+            ".\\atrium.ps1 automation windows-live-proof "
+            "--parity-run-id <parity-run-id> "
+            "--source-fingerprint <fingerprint> "
+            "--source-manifest-sha256 <manifest-sha256> "
+            "--source-file-count <count> "
+            "--max-artifact-age-hours 24.0 "
+            "--output C:\\Temp\\atrium_host_bridge_windows_live.json"
+        )
+        commands["automationWindowsArtifactValidate"] = (
+            ".\\atrium.ps1 automation artifact --label windows "
+            "--expect-parity-run-id <parity-run-id> "
+            "--expect-source-fingerprint <fingerprint> "
+            "--expect-source-manifest-sha256 <manifest-sha256> "
+            "--expect-source-file-count <count> "
+            "--max-artifact-age-hours 24.0 --json "
+            "C:\\Temp\\atrium_host_bridge_windows_live.json"
+        )
+        commands["automationAcceptWindows"] = (
+            ".\\atrium.ps1 automation accept-windows <copied-windows-json> "
+            "--handoff <handoff-json> "
+            "--max-artifact-age-hours 24.0 "
+            "--windows-source-path 'C:\\Temp\\atrium_host_bridge_windows_live.json'"
+        )
+    else:
+        commands["start"] = "./atrium start"
+        commands["stop"] = "./atrium stop"
+        commands["restart"] = "./atrium restart"
+    return {
+        "hostPlatform": platform_name,
+        "launcher": launcher,
+        "nativeOnly": True,
+        "windowsNative": is_windows,
+        "windowsNativePrimary": True,
+        "windowsNativeHostOnly": True,
+        "browserAutomationReady": bridge.get("browserAutomationReady"),
+        "desktopAutomationReady": bridge.get("desktopAutomationReady"),
+        "interactiveSession": bridge.get("interactiveSession"),
+        "commands": commands,
+    }
+
+
+def _host_bridge_load_json_file(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None, "missing"
+    except json.JSONDecodeError as exc:
+        return None, f"invalid JSON: {exc}"
+    except OSError as exc:
+        return None, f"read failed: {type(exc).__name__}: {exc}"
+    if not isinstance(payload, dict):
+        return None, "JSON root is not an object"
+    return payload, None
+
+
+def _host_bridge_source_fingerprint_status(value: object, current_source: dict[str, Any]) -> str:
+    current = current_source.get("sourceFingerprint")
+    if not isinstance(value, str) or not value.strip():
+        return "missing"
+    if isinstance(current, str) and value == current:
+        return "current"
+    return "stale"
+
+
+HOST_BRIDGE_REQUIRED_WINDOWS_PROOF_FACETS = (
+    "browserOpen",
+    "browserOpenIsolatedProfile",
+    "browserSnapshot",
+    "browserSnapshotIsolatedPlaywright",
+    "browserAct",
+    "browserActIsolatedPlaywright",
+    "browserActVerified",
+    "appsDiscovery",
+    "screenshotFile",
+    "notification",
+    "desktopAutomationReady",
+    "interactiveSession",
+    "windowsInteractiveSessionIdentity",
+    "windowsVisualPreflight",
+    "helperSelftest",
+    "powershellPreflight",
+    "windowsDpiAwareness",
+    "windowsVirtualScreen",
+    "windowsForegroundActivation",
+    "windowsUnicodeTyping",
+    "windowsKeyboardShortcut",
+    "mcpExternalWriteReady",
+    "windowsLiveProofRunner",
+    "notepadNativeAct",
+    "clipboardRoundTrip",
+)
+HOST_BRIDGE_WINDOWS_FAILURE_STAGE_IDS = (
+    "source_validate",
+    "mcp_external_write",
+    "windows_full_probe",
+    "artifact_validate",
+)
+HOST_BRIDGE_WINDOWS_READINESS_GATE_IDS = (
+    "source",
+    "mcpExternalWrite",
+    "browserDesktopSmoke",
+    "artifactValidation",
+)
+
+
+def _host_bridge_handoff_contract_findings(handoff: dict[str, Any]) -> list[str]:
+    findings: list[str] = []
+    windows_proof = handoff.get("windowsProof") if isinstance(handoff.get("windowsProof"), dict) else {}
+    required_facets = windows_proof.get("requiredProofFacets")
+    required_set = {str(item) for item in required_facets} if isinstance(required_facets, list) else set()
+    expected_set = set(HOST_BRIDGE_REQUIRED_WINDOWS_PROOF_FACETS)
+    if required_set != expected_set:
+        missing = sorted(expected_set - required_set)
+        extra = sorted(required_set - expected_set)
+        detail = []
+        if missing:
+            detail.append("missing=" + ",".join(missing[:6]))
+        if extra:
+            detail.append("extra=" + ",".join(extra[:6]))
+        findings.append("requiredProofFacets mismatch" + (": " + "; ".join(detail) if detail else ""))
+    if windows_proof.get("proofFacetCount") != len(HOST_BRIDGE_REQUIRED_WINDOWS_PROOF_FACETS):
+        findings.append(
+            "proofFacetCount mismatch: "
+            f"handoff={windows_proof.get('proofFacetCount')}; expected={len(HOST_BRIDGE_REQUIRED_WINDOWS_PROOF_FACETS)}"
+        )
+    failure_stages = windows_proof.get("failureStages") if isinstance(windows_proof.get("failureStages"), dict) else {}
+    for stage_id in HOST_BRIDGE_WINDOWS_FAILURE_STAGE_IDS:
+        stage = failure_stages.get(stage_id) if isinstance(failure_stages, dict) else None
+        if not isinstance(stage, dict) or stage.get("stage") != stage_id:
+            findings.append(f"failureStages.{stage_id} is missing or invalid")
+    readiness_gates = windows_proof.get("readinessGates") if isinstance(windows_proof.get("readinessGates"), dict) else {}
+    for gate_id in HOST_BRIDGE_WINDOWS_READINESS_GATE_IDS:
+        gate = readiness_gates.get(gate_id) if isinstance(readiness_gates, dict) else None
+        if not isinstance(gate, dict) or not gate.get("stage"):
+            findings.append(f"readinessGates.{gate_id} is missing or invalid")
+    mcp_gate = readiness_gates.get("mcpExternalWrite") if isinstance(readiness_gates, dict) else {}
+    if not isinstance(mcp_gate, dict) or mcp_gate.get("stage") != "mcp_external_write" or mcp_gate.get("proofFacet") != "mcpExternalWriteReady":
+        findings.append("readinessGates.mcpExternalWrite must bind mcp_external_write to mcpExternalWriteReady")
+    return findings
+
+
+def _host_bridge_mark_artifact_usability(item: dict[str, Any]) -> None:
+    source_status = item.get("sourceStatus")
+    contract_status = item.get("contractStatus")
+    exists = item.get("exists") is True
+    ok = item.get("ok") is True
+    contract_current = contract_status in (None, "current")
+    item["usable"] = bool(exists and ok and source_status == "current" and contract_current)
+    item["refreshRequired"] = source_status == "stale" or contract_status == "stale"
+
+
+def _host_bridge_failed_artifact_checks(payload: dict[str, Any]) -> list[str]:
+    checks = payload.get("checks")
+    if not isinstance(checks, dict):
+        mode = str(payload.get("mode") or "").strip()
+        if payload.get("ok") is False and mode == "windows_live_proof_failed":
+            return ["windows_live_proof_failed"]
+        return ["artifact ok=false"] if payload.get("ok") is False else []
+    failed: list[str] = []
+    for name, value in checks.items():
+        if not isinstance(name, str) or not isinstance(value, dict):
+            continue
+        return_code = value.get("returnCode")
+        if (
+            value.get("ok") is False
+            or value.get("verified") is False
+            or (return_code not in (None, 0))
+            or bool(value.get("error"))
+            or bool(value.get("stderr"))
+        ):
+            failed.append(name)
+    if not failed and payload.get("ok") is False:
+        failed.append("artifact ok=false")
+    return failed
+
+
+def _host_bridge_artifact_source_fingerprint(payload: dict[str, Any]) -> Any:
+    artifact_source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+    nested = artifact_source.get("sourceFingerprint")
+    if isinstance(nested, str) and nested.strip():
+        return nested
+    top_level = payload.get("sourceFingerprint")
+    if isinstance(top_level, str) and top_level.strip():
+        return top_level
+    preflight = payload.get("preflight") if isinstance(payload.get("preflight"), dict) else {}
+    preflight_value = preflight.get("sourceFingerprint")
+    if isinstance(preflight_value, str) and preflight_value.strip():
+        return preflight_value
+    return top_level
+
+
+def _host_bridge_local_proof_artifacts(current_source: dict[str, Any] | None = None) -> dict[str, Any]:
+    source = current_source if isinstance(current_source, dict) else host_bridge_source_provenance()
+    current_fingerprint = source.get("sourceFingerprint")
+    macos_path = Path("/tmp/atrium_host_bridge_macos_live.json")
+    windows_path = Path("/tmp/atrium_host_bridge_windows_live.json")
+    handoff_path = Path("/tmp/atrium_windows_handoff.json")
+    artifacts: dict[str, Any] = {
+        "currentSourceFingerprint": current_fingerprint if isinstance(current_fingerprint, str) else None,
+    }
+    for label, path in (("macos", macos_path), ("windowsLocal", windows_path)):
+        payload, error = _host_bridge_load_json_file(path)
+        item: dict[str, Any] = {"path": str(path), "exists": payload is not None}
+        if error:
+            item["status"] = error
+        if isinstance(payload, dict):
+            fingerprint = _host_bridge_artifact_source_fingerprint(payload)
+            item.update({
+                "ok": payload.get("ok") is True,
+                "mode": payload.get("mode"),
+                "parityRunId": payload.get("parityRunId"),
+                "sourceFingerprint": fingerprint,
+                "sourceStatus": _host_bridge_source_fingerprint_status(fingerprint, source),
+                "generatedAt": payload.get("generatedAt"),
+            })
+            error_text = str(payload.get("error") or "").strip()
+            if error_text:
+                item["error"] = error_text[:240]
+            failed_stage = str(payload.get("failedStage") or "").strip()
+            if failed_stage:
+                item["failureStage"] = failed_stage
+            next_steps = payload.get("nextSteps")
+            if isinstance(next_steps, dict):
+                item["failureNextSteps"] = next_steps
+            partial_artifact = payload.get("partialArtifact")
+            if isinstance(partial_artifact, dict):
+                item["failurePartialArtifact"] = partial_artifact
+            preflight = payload.get("preflight") if isinstance(payload.get("preflight"), dict) else {}
+            os_preflight = preflight.get("os") if isinstance(preflight.get("os"), dict) else {}
+            if os_preflight:
+                item["preflight"] = {
+                    "sessionName": os_preflight.get("sessionName"),
+                    "isElevated": os_preflight.get("isElevated"),
+                    "isWindows": os_preflight.get("isWindows"),
+                }
+            failed_checks = _host_bridge_failed_artifact_checks(payload)
+            if failed_checks:
+                item["failedChecks"] = failed_checks[:8]
+        _host_bridge_mark_artifact_usability(item)
+        artifacts[label] = item
+
+    handoff, handoff_error = _host_bridge_load_json_file(handoff_path)
+    handoff_item: dict[str, Any] = {"path": str(handoff_path), "exists": handoff is not None}
+    if handoff_error:
+        handoff_item["status"] = handoff_error
+    if isinstance(handoff, dict):
+        handoff_source = handoff.get("source") if isinstance(handoff.get("source"), dict) else {}
+        macos_artifact = handoff.get("macosArtifact") if isinstance(handoff.get("macosArtifact"), dict) else {}
+        windows_proof = handoff.get("windowsProof") if isinstance(handoff.get("windowsProof"), dict) else {}
+        windows_commands = windows_proof.get("commands") if isinstance(windows_proof.get("commands"), dict) else {}
+        operator_checklist = windows_proof.get("operatorChecklist") if isinstance(windows_proof.get("operatorChecklist"), list) else []
+        required_facets = (
+            windows_proof.get("requiredProofFacets")
+            if isinstance(windows_proof.get("requiredProofFacets"), list)
+            else []
+        )
+        proof_facet_count = windows_proof.get("proofFacetCount")
+        if not isinstance(proof_facet_count, int) or proof_facet_count < 0:
+            proof_facet_count = len(required_facets)
+        fingerprint = handoff_source.get("sourceFingerprint")
+        handoff_source_status = _host_bridge_source_fingerprint_status(fingerprint, source)
+        handoff_item.update({
+            "ok": handoff.get("ok") is True,
+            "kind": handoff.get("kind"),
+            "parityRunId": macos_artifact.get("parityRunId"),
+            "sourceFingerprint": fingerprint,
+            "sourceStatus": handoff_source_status,
+            "generatedAt": handoff.get("generatedAt"),
+            "proofFacetCount": proof_facet_count,
+        })
+        if required_facets:
+            handoff_item["requiredProofFacets"] = required_facets
+        contract_findings = _host_bridge_handoff_contract_findings(handoff)
+        handoff_item["contractStatus"] = "stale" if contract_findings else "current"
+        if contract_findings:
+            handoff_item["contractFindings"] = contract_findings[:8]
+        windows_item = artifacts.get("windowsLocal")
+        if isinstance(windows_item, dict):
+            windows_item["expectedProofFacetCount"] = proof_facet_count
+            windows_item["expectedContractStatus"] = handoff_item["contractStatus"]
+            if contract_findings:
+                windows_item["contractStatus"] = "stale"
+                windows_item["contractFindings"] = contract_findings[:8]
+            if required_facets:
+                windows_item["requiredProofFacets"] = required_facets
+            if windows_item.get("exists") is not True:
+                windows_item["sourceStatus"] = handoff_source_status
+                windows_item["refreshRequired"] = handoff_source_status == "stale"
+                windows_item["usable"] = False
+            if isinstance(windows_proof.get("outputPath"), str):
+                windows_item["copySourcePath"] = windows_proof["outputPath"]
+            if isinstance(windows_proof.get("copyInstruction"), str):
+                windows_item["copyInstruction"] = windows_proof["copyInstruction"]
+            if isinstance(windows_commands.get("artifactValidate"), str):
+                windows_item["validateOnWindowsCommand"] = windows_commands["artifactValidate"]
+            if isinstance(windows_commands.get("liveProof"), str):
+                windows_item["liveProofCommand"] = windows_commands["liveProof"]
+            if operator_checklist:
+                windows_item["operatorChecklist"] = operator_checklist
+            if isinstance(macos_artifact.get("parityRunId"), str):
+                windows_item["expectedParityRunId"] = macos_artifact["parityRunId"]
+            if isinstance(fingerprint, str):
+                windows_item["expectedSourceFingerprint"] = fingerprint
+            _host_bridge_mark_artifact_usability(windows_item)
+    _host_bridge_mark_artifact_usability(handoff_item)
+    artifacts["handoff"] = handoff_item
+    return artifacts
+
+
 def _openclaw_windows_command_surface_ready(cli_text: str) -> bool:
     required_tokens = (
         'action == "audit"',
         'action == "artifact"',
         'action == "handoff"',
         'action == "report"',
+        'action == "smoke"',
+        'action == "windows-probe"',
+        'action == "windows-live-proof"',
         'automation_status.add_argument("--json"',
+        "--max-artifact-age-hours",
         "HOST_BRIDGE_PARITY_REPORT",
         "ops/host_bridge_parity_report.py",
         "--skip-current-source-check",
@@ -3925,6 +4469,36 @@ def _openclaw_windows_command_surface_ready(cli_text: str) -> bool:
         "OpenClaw Windows contract",
     )
     return all(token in cli_text for token in required_tokens)
+
+
+def _windows_native_only_forbidden_terms() -> tuple[str, ...]:
+    linux = "linux"
+    windows = "windows"
+    return (
+        linux + " compatibility layer",
+        linux + " compatibility fallback",
+        linux + " shell fallback",
+        linux + " subsystem",
+        "non-native " + windows + " fallback",
+        windows + " compatibility layer",
+    )
+
+
+def _windows_native_only_text_scan(scopes: dict[str, str]) -> dict[str, Any]:
+    terms = _windows_native_only_forbidden_terms()
+    hits: list[dict[str, str]] = []
+    for scope, text in scopes.items():
+        lower_text = text.lower()
+        for term in terms:
+            matched = term.lower() in lower_text
+            if matched:
+                hits.append({"scope": scope, "term": term})
+    return {
+        "ok": not hits,
+        "checkedScopes": sorted(scopes),
+        "hitCount": len(hits),
+        "hits": hits,
+    }
 
 
 def _host_bridge_openclaw_level_contract(
@@ -3941,19 +4515,102 @@ def _host_bridge_openclaw_level_contract(
     platform = str(host_bridge.get("platform") or sys.platform)
     repo_root = Path(__file__).resolve().parents[2]
     route_paths = {str(getattr(route, "path", "")) for route in app.routes}
+    macos_launcher_path = repo_root / "atrium"
+    macos_installer_path = repo_root / "ops" / "install_macos.sh"
     windows_launcher_path = repo_root / "atrium.ps1"
     windows_cmd_launcher_path = repo_root / "atrium.cmd"
     windows_installer_path = repo_root / "ops" / "install_windows_native.ps1"
+    readme_path = repo_root / "README.md"
+    ops_readme_path = repo_root / "ops" / "README.md"
     cli_path = repo_root / "ops" / "atrium_cli.py"
     main_path = repo_root / "system" / "app" / "main.py"
+    macos_launcher_text = macos_launcher_path.read_text(encoding="utf-8", errors="ignore") if macos_launcher_path.exists() else ""
+    macos_installer_text = macos_installer_path.read_text(encoding="utf-8", errors="ignore") if macos_installer_path.exists() else ""
     windows_launcher_text = windows_launcher_path.read_text(encoding="utf-8", errors="ignore") if windows_launcher_path.exists() else ""
     windows_cmd_launcher_text = windows_cmd_launcher_path.read_text(encoding="utf-8", errors="ignore") if windows_cmd_launcher_path.exists() else ""
     windows_installer_text = windows_installer_path.read_text(encoding="utf-8", errors="ignore") if windows_installer_path.exists() else ""
+    readme_text = readme_path.read_text(encoding="utf-8", errors="ignore") if readme_path.exists() else ""
+    ops_readme_text = ops_readme_path.read_text(encoding="utf-8", errors="ignore") if ops_readme_path.exists() else ""
+    windows_docs_text = f"{readme_text}\n{ops_readme_text}"
+    macos_docs_text = windows_docs_text
     cli_text = cli_path.read_text(encoding="utf-8", errors="ignore") if cli_path.exists() else ""
     main_text = main_path.read_text(encoding="utf-8", errors="ignore") if main_path.exists() else ""
+    windows_native_only_scopes = {
+        "README.md": readme_text,
+        "ops/README.md": ops_readme_text,
+    }
+    for rel_path in SOURCE_FINGERPRINT_FILES:
+        source_path = repo_root / rel_path
+        windows_native_only_scopes[rel_path] = (
+            source_path.read_text(encoding="utf-8", errors="ignore")
+            if source_path.exists()
+            else ""
+        )
+    windows_native_only_scan = _windows_native_only_text_scan(windows_native_only_scopes)
+    macos_native_command_surface_ready = (
+        macos_launcher_path.exists()
+        and macos_installer_path.exists()
+        and "ops/atrium_cli.py" in macos_launcher_text
+        and "python3" in macos_launcher_text
+        and "./atrium setup --yes" in macos_installer_text
+        and "./atrium doctor --json" in macos_installer_text
+        and "./atrium status --json" in macos_installer_text
+        and "./atrium provider status --probe --json" in macos_installer_text
+        and "./atrium provider reference --json" in macos_installer_text
+        and "./atrium provider env --json" in macos_installer_text
+        and "./atrium provider login chatgpt" in macos_installer_text
+        and "./atrium provider login claude-code" in macos_installer_text
+        and "./atrium permissions status --json" in macos_installer_text
+        and "./atrium permissions set full_auto --agent-full-access true" in macos_installer_text
+        and "./atrium tools status --json" in macos_installer_text
+        and "./atrium tools catalog --json" in macos_installer_text
+        and "./atrium automation status --commands" in macos_installer_text
+        and "./atrium automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium" in macos_installer_text
+        and "./atrium logs --json" in macos_installer_text
+        and "./atrium report --bundle" in macos_installer_text
+        and "def print_native_next_checks" in cli_text
+        and "./atrium automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium --output /tmp/atrium_host_bridge_macos_smoke.json" in cli_text
+        and "./atrium automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium" in macos_docs_text
+        and "macOS Runtime Control" in ops_readme_text
+    )
     windows_cmd_launcher_ready = all(
         token.lower() in windows_cmd_launcher_text.lower()
-        for token in ("powershell.exe", "pwsh.exe", "-ExecutionPolicy Bypass", "atrium.ps1", "%*", "Missing PowerShell")
+        for token in (
+            "powershell.exe",
+            "pwsh.exe",
+            "-ExecutionPolicy Bypass",
+            "atrium.ps1",
+            "%*",
+            "goto try_pwsh",
+            "try_system_powershell",
+            "%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+            "%SystemRoot%\\SysWOW64\\WindowsPowerShell\\v1.0\\powershell.exe",
+            "%ProgramFiles%\\PowerShell\\7\\pwsh.exe",
+            "goto missing_powershell",
+            "Missing PowerShell",
+        )
+    )
+    windows_standard_powershell_path_fallback_ready = (
+        "%systemroot%\\system32\\windowspowershell\\v1.0\\powershell.exe" in windows_cmd_launcher_text.lower()
+        and "%systemroot%\\syswow64\\windowspowershell\\v1.0\\powershell.exe" in windows_cmd_launcher_text.lower()
+        and "%programfiles%\\powershell\\7\\pwsh.exe" in windows_cmd_launcher_text.lower()
+        and "SystemRoot" in cli_text
+        and "ProgramFiles" in cli_text
+        and "SystemRoot" in main_text
+        and "ProgramFiles" in main_text
+    )
+    windows_fresh_install_one_liner_ready = all(
+        token in windows_docs_text
+        for token in (
+            "ops/install_windows_native.ps1",
+            "$PSHOME\\powershell.exe",
+            "$PSHOME\\pwsh.exe",
+            "$env:SystemRoot\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
+            "$env:SystemRoot\\SysWOW64\\WindowsPowerShell\\v1.0\\powershell.exe",
+            "$env:ProgramFiles\\PowerShell\\7\\pwsh.exe",
+            "${env:ProgramFiles(x86)}\\PowerShell\\7\\pwsh.exe",
+            "if(-not $runnerPath)",
+        )
     )
     windows_ps1_launcher_ready = all(
         token in windows_launcher_text
@@ -3965,6 +4622,7 @@ def _host_bridge_openclaw_level_contract(
             "Python3*",
             "Python312",
             "Python311",
+            "PowerShell\\7",
             "uv",
             "Python 3 is required",
         )
@@ -3976,7 +4634,14 @@ def _host_bridge_openclaw_level_contract(
             "Test-Python3Available",
             "Install-PythonIfMissing",
             "Invoke-Native",
+            "Invoke-WingetInstall",
             "$LASTEXITCODE",
+            "Resolve-PowerShell",
+            "pwsh.exe",
+            "winget source update",
+            "Join-Path $env:SystemRoot",
+            "PowerShell\\7",
+            'Exe = "python3"',
             "Python3*",
             "Python312",
             "Python311",
@@ -3994,6 +4659,12 @@ def _host_bridge_openclaw_level_contract(
             "corepack enable failed",
             "corepack pnpm activation failed",
             "Claude Code npm install failed",
+            "No supported browser is available yet",
+            "ATRIUM native setup failed",
+            "ConvertTo-PowerShellSingleQuotedLiteral",
+            "Run the next commands from the repo directory",
+            "Set-Location -LiteralPath $installPathLiteral",
+            'cd /d ""$installFullPath"""',
         )
     )
     windows_installer_setup_runner_ready = (
@@ -4011,20 +4682,75 @@ def _host_bridge_openclaw_level_contract(
         and windows_cmd_launcher_ready
         and windows_ps1_launcher_ready
         and windows_installer_ready
+        and windows_fresh_install_one_liner_ready
     )
     windows_process_truth_sources_ready = (
         cli_path.exists()
         and "BACKEND_PID" in cli_text
         and "UI_PID" in cli_text
         and "pid_detail" in cli_text
+        and "windows_process_identity" in cli_text
+        and "processIdentity" in cli_text
         and "windows_process_details" in cli_text
         and "windows_process_status" in cli_text
+        and "windows_popen_command" in cli_text
+        and "subprocess.list2cmdline" in cli_text
+        and '".cmd", ".bat"' in cli_text
         and "report_command_path" in cli_text
+    )
+    windows_entrypoint_diagnostics_ready = (
+        "postStartReadiness" in cli_text
+        and "nativeInstallerNextChecks" in cli_text
+        and "windows_openclaw_lifecycle_commands" in cli_text
+        and "print_native_next_checks" in cli_text
+        and "openclawLifecycleProof" in cli_text
+        and "windows.entrypoints.openclawLifecycleProof.ok" in cli_text
+        and "openclawLifecycleProof.checklist" in cli_text
+        and '"nativeProviderDisconnectChatGPT"' in cli_text
+        and '"nativeProviderDisconnectClaudeCode"' in cli_text
+        and "accountSwitchCommands" in cli_text
+        and ".\\atrium.ps1 provider reference --json" in windows_installer_text
+        and ".\\atrium.ps1 provider env --json" in windows_installer_text
+        and ".\\atrium.ps1 permissions status --json" in windows_installer_text
+        and ".\\atrium.ps1 permissions set full_auto --agent-full-access true" in windows_installer_text
+        and ".\\atrium.ps1 automation source --json" in windows_installer_text
+        and ".\\atrium.ps1 automation windows-live-proof" in windows_installer_text
+        and ".\\atrium.ps1 automation artifact --label windows" in windows_installer_text
+        and "--source-fingerprint <fingerprint>" in windows_installer_text
+        and "--source-manifest-sha256 <manifest>" in windows_installer_text
+        and "--source-file-count <count>" in windows_installer_text
+        and "--max-artifact-age-hours 24.0" in windows_installer_text
+        and ".\\atrium.ps1 automation smoke" in windows_installer_text
+        and "raw diagnostic; automation smoke is the normal native smoke command" in windows_installer_text
+        and "automation windows-probe --full" in windows_installer_text
     )
     windows_status_json_ready = (
         "def collect_status_payload" in cli_text
         and 'status.add_argument("--json"' in cli_text
         and "redact_json_value(collect_status_payload())" in cli_text
+        and "/api/runtime" in cli_text
+        and "/api/tools/catalog" in cli_text
+        and "/api/provider-auth/status" in cli_text
+        and "/api/permissions/mode" in cli_text
+        and "/api/host-bridge/parity" in cli_text
+        and "windowsRuntime" in cli_text
+        and "windowsEntryPoints" in cli_text
+        and "nativeNextChecks" in cli_text
+        and "nativeParityMatrix" in cli_text
+        and "toolCatalog" in cli_text
+        and "hostBridgeSource" in cli_text
+        and "localProofArtifacts" in cli_text
+        and "collect_windows_entrypoints_payload" in cli_text
+    )
+    windows_doctor_json_ready = (
+        "def collect_doctor_payload" in cli_text
+        and 'doctor.add_argument("--json"' in cli_text
+        and "redact_json_value(collect_doctor_payload())" in cli_text
+        and "def collect_docker_payload" in cli_text
+        and "windowsEntryPoints" in cli_text
+        and "nativeNextChecks" in cli_text
+        and "nativeParityMatrix" in cli_text
+        and "collect_windows_entrypoints_payload" in cli_text
         and "/api/runtime" in cli_text
         and "/api/provider-auth/status" in cli_text
         and "/api/permissions/mode" in cli_text
@@ -4035,19 +4761,83 @@ def _host_bridge_openclaw_level_contract(
         and "Python.Python.3.12" in cli_text
         and "Python 3 installation did not expose a runnable Python 3 command" in cli_text
     )
+    windows_cli_winget_retry_ready = (
+        "def run_winget_install" in cli_text
+        and '"source", "update"' in cli_text
+        and "--accept-source-agreements" in cli_text
+        and "--accept-package-agreements" in cli_text
+        and "Docker.DockerDesktop" in cli_text
+        and "Google.Chrome" in cli_text
+        and "Anthropic.ClaudeCode" in cli_text
+        and "winget install failed after source refresh" in cli_text
+    )
+    windows_start_readiness_gate_ready = (
+        "ATRIUM did not become ready within" in cli_text
+        and "Backend :8787 listener" in cli_text
+        and "Frontend :5173 listener" in cli_text
+        and "def print_post_start_readiness" in cli_text
+        and "Post-start Readiness" in cli_text
+        and "/api/tools/catalog" in cli_text
+        and "/api/connectors" in cli_text
+        and "status --json" in cli_text
+        and "logs --json" in cli_text
+    )
+    windows_lifecycle_command_surface_ready = (
+        "def command_start" in cli_text
+        and "def command_start_windows" in cli_text
+        and "def command_stop" in cli_text
+        and "def command_restart" in cli_text
+        and 'start.set_defaults(func=command_start)' in cli_text
+        and 'stop.set_defaults(func=command_stop)' in cli_text
+        and 'restart.set_defaults(func=command_restart)' in cli_text
+        and "windows_stop_process_tree" in cli_text
+        and "windows_stop_process(" in cli_text
+        and "nativeStart" in cli_text
+        and "nativeStop" in cli_text
+        and "nativeRestart" in cli_text
+        and ".\\atrium.ps1 start" in windows_installer_text
+        and ".\\atrium.ps1 stop" in windows_installer_text
+    )
+    windows_native_command_hint_ready = (
+        'start_hint = local_cli_command("start")' in cli_text
+        and "winget packages" in cli_text
+        and "start native Windows services" in cli_text
+    )
     windows_support_bundle_ready = (
         "def command_report" in cli_text
         and "--bundle" in cli_text
         and "zipfile.ZipFile" in cli_text
         and "support-report.txt" in cli_text
+        and "diagnostics/doctor.json" in cli_text
         and "diagnostics/status.json" in cli_text
         and "diagnostics/process.json" in cli_text
+        and "diagnostics/windows-runtime.json" in cli_text
+        and "diagnostics/windows-entrypoints.json" in cli_text
+        and "diagnostics/native-next-checks.json" in cli_text
+        and "diagnostics/native-parity-matrix.json" in cli_text
+        and "diagnostics/docker.json" in cli_text
+        and "diagnostics/host-bridge-source.json" in cli_text
+        and "diagnostics/local-proof-artifacts.json" in cli_text
         and "diagnostics/logs.json" in cli_text
+        and "diagnostics/runtime.json" in cli_text
+        and "diagnostics/connectors.json" in cli_text
+        and "diagnostics/tools-catalog.json" in cli_text
+        and "diagnostics/tools-mcp-gateway.json" in cli_text
+        and "diagnostics/tools-mcp-probe.json" in cli_text
+        and "diagnostics/host-bridge-parity.json" in cli_text
         and "diagnostics/permission-mode.json" in cli_text
         and "diagnostics/provider-status.json" in cli_text
+        and "diagnostics/provider-reference.json" in cli_text
+        and "diagnostics/provider-env.json" in cli_text
         and "diagnostics/tools-status.json" in cli_text
         and "diagnostics/automation-status.json" in cli_text
+        and "provider_reference:" in cli_text
+        and "provider_env:" in cli_text
+        and "summarize_provider_reference_payload(provider_reference_payload" in cli_text
+        and "summarize_provider_env_payload(provider_env_payload" in cli_text
         and "logs/{label}.log" in cli_text
+        and "summarize_windows_entrypoints_payload" in cli_text
+        and "windows.entrypoint.file." in cli_text
     )
     windows_logs_json_ready = (
         "def command_logs" in cli_text
@@ -4058,6 +4848,11 @@ def _host_bridge_openclaw_level_contract(
     windows_automation_permission_status_ready = (
         "def collect_automation_status_payload" in cli_text
         and "/api/permissions/mode" in cli_text
+        and "def command_permissions" in cli_text
+        and 'permissions_status.add_argument("--json"' in cli_text
+        and 'permissions_set.add_argument("mode"' in cli_text
+        and 'permissions_set.add_argument("--agent-full-access"' in cli_text
+        and 'backend_json_request("/api/permissions/mode", method="PATCH"' in cli_text
         and 'normalized["permissionMode"]' in cli_text
         and '"localArtifacts"' in cli_text
         and "automation_permission.local_artifacts" in cli_text
@@ -4070,53 +4865,179 @@ def _host_bridge_openclaw_level_contract(
         and 'sys.platform == "win32"' in main_text
         and ".\\\\atrium.ps1 restart --force" in main_text
         and "windows_native" in main_text
+        and "pwsh.exe" in main_text
+        and "SystemRoot" in main_text
+        and "PowerShell\" / \"7\" / \"pwsh.exe" in main_text
         and "powershell" in main_text.lower()
     )
     openclaw_command_surface_ready = _openclaw_windows_command_surface_ready(cli_text)
-    windows_provider_tools_command_surface_ready = all(
+    windows_provider_status_command_ready = (
+        "def command_provider" in cli_text
+        and 'provider_status.add_argument("--probe"' in cli_text
+        and 'provider_status.add_argument("--json"' in cli_text
+        and "/api/provider-auth/status" in cli_text
+        and "redact_json_value" in cli_text
+    )
+    windows_provider_login_command_ready = (
+        "provider_login.add_argument" in cli_text
+        and "provider_auth_start_path(target)" in cli_text
+        and "authorizationUrl" in cli_text
+        and "open_url(authorization_url.strip())" in cli_text
+        and "wait_provider_ready(target" in cli_text
+        and 'run_interactive([claude, "auth", "login", "--claudeai"]' in cli_text
+    )
+    windows_support_bundle_mcp_gateway_ready = "diagnostics/tools-mcp-gateway.json" in cli_text
+    windows_support_bundle_mcp_probe_ready = "diagnostics/tools-mcp-probe.json" in cli_text
+    windows_provider_disconnect_command_ready = (
+        "provider_disconnect.add_argument" in cli_text
+        and "provider_auth_disconnect_path(target)" in cli_text
+        and "provider_disconnect_summary(target, result)" in cli_text
+    )
+    windows_provider_reference_env_command_ready = (
+        "provider_reference.add_argument(\"--json\"" in cli_text
+        and "provider_env.add_argument(\"--json\"" in cli_text
+        and "/api/provider-auth/reference" in cli_text
+        and "/api/provider-auth/env" in cli_text
+        and "summarize_provider_reference_payload" in cli_text
+        and "summarize_provider_env_payload" in cli_text
+        and "diagnostics/provider-reference.json" in cli_text
+        and "diagnostics/provider-env.json" in cli_text
+    )
+    windows_provider_target_ready = all(
         token in cli_text
         for token in (
-            "def command_provider",
-            "def command_tools",
-            'provider_status.add_argument("--probe"',
-            'provider_status.add_argument("--json"',
-            'tools_status.add_argument("--json"',
-            'tools_catalog.add_argument("--json"',
-            "redact_json_value",
-            'getattr(os, "startfile"',
-            "Start-Process -FilePath",
-            "ps_single_quote(url)",
+            '"chatgpt": "chatgpt"',
+            '"chatgpt-account": "chatgpt"',
+            '"claude": "claude-code"',
+            '"claude-code": "claude-code"',
+        )
+    )
+    windows_provider_backend_endpoints_ready = all(
+        path in route_paths
+        for path in (
             "/api/provider-auth/status",
-            "/api/tools/catalog",
-            "/api/connectors",
-            "summarize_tool_catalog_payload",
+            "/api/provider-auth/chatgpt/start",
+            "/api/provider-auth/chatgpt/disconnect",
+            "/api/provider-auth/claude-code/start",
+            "/api/provider-auth/claude-code/disconnect",
+        )
+    )
+    windows_provider_tools_command_surface_ready = (
+        windows_provider_status_command_ready
+        and windows_provider_login_command_ready
+        and windows_provider_disconnect_command_ready
+        and windows_provider_reference_env_command_ready
+        and windows_provider_target_ready
+        and windows_provider_backend_endpoints_ready
+        and all(
+            token in cli_text
+            for token in (
+                "def command_tools",
+                'tools_status.add_argument("--json"',
+                'tools_mcp_gateway.add_argument("--json"',
+                'tools_mcp_probe.add_argument("--json"',
+                "mcp_gateway_setup_payload",
+                "/api/tools/mcp-gateway?probe=true",
+                'tools_catalog.add_argument("--json"',
+                "redact_json_value",
+                'getattr(os, "startfile"',
+                "Start-Process -FilePath",
+                "ps_single_quote(url)",
+                "/api/tools/catalog",
+                "/api/connectors",
+                "summarize_tool_catalog_payload",
+            )
         )
     )
     local_requirements = [
+        {
+            "id": "macos_native_lifecycle",
+            "label": "macOS-native setup/status/provider/tools/permissions/smoke/log/report",
+            "requiredEvidence": [
+                "./atrium setup --yes",
+                "./atrium doctor --json",
+                "./atrium status --json",
+                "./atrium provider status --probe --json",
+                "./atrium provider reference --json",
+                "./atrium provider env --json",
+                "./atrium provider login chatgpt",
+                "./atrium provider login claude-code",
+                "./atrium permissions status --json",
+                "./atrium permissions set full_auto --agent-full-access true",
+                "./atrium tools status --json",
+                "./atrium tools mcp-gateway --json",
+                "./atrium tools catalog --json",
+                "./atrium automation status --commands",
+                "./atrium automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium",
+                "./atrium logs --json",
+                "./atrium report --bundle",
+                "ops/install_macos.sh next-check commands",
+                "ops/README.md macOS Runtime Control runbook",
+            ],
+            "currentHostApplies": platform == "darwin",
+            "currentReady": platform != "darwin" or (
+                bool(host_bridge.get("shellReady"))
+                and macos_native_command_surface_ready
+                and windows_provider_tools_command_surface_ready
+                and windows_automation_permission_status_ready
+                and openclaw_command_surface_ready
+            ),
+            "currentDetails": {
+                "atriumSh": macos_launcher_path.exists(),
+                "installMacosSh": macos_installer_path.exists(),
+                "launcherRunsCli": "ops/atrium_cli.py" in macos_launcher_text and "python3" in macos_launcher_text,
+                "installerNextChecks": macos_native_command_surface_ready,
+                "providerToolsCommands": windows_provider_tools_command_surface_ready,
+                "permissionsCommandSurface": "def command_permissions" in cli_text,
+                "automationSmoke": 'action == "smoke"' in cli_text and 'automation_sub.add_parser("smoke"' in cli_text,
+                "logsJson": windows_logs_json_ready,
+                "supportBundle": windows_support_bundle_ready,
+                "supportBundleMcpGateway": windows_support_bundle_mcp_gateway_ready,
+                "supportBundleMcpProbe": windows_support_bundle_mcp_probe_ready,
+                "nativeNextChecks": "nativeNextChecks" in cli_text and "diagnostics/native-next-checks.json" in cli_text,
+                "nativeParityMatrix": "nativeParityMatrix" in cli_text and "diagnostics/native-parity-matrix.json" in cli_text,
+            },
+        },
         {
             "id": "windows_native_lifecycle",
             "label": "Windows-native setup/start/stop/restart/status/log/report",
             "requiredEvidence": [
                 ".\\atrium.ps1 setup",
                 ".\\atrium.ps1 start",
+                ".\\atrium.ps1 stop",
                 ".\\atrium.ps1 restart",
+                ".\\atrium.ps1 doctor --json",
                 ".\\atrium.ps1 status",
                 ".\\atrium.ps1 status --json",
                 ".\\atrium.ps1 logs",
                 ".\\atrium.ps1 logs --json",
                 ".\\atrium.ps1 report",
                 ".\\atrium.ps1 report --bundle",
+                ".\\atrium.ps1 permissions status",
+                ".\\atrium.ps1 permissions status --json",
+                ".\\atrium.ps1 permissions set full_auto --agent-full-access true",
                 "runnable Python 3 validation in .\\atrium.ps1 setup",
                 "PID-file process truth for backend/frontend",
+                "Windows process identity proof for launcher-owned PIDs",
                 "UI self-update restart through .\\atrium.ps1 restart --force",
+                "start readiness gate with backend/frontend port owners and redacted diagnostics",
+                "OpenClaw lifecycle proof checklist in entrypoint payload",
+                "guided setup next-check checklist",
+                "OS-native setup and blocked-command next-step hints",
             ],
             "currentHostApplies": platform == "win32",
             "currentReady": platform != "win32" or (
                 bool(host_bridge.get("shellReady"))
                 and windows_native_sources_ready
                 and windows_process_truth_sources_ready
+                and windows_entrypoint_diagnostics_ready
+                and windows_doctor_json_ready
                 and windows_status_json_ready
                 and windows_cli_python_install_ready
+                and windows_cli_winget_retry_ready
+                and windows_lifecycle_command_surface_ready
+                and windows_start_readiness_gate_ready
+                and windows_native_command_hint_ready
                 and windows_logs_json_ready
                 and windows_support_bundle_ready
                 and windows_self_update_restart_ready
@@ -4132,10 +5053,29 @@ def _host_bridge_openclaw_level_contract(
                 "installWindowsNativeSafety": windows_installer_ready,
                 "atriumCli": cli_path.exists(),
                 "pidFiles": windows_process_truth_sources_ready,
+                "entrypointDiagnostics": windows_entrypoint_diagnostics_ready,
+                "openclawLifecycleProofPackage": (
+                    "windows_openclaw_lifecycle_commands" in cli_text
+                    and "print_native_next_checks" in cli_text
+                    and "openclawLifecycleProof" in cli_text
+                    and "openclawLifecycleProof.checklist" in cli_text
+                    and "mcp_gateway_probe" in cli_text
+                    and "windows_raw_probe" in cli_text
+                ),
                 "statusJson": windows_status_json_ready,
+                "doctorJson": windows_doctor_json_ready,
                 "python3Validated": windows_cli_python_install_ready,
+                "wingetRetry": windows_cli_winget_retry_ready,
+                "lifecycleCommands": windows_lifecycle_command_surface_ready,
+                "startReadinessGate": windows_start_readiness_gate_ready,
+                "nativeCommandHints": windows_native_command_hint_ready,
                 "logsJson": windows_logs_json_ready,
                 "supportBundle": windows_support_bundle_ready,
+                "supportBundleMcpGateway": windows_support_bundle_mcp_gateway_ready,
+                "supportBundleMcpProbe": windows_support_bundle_mcp_probe_ready,
+                "nativeNextChecks": "nativeNextChecks" in cli_text and "diagnostics/native-next-checks.json" in cli_text,
+                "nativeParityMatrix": "nativeParityMatrix" in cli_text and "diagnostics/native-parity-matrix.json" in cli_text,
+                "permissionsCommandSurface": "def command_permissions" in cli_text,
                 "selfUpdateRestart": windows_self_update_restart_ready,
                 "automationPermissionMode": windows_automation_permission_status_ready,
             },
@@ -4145,23 +5085,59 @@ def _host_bridge_openclaw_level_contract(
             "label": "Windows-native wrapper and installer entrypoints",
             "requiredEvidence": [
                 "atrium.ps1",
-                "atrium.cmd with Windows PowerShell/pwsh fallback",
+                "atrium.cmd with Windows PowerShell/pwsh fallback and exit-code preservation",
+                "standard PowerShell install-path fallback when PATH is incomplete",
+                "fresh install one-liner with standard PowerShell install-path fallback",
                 "ops/install_windows_native.ps1",
                 "ops/atrium_cli.py",
+                "installer PowerShell/pwsh setup handoff",
+                "post-start readiness diagnostics in entrypoint payload",
+                "OpenClaw lifecycle proof checklist in entrypoint payload",
+                "guided setup next-check checklist",
+                "native installer next-check commands for provider/tools/automation/report",
             ],
             "currentHostApplies": True,
-            "currentReady": windows_native_sources_ready,
+            "currentReady": (
+                windows_native_sources_ready
+                and windows_standard_powershell_path_fallback_ready
+                and windows_entrypoint_diagnostics_ready
+            ),
             "currentDetails": {
                 "atriumPs1": windows_launcher_path.exists(),
                 "atriumPs1Runner": windows_ps1_launcher_ready,
                 "atriumCmd": windows_cmd_launcher_path.exists(),
                 "atriumCmdForwarder": windows_cmd_launcher_ready,
+                "standardPowerShellPathFallback": windows_standard_powershell_path_fallback_ready,
+                "freshInstallOneLiner": windows_fresh_install_one_liner_ready,
                 "installWindowsNativePs1": windows_installer_path.exists(),
                 "installWindowsNativeBaseSafety": windows_installer_base_ready,
                 "installWindowsNativeSetupRunner": windows_installer_setup_runner_ready,
                 "installWindowsNativeSafety": windows_installer_ready,
+                "entrypointDiagnostics": windows_entrypoint_diagnostics_ready,
+                "openclawLifecycleProofPackage": (
+                    "windows_openclaw_lifecycle_commands" in cli_text
+                    and "print_native_next_checks" in cli_text
+                    and "openclawLifecycleProof" in cli_text
+                    and "openclawLifecycleProof.checklist" in cli_text
+                    and "mcp_gateway_probe" in cli_text
+                    and "windows_raw_probe" in cli_text
+                ),
                 "atriumCli": cli_path.exists(),
             },
+        },
+        {
+            "id": "windows_native_only_dependency_scan",
+            "label": "Windows docs and proof-bound source stay native-host-only",
+            "requiredEvidence": [
+                "README.md and ops/README.md contain only native PowerShell Windows setup/runbook",
+                "atrium.ps1 and atrium.cmd route through native PowerShell only",
+                "ops/install_windows_native.ps1 stays on the Windows host path and native toolchain",
+                "HostBridge proof-bound source files keep Windows routing on the native host path",
+                "OpenClaw audit exposes any non-native host routing wording as a local requirement gap",
+            ],
+            "currentHostApplies": True,
+            "currentReady": windows_native_only_scan["ok"] is True,
+            "currentDetails": windows_native_only_scan,
         },
         {
             "id": "windows_native_provider_ai_tools",
@@ -4169,12 +5145,19 @@ def _host_bridge_openclaw_level_contract(
             "requiredEvidence": [
                 ".\\atrium.ps1 provider status --probe",
                 ".\\atrium.ps1 provider status --probe --json",
+                ".\\atrium.ps1 provider reference",
+                ".\\atrium.ps1 provider reference --json",
+                ".\\atrium.ps1 provider env",
+                ".\\atrium.ps1 provider env --json",
                 ".\\atrium.ps1 provider login chatgpt",
                 ".\\atrium.ps1 provider login claude-code",
                 ".\\atrium.ps1 provider disconnect chatgpt",
+                ".\\atrium.ps1 provider disconnect claude-code",
                 "native Windows URL opener for provider OAuth",
                 ".\\atrium.ps1 tools status",
                 ".\\atrium.ps1 tools status --json",
+                ".\\atrium.ps1 tools mcp-gateway --json",
+                ".\\atrium.ps1 tools mcp-probe --json",
                 ".\\atrium.ps1 tools catalog",
                 ".\\atrium.ps1 tools catalog --json",
                 "backend provider-auth/tool-catalog/connector truth",
@@ -4184,18 +5167,34 @@ def _host_bridge_openclaw_level_contract(
             "currentDetails": {
                 "commandProvider": "def command_provider" in cli_text,
                 "commandTools": "def command_tools" in cli_text,
-                "providerStatusProbe": 'provider_status.add_argument("--probe"' in cli_text,
+                "providerStatusProbe": windows_provider_status_command_ready,
                 "providerStatusJson": 'provider_status.add_argument("--json"' in cli_text,
                 "providerStatusJsonRedaction": "redact_json_value" in cli_text,
+                "providerLogin": windows_provider_login_command_ready,
+                "providerDisconnect": windows_provider_disconnect_command_ready,
+                "providerReferenceEnv": windows_provider_reference_env_command_ready,
+                "providerTargets": windows_provider_target_ready,
+                "providerBackendEndpoints": windows_provider_backend_endpoints_ready,
+                "chatgptStartEndpoint": "/api/provider-auth/chatgpt/start" in route_paths,
+                "chatgptDisconnectEndpoint": "/api/provider-auth/chatgpt/disconnect" in route_paths,
+                "claudeCodeStartEndpoint": "/api/provider-auth/claude-code/start" in route_paths,
+                "claudeCodeDisconnectEndpoint": "/api/provider-auth/claude-code/disconnect" in route_paths,
+                "providerWaitPolling": "wait_provider_ready(target" in cli_text,
+                "claudeCodeInteractiveLogin": 'run_interactive([claude, "auth", "login", "--claudeai"]' in cli_text,
                 "windowsUrlOpenNative": (
                     'getattr(os, "startfile"' in cli_text
                     and "Start-Process -FilePath" in cli_text
                     and "ps_single_quote(url)" in cli_text
                 ),
                 "toolsStatusJson": 'tools_status.add_argument("--json"' in cli_text,
+                "toolsMcpGatewayJson": 'tools_mcp_gateway.add_argument("--json"' in cli_text and "mcp_gateway_setup_payload" in cli_text,
+                "toolsMcpProbeJson": 'tools_mcp_probe.add_argument("--json"' in cli_text and "/api/tools/mcp-gateway?probe=true" in cli_text,
                 "toolsCatalogJson": 'tools_catalog.add_argument("--json"' in cli_text,
                 "providerAuthStatusEndpoint": "/api/provider-auth/status" in cli_text,
+                "providerAuthReferenceEndpoint": "/api/provider-auth/reference" in cli_text,
+                "providerAuthEnvEndpoint": "/api/provider-auth/env" in cli_text,
                 "toolCatalogEndpoint": "/api/tools/catalog" in cli_text,
+                "mcpGatewayEndpoint": "/api/tools/mcp-gateway" in route_paths,
                 "connectorsEndpoint": "/api/connectors" in cli_text,
             },
         },
@@ -4205,7 +5204,10 @@ def _host_bridge_openclaw_level_contract(
             "requiredEvidence": [
                 ".\\atrium.ps1 automation status --json",
                 ".\\atrium.ps1 automation handoff --macos <macos-json>",
-                ".\\atrium.ps1 automation report --macos <macos-json> --windows <copied-windows-json>",
+                ".\\atrium.ps1 automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium",
+                ".\\atrium.ps1 automation windows-probe --full",
+                ".\\atrium.ps1 automation windows-live-proof --parity-run-id <run-id>",
+                ".\\atrium.ps1 automation report --macos <macos-json> --windows <copied-windows-json> --max-artifact-age-hours 24.0",
                 ".\\atrium.ps1 automation audit",
                 "backend default report path",
                 "no historical proof override for current parity claims",
@@ -4216,7 +5218,11 @@ def _host_bridge_openclaw_level_contract(
                 "automationAudit": 'action == "audit"' in cli_text,
                 "automationStatusJson": 'automation_status.add_argument("--json"' in cli_text,
                 "automationHandoff": 'action == "handoff"' in cli_text,
+                "automationSmoke": 'action == "smoke"' in cli_text and 'automation_sub.add_parser("smoke"' in cli_text,
+                "automationWindowsProbe": 'action == "windows-probe"' in cli_text,
+                "automationWindowsLiveProof": 'action == "windows-live-proof"' in cli_text,
                 "automationReport": 'action == "report"' in cli_text,
+                "artifactFreshnessGate": "--max-artifact-age-hours" in cli_text,
                 "defaultReportPath": "HOST_BRIDGE_PARITY_REPORT" in cli_text,
                 "rawVerifier": "ops/host_bridge_parity_report.py" in cli_text,
                 "historicalOverrideFlag": "--skip-current-source-check" in cli_text,
@@ -4249,13 +5255,14 @@ def _host_bridge_openclaw_level_contract(
         },
     ]
     api_surface_specs = [
-        ("runtime_status", "Runtime truth endpoint", "/api/runtime", "backend runtime/provider/memory/tool truth"),
+        ("runtime_status", "Runtime truth endpoint", "/api/runtime", "backend runtime/provider/memory/tool/native host truth"),
         ("provider_status", "Provider auth status endpoint", "/api/provider-auth/status", "ChatGPT/Claude Code readiness without identity leaks"),
         ("chatgpt_login", "ChatGPT account login endpoint", "/api/provider-auth/chatgpt/start", "native Windows browser OAuth start"),
         ("chatgpt_disconnect", "ChatGPT account disconnect endpoint", "/api/provider-auth/chatgpt/disconnect", "native account switching cleanup"),
         ("claude_login", "Claude Code login endpoint", "/api/provider-auth/claude-code/start", "native terminal Claude Code login start"),
         ("claude_disconnect", "Claude Code disconnect endpoint", "/api/provider-auth/claude-code/disconnect", "native Claude Code account cleanup"),
         ("connector_catalog", "Connector catalog endpoint", "/api/connectors", "feature readiness catalog"),
+        ("mcp_gateway_probe", "MCP gateway probe endpoint", "/api/tools/mcp-gateway", "write-capable external MCP gateway health proof"),
         ("host_bridge_parity", "HostBridge parity endpoint", "/api/host-bridge/parity", "OpenClaw-level Windows contract and proof commands"),
     ]
     api_surface_requirements = [
@@ -4264,7 +5271,16 @@ def _host_bridge_openclaw_level_contract(
             "label": label,
             "path": path,
             "requiredEvidence": evidence,
-            "registered": path in route_paths,
+            "registered": path in route_paths and (path != "/api/runtime" or "_native_runtime_status_payload" in main_text),
+            "currentDetails": (
+                {
+                    "endpointRegistered": path in route_paths,
+                    "nativeRuntimeField": "nativeRuntime" in main_text,
+                    "nativeRuntimeHelper": "_native_runtime_status_payload" in main_text,
+                }
+                if path == "/api/runtime"
+                else {}
+            ),
         }
         for item_id, label, path, evidence in api_surface_specs
     ]
@@ -4294,12 +5310,13 @@ def _host_bridge_openclaw_level_contract(
         {
             "id": "proof_id_bound_to_artifacts",
             "label": "Proof ID bound to artifacts and current source",
-            "requiredEvidence": ["proofId", "expectedProofId", "currentSourceFingerprint", "currentSourceManifestSha256", "currentGitHead"],
+            "requiredEvidence": ["proofId", "expectedProofId", "currentSourceFingerprint", "currentSourceManifestSha256", "currentSourceFileCount", "currentGitHead"],
             "currentReady": (
                 _host_bridge_is_hex64(proof_details.get("proofId"))
                 and proof_details.get("proofId") == proof_details.get("expectedProofId")
                 and _host_bridge_is_hex64(proof_details.get("currentSourceFingerprint"))
                 and _host_bridge_is_hex64(proof_details.get("currentSourceManifestSha256"))
+                and proof_details.get("currentSourceFileCount") == len(SOURCE_FINGERPRINT_FILES)
                 and isinstance(proof_details.get("currentGitHead"), str)
                 and re.fullmatch(r"[0-9a-f]{40}", str(proof_details.get("currentGitHead"))) is not None
             ),
@@ -4308,6 +5325,7 @@ def _host_bridge_openclaw_level_contract(
                 "expectedProofId": proof_details.get("expectedProofId"),
                 "currentSourceFingerprint": proof_details.get("currentSourceFingerprint"),
                 "currentSourceManifestSha256": proof_details.get("currentSourceManifestSha256"),
+                "currentSourceFileCount": proof_details.get("currentSourceFileCount"),
                 "currentGitHead": proof_details.get("currentGitHead"),
             },
         },
@@ -4440,6 +5458,24 @@ def _host_bridge_openclaw_level_contract(
                     or (not requires_write and connector.get("localFallback") is True)
                 )
             )
+        current_details: dict[str, Any] = {}
+        if connector_id == "mcp":
+            external_write_requires = connector.get("externalWriteRequires")
+            current_details = {
+                "gatewayConfigured": connector.get("localFallback") is not True,
+                "gatewayHealthy": status_value == "configured" and connector.get("readReady") is True,
+                "externalWriteReady": connector.get("writeReady") is True,
+                "localFallbackOnly": connector.get("localFallback") is True,
+                "externalWriteRequirements": external_write_requires if isinstance(external_write_requires, list) else [],
+                "setupCommand": ".\\atrium.ps1 tools mcp-gateway --json",
+                "probeCommand": ".\\atrium.ps1 tools mcp-probe --json",
+                "statusCommand": "curl -fsS 'http://127.0.0.1:8787/api/tools/mcp-gateway?probe=true'",
+                "requiredEnvironment": [
+                    "ATRIUM_MCP_GATEWAY_URL",
+                    "ATRIUM_MCP_GATEWAY_TOKEN or ATRIUM_MCP_GATEWAY_TOKEN_KEYCHAIN_SERVICE",
+                    "ATRIUM_MCP_ENABLED_SERVERS",
+                ],
+            }
         feature_requirements.append({
             "id": connector_id,
             "label": label,
@@ -4455,6 +5491,7 @@ def _host_bridge_openclaw_level_contract(
             "degradedByLocalFallback": bool(required and requires_write and connector.get("localFallback") is True and connector.get("writeReady") is not True),
             "proofStatus": proof_status,
             "ready": bool(ready),
+            **({"currentDetails": current_details} if current_details else {}),
         })
     local_blocked = any(
         item["currentHostApplies"] and item["currentReady"] is False
@@ -4497,6 +5534,7 @@ def _host_bridge_openclaw_level_contract(
 def _host_bridge_parity_status_payload() -> dict[str, Any]:
     settings = get_settings()
     host_bridge = HostBridge(settings).status().to_dict()
+    current_source = host_bridge_source_provenance()
     parity_report = _host_bridge_parity_report_proof(settings)
     connectors_by_id = {connector["id"]: connector for connector in _connector_catalog()}
     bridge_connectors = [connectors_by_id.get("browser") or {}, connectors_by_id.get("desktop") or {}]
@@ -4589,6 +5627,12 @@ def _host_bridge_parity_status_payload() -> dict[str, Any]:
             else []
         )
     )
+    local_artifacts = _host_bridge_local_proof_artifacts(current_source)
+    parity_commands = _host_bridge_parity_commands(
+        str(host_bridge.get("platform") or sys.platform),
+        current_source,
+        local_artifacts,
+    )
     return HostBridgeParityStatusResponse(
         ok=status == "cross_os_verified",
         status=status,
@@ -4596,9 +5640,14 @@ def _host_bridge_parity_status_payload() -> dict[str, Any]:
         gaps=gaps,
         report=report_payload,
         local=local_payload,
+        local_artifacts=local_artifacts,
+        native_parity_matrix=_host_bridge_native_parity_matrix(
+            str(host_bridge.get("platform") or sys.platform),
+            parity_commands,
+        ),
         contract=contract_payload,
         connectors=proof_connectors,
-        commands=_host_bridge_parity_commands(str(host_bridge.get("platform") or sys.platform)),
+        commands=parity_commands,
     ).dump()
 
 
@@ -9634,12 +10683,16 @@ async def runtime_status() -> dict[str, Any]:
                 "error": embedding_error or None,
             },
             "memory": memory,
-        "database": database,
+            "database": database,
             "objectStoreEnabled": settings.object_store_enabled,
             "backup": _backup_runtime_status(settings, now),
             "toolRegistryCount": len(registry.list()),
             "customToolCount": custom_tool_count,
             "hostBridge": host_bridge,
+            "nativeRuntime": _native_runtime_status_payload(
+                str(host_bridge.get("platform") or sys.platform),
+                host_bridge,
+            ),
             "credentialReadiness": _credential_readiness_status(settings),
             "fullAutonomy": permission_policy.get("fullAutonomyStatus") or full_autonomy_status(permission_policy),
             "mcp": {
@@ -10431,6 +11484,11 @@ async def route_tool_execution(tool: str = Query(...), args: str | None = Query(
         "supported": True,
         "catalog": custom_catalog or catalog_item,
     }
+
+
+@app.get("/api/tools/mcp-gateway")
+async def get_mcp_gateway_status(probe: bool = False) -> dict[str, Any]:
+    return _mcp_gateway_status_payload(probe=probe)
 
 
 @app.get("/api/connectors", response_model=list[Connector])

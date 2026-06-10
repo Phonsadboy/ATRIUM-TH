@@ -88,3 +88,24 @@ fi
 
 step "Run ATRIUM guided setup"
 ./atrium setup --yes
+
+cat <<'EOF'
+
+Next macOS checks:
+  ./atrium doctor --json
+  ./atrium status --json
+  ./atrium provider status --probe --json
+  ./atrium provider reference --json
+  ./atrium provider env --json
+  ./atrium provider login chatgpt
+  ./atrium provider login claude-code
+  ./atrium permissions status --json
+  ./atrium permissions set full_auto --agent-full-access true
+  ./atrium tools status --json
+  ./atrium tools mcp-gateway --json
+  ./atrium tools catalog --json
+  ./atrium automation status --commands
+  ./atrium automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium --output /tmp/atrium_host_bridge_macos_smoke.json
+  ./atrium logs --json
+  ./atrium report --bundle
+EOF

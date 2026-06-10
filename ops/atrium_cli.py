@@ -8,6 +8,7 @@ doctor` works immediately after a fresh clone.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import platform
@@ -80,6 +81,7 @@ FULL_STACK_DEFAULTS = {
     "ATRIUM_DEPARTMENT_WORKER_CONCURRENCY": "5",
 }
 UI_DEFAULTS = {"VITE_ATRIUM_API_URL": BACKEND_URL}
+HOST_BRIDGE_PARITY_TIMEOUT_SECONDS = 30.0
 PARITY_COMMAND_KEYS = (
     "parityRunId",
     "sourceFingerprint",
@@ -90,16 +92,25 @@ PARITY_COMMAND_KEYS = (
     "sourceFingerprintStatus",
     "macosSourceValidate",
     "macosProbe",
+    "macosSmoke",
+    "macosArtifact",
     "macosArtifactValidate",
     "windowsHandoff",
     "windowsHandoffArtifact",
     "windowsRunIdSet",
     "windowsSourceValidate",
+    "mcpGatewaySetupJson",
+    "mcpGatewayStatusJson",
+    "mcpGatewayProbeJson",
+    "nativeBrowserDesktopSmoke",
     "windowsProbe",
     "windowsLiveProofRunner",
     "windowsArtifactValidateOnWindows",
+    "windowsArtifactSource",
+    "windowsArtifactLocal",
     "windowsArtifactCopyHint",
     "windowsArtifactValidateLocal",
+    "acceptWindowsArtifact",
     "automationReport",
     "report",
     "verify",
@@ -107,7 +118,50 @@ PARITY_COMMAND_KEYS = (
 )
 DEFAULT_WINDOWS_PROOF_PATH = "C:\\Temp\\atrium_host_bridge_windows_live.json"
 DEFAULT_WINDOWS_LOCAL_COPY_PATH = "/tmp/atrium_host_bridge_windows_live.json"
+DEFAULT_MACOS_PROOF_PATH = "/tmp/atrium_host_bridge_macos_live.json"
 DEFAULT_WINDOWS_HANDOFF_PATH = "/tmp/atrium_windows_handoff.json"
+DEFAULT_WINDOWS_SMOKE_PATH = "C:\\Temp\\atrium_host_bridge_windows_smoke.json"
+DEFAULT_WINDOWS_PROBE_PATH = "C:\\Temp\\atrium_host_bridge_windows_probe.json"
+DEFAULT_MACOS_SMOKE_PATH = "/tmp/atrium_host_bridge_macos_smoke.json"
+REQUIRED_WINDOWS_PROOF_FACETS = (
+    "browserOpen",
+    "browserOpenIsolatedProfile",
+    "browserSnapshot",
+    "browserSnapshotIsolatedPlaywright",
+    "browserAct",
+    "browserActIsolatedPlaywright",
+    "browserActVerified",
+    "appsDiscovery",
+    "screenshotFile",
+    "notification",
+    "desktopAutomationReady",
+    "interactiveSession",
+    "windowsInteractiveSessionIdentity",
+    "windowsVisualPreflight",
+    "helperSelftest",
+    "powershellPreflight",
+    "windowsDpiAwareness",
+    "windowsVirtualScreen",
+    "windowsForegroundActivation",
+    "windowsUnicodeTyping",
+    "windowsKeyboardShortcut",
+    "mcpExternalWriteReady",
+    "windowsLiveProofRunner",
+    "notepadNativeAct",
+    "clipboardRoundTrip",
+)
+WINDOWS_LIVE_PROOF_FAILURE_STAGE_IDS = (
+    "source_validate",
+    "mcp_external_write",
+    "windows_full_probe",
+    "artifact_validate",
+)
+WINDOWS_LIVE_PROOF_READINESS_GATE_IDS = (
+    "source",
+    "mcpExternalWrite",
+    "browserDesktopSmoke",
+    "artifactValidation",
+)
 
 
 def common_path_candidates() -> list[str]:
@@ -230,6 +284,16 @@ def redact_text(text: str) -> str:
             key, value = line.split("=", 1)
             redacted.append(f"{key}={redact_value(key.strip(), value.strip())}")
         else:
+            line = re.sub(
+                r"(?i)(--(?:token|secret|password|api-key|apikey|access-token|refresh-token)\s+)(?:\"[^\"]*\"|'[^']*'|\S+)",
+                r"\1<redacted>",
+                line,
+            )
+            line = re.sub(
+                r"(?i)(-(?:Token|Secret|Password|ApiKey|AccessToken|RefreshToken)\s+)(?:\"[^\"]*\"|'[^']*'|\S+)",
+                r"\1<redacted>",
+                line,
+            )
             redacted.append(line)
     suffix = "\n" if text.endswith("\n") else ""
     return "\n".join(redacted) + suffix
@@ -302,6 +366,20 @@ def command_path(name: str) -> str | None:
         for candidate in ("/opt/homebrew/bin/brew", "/usr/local/bin/brew"):
             if Path(candidate).exists():
                 return candidate
+    if name in {"powershell", "powershell.exe"}:
+        for candidate in (
+            Path(os.environ.get("SystemRoot", "C:/Windows")) / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe",
+            Path(os.environ.get("SystemRoot", "C:/Windows")) / "SysWOW64" / "WindowsPowerShell" / "v1.0" / "powershell.exe",
+        ):
+            if candidate.exists():
+                return str(candidate)
+    if name in {"pwsh", "pwsh.exe"}:
+        for candidate in (
+            Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "PowerShell" / "7" / "pwsh.exe",
+            Path(os.environ.get("ProgramFiles(x86)", "C:/Program Files (x86)")) / "PowerShell" / "7" / "pwsh.exe",
+        ):
+            if candidate.exists():
+                return str(candidate)
     if name == "docker":
         for candidate in (
             "/Applications/Docker.app/Contents/Resources/bin/docker",
@@ -641,7 +719,7 @@ def http_get_json(url: str, *, timeout: float = 3.0) -> tuple[bool, str, object 
             body = response.read().decode("utf-8", errors="replace")
     except urllib.error.URLError as exc:
         return False, str(exc), None
-    except TimeoutError as exc:
+    except (TimeoutError, ConnectionError, OSError) as exc:
         return False, str(exc), None
     try:
         return True, body, json.loads(body)
@@ -673,7 +751,7 @@ def http_json_request(
             return False, body or str(exc), None
     except urllib.error.URLError as exc:
         return False, str(exc), None
-    except TimeoutError as exc:
+    except (TimeoutError, ConnectionError, OSError) as exc:
         return False, str(exc), None
     try:
         return True, body, json.loads(body)
@@ -747,6 +825,19 @@ PROVIDER_AUTH_TARGETS = {
     "claude": "claude-code",
     "claude-code": "claude-code",
 }
+
+
+PERMISSION_MODE_CHOICES = (
+    "deny",
+    "allowlist",
+    "ask",
+    "auto",
+    "full",
+    "full_auto",
+    "approve_everything",
+    "approve_all",
+    "critical_only",
+)
 
 
 def normalize_provider_auth_target(value: str) -> str:
@@ -831,6 +922,63 @@ def provider_disconnect_summary(target: str, payload: object) -> list[str]:
     return [f"{target} disconnect: completed"]
 
 
+def summarize_provider_reference_payload(payload: object) -> list[str]:
+    if not isinstance(payload, dict):
+        return ["provider reference=unavailable"]
+    credentials = payload.get("credentials")
+    providers = payload.get("providers")
+    subsystems = payload.get("subsystems")
+    errors = payload.get("statusErrors")
+    lines = [
+        f"credentials={len(credentials) if isinstance(credentials, list) else 'unknown'}",
+        f"providers={len(providers) if isinstance(providers, list) else 'unknown'}",
+        f"subsystems={len(subsystems) if isinstance(subsystems, list) else 'unknown'}",
+    ]
+    if isinstance(credentials, list):
+        configured = [
+            str(item.get("id"))
+            for item in credentials
+            if isinstance(item, dict) and item.get("configured") is True and item.get("id")
+        ]
+        if configured:
+            lines.append("configured=" + ", ".join(sorted(configured)))
+    if isinstance(errors, list) and errors:
+        lines.append("statusErrors=" + "; ".join(str(item) for item in errors[:4]))
+    return lines
+
+
+def summarize_provider_env_payload(payload: object) -> list[str]:
+    if not isinstance(payload, dict):
+        return ["provider env=unavailable"]
+    groups = payload.get("groups")
+    process_overrides = payload.get("processOverrides")
+    group_count = len(groups) if isinstance(groups, list) else "unknown"
+    field_count = 0
+    configured_fields: list[str] = []
+    if isinstance(groups, list):
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            for field in group.get("fields") or []:
+                if not isinstance(field, dict):
+                    continue
+                field_count += 1
+                if field.get("configured") and field.get("key"):
+                    configured_fields.append(str(field["key"]))
+    lines = [
+        f"envPath={payload.get('envPath') or 'unknown'}",
+        f"groups={group_count}",
+        f"fields={field_count}",
+        f"configuredFields={len(configured_fields)}",
+        f"restartRecommended={bool_text(payload.get('restartRecommended'))}",
+    ]
+    if configured_fields:
+        lines.append("configured=" + ", ".join(sorted(configured_fields)[:12]))
+    if isinstance(process_overrides, list) and process_overrides:
+        lines.append("processOverrides=" + ", ".join(str(item) for item in process_overrides[:12]))
+    return lines
+
+
 def wait_provider_ready(target: str, timeout_s: float) -> tuple[bool, object | None]:
     deadline = time.time() + max(0.0, timeout_s)
     last_payload: object | None = None
@@ -890,6 +1038,27 @@ def summarize_full_autonomy(payload: object) -> list[str]:
     ]
 
 
+def parse_bool_option(value: str) -> bool:
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError("expected true/false")
+
+
+def split_csv_values(values: Sequence[str] | None) -> list[str]:
+    if not values:
+        return []
+    items: list[str] = []
+    for value in values:
+        for item in str(value).split(","):
+            text = item.strip()
+            if text:
+                items.append(text)
+    return items
+
+
 def summarize_host_bridge_payload(payload: object) -> list[str]:
     if not isinstance(payload, dict):
         return ["HostBridge=unavailable"]
@@ -915,6 +1084,15 @@ def summarize_host_bridge_payload(payload: object) -> list[str]:
             f"ok={bool_text(host_bridge.get('windowsVisualPreflightOk'))}, "
             f"error={host_bridge.get('windowsVisualPreflightError') or 'none'}"
         )
+        checks = host_bridge.get("windowsVisualPreflightChecks")
+        if isinstance(checks, dict) and checks:
+            failed_checks = ", ".join(str(key) for key, value in sorted(checks.items()) if value is not True)
+            passed_count = sum(1 for value in checks.values() if value is True)
+            lines.append(
+                "Windows automation checks: "
+                f"passed={passed_count}/{len(checks)}, "
+                f"failed={failed_checks or 'none'}"
+            )
     if host_bridge.get("platform") == "darwin":
         lines.append(
             "macOS automation preflight: "
@@ -998,21 +1176,182 @@ def summarize_connectors_payload(payload: object) -> list[str]:
             f"runtime={connector.get('runtimeStatus') or 'unknown'}, "
             f"proof={connector.get('proofStatus') or 'unknown'}"
         )
+        if connector.get("id") == "mcp":
+            external_requires = connector.get("externalWriteRequires")
+            require_text = "none"
+            if isinstance(external_requires, list) and external_requires:
+                require_text = ", ".join(str(value) for value in external_requires if str(value).strip()) or "none"
+            lines.append(
+                "connector.mcp.externalWrite: "
+                f"ready={bool_text(connector.get('writeReady'))}, "
+                f"localFallbackOnly={bool_text(connector.get('localFallback'))}, "
+                f"requires={require_text}, "
+                "statusCommand=curl -fsS http://127.0.0.1:8787/api/connectors"
+            )
     return lines or ["connectors=unavailable"]
 
 
+def _mcp_connector_from_payload(payload: object) -> dict[str, object] | None:
+    if not isinstance(payload, list):
+        return None
+    for connector in payload:
+        if isinstance(connector, dict) and connector.get("id") == "mcp":
+            return connector
+    return None
+
+
+def mcp_gateway_setup_payload(runtime_payload: object, connectors_payload: object) -> dict[str, object]:
+    runtime_v2 = runtime_payload.get("v2") if isinstance(runtime_payload, dict) and isinstance(runtime_payload.get("v2"), dict) else {}
+    credential_readiness = (
+        runtime_v2.get("credentialReadiness")
+        if isinstance(runtime_v2.get("credentialReadiness"), dict)
+        else {}
+    )
+    mcp_connector = _mcp_connector_from_payload(connectors_payload) or {}
+    requirements = mcp_connector.get("externalWriteRequires")
+    if not isinstance(requirements, list):
+        requirements = (
+            credential_readiness.get("externalWriteChannels", {})
+            .get("mcpExternalWrites", {})
+            .get("requirements", [])
+            if isinstance(credential_readiness.get("externalWriteChannels"), dict)
+            else []
+        )
+    if not isinstance(requirements, list):
+        requirements = []
+    windows_commands = [
+        "$env:ATRIUM_MCP_GATEWAY_URL='<write-capable MCP gateway URL>'",
+        "$env:ATRIUM_MCP_ENABLED_SERVERS='github,email,calendar,notion,drive'",
+        "$value = Read-Host -Prompt 'ATRIUM MCP gateway token' -AsSecureString",
+        "$ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($value)",
+        "$plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)",
+        "[Environment]::SetEnvironmentVariable('ATRIUM_MCP_GATEWAY_URL', $env:ATRIUM_MCP_GATEWAY_URL, 'User')",
+        "[Environment]::SetEnvironmentVariable('ATRIUM_MCP_GATEWAY_TOKEN', $plain, 'User')",
+        "[Environment]::SetEnvironmentVariable('ATRIUM_MCP_ENABLED_SERVERS', $env:ATRIUM_MCP_ENABLED_SERVERS, 'User')",
+        "[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr)",
+        ".\\atrium.ps1 restart --force",
+        ".\\atrium.ps1 tools status --json",
+        ".\\atrium.ps1 tools mcp-probe --json",
+    ]
+    macos_commands = [
+        "export ATRIUM_MCP_GATEWAY_URL='<write-capable MCP gateway URL>'",
+        "security add-generic-password -U -s atrium.mcp.gateway -a atrium -w '<secret token>'",
+        "export ATRIUM_MCP_GATEWAY_TOKEN_KEYCHAIN_SERVICE='atrium.mcp.gateway'",
+        "export ATRIUM_MCP_GATEWAY_TOKEN_KEYCHAIN_ACCOUNT='atrium'",
+        "export ATRIUM_MCP_ENABLED_SERVERS='github,email,calendar,notion,drive'",
+        "./atrium restart --force",
+        "./atrium tools mcp-probe --json",
+    ]
+    verify_commands = [
+        "curl -fsS http://127.0.0.1:8787/api/runtime",
+        "curl -fsS 'http://127.0.0.1:8787/api/tools/mcp-gateway?probe=true'",
+        ".\\atrium.ps1 tools status --json",
+        ".\\atrium.ps1 tools mcp-probe --json",
+    ]
+    ready = bool(
+        mcp_connector.get("status") == "configured"
+        and mcp_connector.get("readReady") is True
+        and mcp_connector.get("writeReady") is True
+        and mcp_connector.get("localFallback") is False
+        and not requirements
+    )
+    return {
+        "ok": True,
+        "ready": ready,
+        "connector": mcp_connector,
+        "requirements": requirements,
+        "proofBlocker": {
+            "blocked": not ready,
+            "stage": "mcp_external_write",
+            "runner": "ops/windows_host_bridge_live_proof.ps1",
+            "proofFacet": "mcpExternalWriteReady",
+            "requirements": requirements,
+        },
+        "redaction": "Secret values are placeholders and are never read back or printed by this command.",
+        "env": {
+            "ATRIUM_MCP_GATEWAY_URL": "<write-capable MCP gateway URL>",
+            "ATRIUM_MCP_GATEWAY_TOKEN": "<secret token, or use Keychain/service storage where available>",
+            "ATRIUM_MCP_GATEWAY_TOKEN_KEYCHAIN_SERVICE": "atrium.mcp.gateway",
+            "ATRIUM_MCP_GATEWAY_TOKEN_KEYCHAIN_ACCOUNT": "atrium",
+            "ATRIUM_MCP_ENABLED_SERVERS": "github,email,calendar,notion,drive",
+        },
+        "windowsPowerShell": windows_commands,
+        "macosShell": macos_commands,
+        "verifyCommands": verify_commands,
+        "probeCommand": ".\\atrium.ps1 tools mcp-probe --json",
+        "requiredBefore": "windows-live-proof",
+        "successCondition": "MCP probe reports ready=true, gatewayHealth.ok=true, writeReady=true, localFallback=false, and externalWriteRequires=[]",
+    }
+
+
+def summarize_mcp_gateway_setup_payload(payload: object) -> list[str]:
+    if not isinstance(payload, dict):
+        return ["MCP gateway setup=unavailable"]
+    connector = payload.get("connector") if isinstance(payload.get("connector"), dict) else {}
+    requirements = payload.get("requirements") if isinstance(payload.get("requirements"), list) else []
+    lines = [
+        (
+            "MCP external-write: "
+            f"ready={bool_text(payload.get('ready'))}, "
+            f"status={connector.get('status') or 'unknown'}, "
+            f"write={bool_text(connector.get('writeReady'))}, "
+            f"localFallback={bool_text(connector.get('localFallback'))}"
+        ),
+        "MCP success condition: " + str(payload.get("successCondition") or "unknown"),
+    ]
+    if requirements:
+        lines.append("MCP requirements: " + "; ".join(str(item) for item in requirements if str(item).strip()))
+    proof_blocker = payload.get("proofBlocker") if isinstance(payload.get("proofBlocker"), dict) else {}
+    if proof_blocker.get("blocked") is True and proof_blocker.get("stage"):
+        lines.append(
+            "Windows live proof blocker: "
+            f"{proof_blocker.get('stage')} "
+            f"facet={proof_blocker.get('proofFacet') or 'mcpExternalWriteReady'}"
+        )
+    windows_commands = payload.get("windowsPowerShell")
+    if isinstance(windows_commands, list):
+        lines.append("Windows PowerShell setup:")
+        lines.extend(f"  {item}" for item in windows_commands[:8])
+    verify_commands = payload.get("verifyCommands")
+    if isinstance(verify_commands, list):
+        lines.append("Verify:")
+        lines.extend(f"  {item}" for item in verify_commands[:4])
+    probe_command = payload.get("probeCommand")
+    if isinstance(probe_command, str) and probe_command:
+        lines.append(f"Probe: {probe_command}")
+    return lines
+
+
 def docker_report_lines() -> list[str]:
+    payload = collect_docker_payload()
+    compose_cmd = payload.get("compose")
     docker = command_path("docker")
-    compose_cmd = docker_compose_cmd() if docker else None
     lines = [
         f"docker.cli={'present' if docker else 'missing'}",
-        f"docker.compose={' '.join(compose_cmd) if compose_cmd else 'missing'}",
+        f"docker.compose={' '.join(compose_cmd) if isinstance(compose_cmd, list) else 'missing'}",
     ]
-    if docker:
-        lines.append(f"docker.running={bool_text(run([docker, 'info'], timeout=10).returncode == 0)}")
-    else:
-        lines.append("docker.running=false")
+    lines.append(f"docker.running={bool_text(payload.get('running'))}")
+    if payload.get("error"):
+        lines.append(f"docker.error={payload.get('error')}")
     return lines
+
+
+def collect_docker_payload() -> dict[str, object]:
+    docker = command_path("docker")
+    compose_cmd = docker_compose_cmd() if docker else None
+    payload: dict[str, object] = {
+        "cli": docker or None,
+        "compose": compose_cmd,
+        "running": False,
+    }
+    if not docker:
+        payload["error"] = "docker CLI missing"
+        return payload
+    result = run([docker, "info"], timeout=10)
+    payload["running"] = result.returncode == 0
+    if result.returncode != 0:
+        payload["error"] = redact_text((result.stderr or result.stdout or "docker info failed").strip())[:400]
+    return payload
 
 
 def _host_bridge_gap_text(value: object) -> str:
@@ -1020,7 +1359,7 @@ def _host_bridge_gap_text(value: object) -> str:
     if "ops/host_bridge_parity_report.py" not in text:
         return text
     return (
-        f"Run {local_cli_command('automation', 'report')} with macOS and Windows --full probe artifacts, "
+        f"Run {local_cli_command('automation', 'report')} --max-artifact-age-hours 24.0 with macOS and Windows --full probe artifacts, "
         f"then {local_cli_command('automation', 'audit')}, before claiming cross-OS HostBridge parity."
     )
 
@@ -1028,12 +1367,26 @@ def _host_bridge_gap_text(value: object) -> str:
 def openclaw_requirement_gap_label(item: dict[str, object]) -> str:
     item_id = str(item.get("id") or item.get("label") or "unknown")
     details: list[str] = []
+    current_details = item.get("currentDetails")
     if item.get("degradedByLocalFallback") is True:
         details.append("local fallback only")
     if item.get("requiresWriteReady") is True and item.get("writeReady") is False:
         details.append("write not ready")
     if item.get("readReady") is False:
         details.append("read not ready")
+    if isinstance(current_details, dict):
+        if current_details.get("gatewayConfigured") is False:
+            details.append("gateway not configured")
+        if current_details.get("gatewayHealthy") is False and current_details.get("gatewayConfigured") is True:
+            details.append("gateway health not ready")
+        required_env = current_details.get("requiredEnvironment")
+        if isinstance(required_env, list) and required_env:
+            env_text = ", ".join(str(value) for value in required_env[:3] if str(value).strip())
+            if env_text:
+                details.append(f"env={env_text}")
+        status_command = str(current_details.get("statusCommand") or "").strip()
+        if status_command:
+            details.append(f"check={status_command}")
     external_requires = item.get("externalWriteRequires")
     if isinstance(external_requires, list):
         details.extend(str(value) for value in external_requires[:2] if str(value).strip())
@@ -1081,6 +1434,20 @@ def _legacy_report_to_automation_report(command: str) -> str | None:
     if "--skip-current-source-check" in command:
         parts.append("--skip-current-source-check")
     return " ".join(parts)
+
+
+def resolve_repo_output_path(path_value: str | Path) -> Path:
+    output_path = Path(path_value).expanduser()
+    if not output_path.is_absolute():
+        output_path = ROOT / output_path
+    return output_path
+
+
+def is_backend_parity_report_path(path_value: str | Path) -> bool:
+    try:
+        return resolve_repo_output_path(path_value).resolve() == HOST_BRIDGE_PARITY_REPORT.resolve()
+    except OSError:
+        return resolve_repo_output_path(path_value).absolute() == HOST_BRIDGE_PARITY_REPORT.absolute()
 
 
 def current_source_summary() -> dict[str, object] | None:
@@ -1140,6 +1507,20 @@ def ps_single_quote(value: object) -> str:
     return "'" + str(value).replace("'", "''") + "'"
 
 
+def file_sha256_and_size(path: str | Path) -> tuple[str | None, int | None]:
+    try:
+        file_path = Path(path)
+        digest = hashlib.sha256()
+        size = 0
+        with file_path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+                size += len(chunk)
+        return digest.hexdigest(), size
+    except OSError:
+        return None, None
+
+
 def build_windows_handoff_payload(
     *,
     macos_artifact: str,
@@ -1147,6 +1528,7 @@ def build_windows_handoff_payload(
     source_summary: dict[str, object],
     windows_output: str,
     windows_local_copy: str,
+    handoff_output: str = DEFAULT_WINDOWS_HANDOFF_PATH,
 ) -> dict[str, object]:
     parity_run_id = str(macos_summary.get("parityRunId") or "")
     source_fingerprint = str(source_summary.get("sourceFingerprint") or "")
@@ -1158,6 +1540,7 @@ def build_windows_handoff_payload(
         f"--source-fingerprint {source_fingerprint} "
         f"--source-manifest-sha256 {source_manifest_sha256} "
         f"--source-file-count {source_file_count} "
+        "--max-artifact-age-hours 24.0 "
         f"--output {ps_single_quote(windows_output)}"
     )
     windows_source = (
@@ -1184,7 +1567,228 @@ def build_windows_handoff_payload(
         "--max-artifact-age-hours 24.0 "
         f"--windows-source-path {shell_quote(windows_output)}"
     )
+    accept_windows = (
+        f"{local_cli_command('automation', 'accept-windows')} "
+        f"{shell_quote(windows_local_copy)} "
+        f"--handoff {shell_quote(handoff_output)} "
+        "--max-artifact-age-hours 24.0 "
+        f"--windows-source-path {shell_quote(windows_output)}"
+    )
     audit = local_cli_command("automation", "audit")
+    native_setup = ".\\atrium.ps1 setup --yes"
+    native_start = ".\\atrium.ps1 start"
+    native_status = ".\\atrium.ps1 status --json"
+    native_logs = ".\\atrium.ps1 logs --json"
+    native_report = ".\\atrium.ps1 report --bundle"
+    native_stop = ".\\atrium.ps1 stop"
+    native_restart = ".\\atrium.ps1 restart --force"
+    native_permissions_status = ".\\atrium.ps1 permissions status --json"
+    native_permissions_set = ".\\atrium.ps1 permissions set full_auto --agent-full-access true"
+    native_provider_status = ".\\atrium.ps1 provider status --probe --json"
+    native_provider_reference = ".\\atrium.ps1 provider reference --json"
+    native_provider_env = ".\\atrium.ps1 provider env --json"
+    native_provider_login_chatgpt = ".\\atrium.ps1 provider login chatgpt"
+    native_provider_login_claude = ".\\atrium.ps1 provider login claude-code"
+    native_provider_disconnect_chatgpt = ".\\atrium.ps1 provider disconnect chatgpt"
+    native_provider_disconnect_claude = ".\\atrium.ps1 provider disconnect claude-code"
+    native_tools_status = ".\\atrium.ps1 tools status --json"
+    native_tools_catalog = ".\\atrium.ps1 tools catalog --json"
+    mcp_gateway_setup = ".\\atrium.ps1 tools mcp-gateway --json"
+    mcp_gateway_status = ".\\atrium.ps1 tools status --json"
+    mcp_gateway_probe = ".\\atrium.ps1 tools mcp-probe --json"
+    native_browser_desktop_smoke = f".\\atrium.ps1 automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium --output {DEFAULT_WINDOWS_SMOKE_PATH}"
+    windows_probe = f".\\atrium.ps1 automation windows-probe --full --browser-url http://127.0.0.1:5173 --browser-profile atrium --output {DEFAULT_WINDOWS_PROBE_PATH}"
+    failure_stages = {
+        "source_validate": {
+            "stage": "source_validate",
+            "checklistId": "source_validate",
+            "commandKey": "sourceValidate",
+            "blocks": ["windows_live_proof"],
+            "successCondition": "source fingerprint, manifest, and file count match this handoff",
+        },
+        "mcp_external_write": {
+            "stage": "mcp_external_write",
+            "checklistId": "mcp_gateway_probe",
+            "commandKey": "mcpGatewayProbeJson",
+            "proofFacet": "mcpExternalWriteReady",
+            "blocks": ["windows_live_proof"],
+            "successCondition": "ready=true, gatewayHealth.ok=true, writeReady=true, localFallback=false, and externalWriteRequires=[]",
+        },
+        "windows_full_probe": {
+            "stage": "windows_full_probe",
+            "checklistId": "native_browser_desktop_smoke",
+            "commandKey": "windowsProbe",
+            "blocks": ["windows_live_proof"],
+            "successCondition": "raw Windows browser/desktop diagnostic probe can run in the signed-in native desktop session",
+        },
+        "artifact_validate": {
+            "stage": "artifact_validate",
+            "checklistId": "artifact_validate_on_windows",
+            "commandKey": "artifactValidate",
+            "blocks": ["copy_to_repo_host", "accept_windows_artifact"],
+            "successCondition": "Windows artifact validates all required proof facets on the Windows host",
+        },
+    }
+    readiness_gates = {
+        "source": failure_stages["source_validate"],
+        "mcpExternalWrite": failure_stages["mcp_external_write"],
+        "browserDesktopSmoke": {
+            "stage": "windows_full_probe",
+            "checklistId": "native_browser_desktop_smoke",
+            "commandKey": "nativeBrowserDesktopSmoke",
+            "diagnosticCommandKey": "windowsProbe",
+            "blocks": ["windows_live_proof"],
+            "successCondition": "native smoke and raw diagnostic probe both produce usable browser/desktop evidence",
+        },
+        "artifactValidation": failure_stages["artifact_validate"],
+    }
+    operator_checklist = [
+        {
+            "step": 1,
+            "host": "windows",
+            "id": "native_setup_start",
+            "command": f"{native_setup}; {native_start}; {native_status}",
+            "requiredBefore": "source_validate",
+            "successCondition": "setup/start succeed and status JSON shows native backend/frontend process truth",
+        },
+        {
+            "step": 2,
+            "host": "windows",
+            "id": "native_permissions",
+            "command": f"{native_permissions_status}; {native_permissions_set}; {native_permissions_status}",
+            "requiredBefore": "windows_live_proof",
+            "successCondition": "permission status JSON is readable and owner automation permission mode is full_auto with agent full access",
+        },
+        {
+            "step": 3,
+            "host": "windows",
+            "id": "native_provider_ai_tools",
+            "command": f"{native_provider_status}; {native_provider_reference}; {native_provider_env}; {native_tools_status}; {native_tools_catalog}",
+            "loginCommands": [native_provider_login_chatgpt, native_provider_login_claude],
+            "accountSwitchCommands": [native_provider_disconnect_chatgpt, native_provider_disconnect_claude],
+            "requiredBefore": "windows_live_proof",
+            "successCondition": "provider status/reference/env JSON and AI tools status/catalog JSON are readable; run loginCommands if provider accounts are not ready, and accountSwitchCommands only when intentionally changing accounts",
+        },
+        {
+            "step": 4,
+            "host": "windows",
+            "id": "native_logs_report",
+            "command": f"{native_logs}; {native_report}",
+            "requiredBefore": "source_validate",
+            "successCondition": "logs JSON and support bundle are generated without leaking secrets",
+        },
+        {
+            "step": 5,
+            "host": "windows",
+            "id": "native_stop_restart",
+            "command": f"{native_stop}; {native_restart}; {native_status}",
+            "requiredBefore": "source_validate",
+            "successCondition": "stop/restart preserve native launcher process truth and status JSON returns ready",
+        },
+        {
+            "step": 6,
+            "host": "windows",
+            "id": "mcp_gateway_setup",
+            "command": mcp_gateway_setup,
+            "requiredBefore": "windows_live_proof",
+            "successCondition": "MCP gateway settings JSON is readable on the native Windows host",
+        },
+        {
+            "step": 7,
+            "host": "windows",
+            "id": "mcp_gateway_probe",
+            "command": mcp_gateway_probe,
+            "requiredBefore": "windows_live_proof",
+            "failureStage": "mcp_external_write",
+            "proofFacet": "mcpExternalWriteReady",
+            "successCondition": "mcp-probe JSON shows ready=true, gatewayHealth.ok=true, writeReady=true, localFallback=false, and no externalWriteRequires",
+        },
+        {
+            "step": 8,
+            "host": "windows",
+            "id": "mcp_gateway_status",
+            "command": mcp_gateway_status,
+            "requiredBefore": "windows_live_proof",
+            "successCondition": "tools status JSON shows MCP connector catalog readiness on the native Windows host",
+        },
+        {
+            "step": 9,
+            "host": "windows",
+            "id": "native_browser_desktop_smoke",
+            "command": native_browser_desktop_smoke,
+            "outputPath": "C:\\Temp\\atrium_host_bridge_windows_smoke.json",
+            "requiredBefore": "windows_live_proof",
+            "failureStage": "windows_full_probe",
+            "successCondition": "diagnostic browser/desktop smoke artifact is generated from native PowerShell; this does not replace windows-live-proof",
+        },
+        {
+            "step": 10,
+            "host": "windows",
+            "id": "windows_raw_probe",
+            "command": windows_probe,
+            "diagnosticOutputPath": DEFAULT_WINDOWS_PROBE_PATH,
+            "requiredBefore": "windows_live_proof",
+            "failureStage": "windows_full_probe",
+            "successCondition": "raw Windows HostBridge diagnostic probe artifact is generated for troubleshooting only",
+        },
+        {
+            "step": 11,
+            "host": "windows",
+            "id": "source_validate",
+            "command": windows_source,
+            "requiredBefore": "windows_live_proof",
+            "failureStage": "source_validate",
+            "successCondition": "ok=true and sourceFingerprint/sourceManifestSha256/sourceFileCount match this handoff",
+        },
+        {
+            "step": 12,
+            "host": "windows",
+            "id": "windows_live_proof",
+            "command": windows_live,
+            "outputPath": windows_output,
+            "failureStages": list(failure_stages),
+            "successCondition": "artifact ok=true, mode=live, and full Windows HostBridge proof facets are present",
+        },
+        {
+            "step": 13,
+            "host": "windows",
+            "id": "artifact_validate_on_windows",
+            "command": windows_artifact,
+            "requiredBefore": "copy_to_repo_host",
+            "failureStage": "artifact_validate",
+            "successCondition": "validator returns ok=true for the Windows artifact on the Windows host",
+        },
+        {
+            "step": 14,
+            "host": "transfer",
+            "id": "copy_to_repo_host",
+            "from": windows_output,
+            "to": windows_local_copy,
+            "successCondition": "the copied file path exists on the repo host before report generation",
+        },
+        {
+            "step": 15,
+            "host": "repo",
+            "id": "accept_windows_artifact",
+            "command": accept_windows,
+            "successCondition": "artifact validates, is installed at the local copy path, report is generated, and audit passes",
+        },
+        {
+            "step": 16,
+            "host": "repo",
+            "id": "generate_report",
+            "command": report,
+            "successCondition": "fallback manual path: persisted cross-OS report ok=true",
+        },
+        {
+            "step": 17,
+            "host": "repo",
+            "id": "audit_gate",
+            "command": audit,
+            "successCondition": "automation audit ok=true before claiming OpenClaw-level Windows parity",
+        },
+    ]
+    macos_artifact_sha256, macos_artifact_bytes = file_sha256_and_size(macos_artifact)
     return {
         "ok": True,
         "schemaVersion": 1,
@@ -1199,7 +1803,8 @@ def build_windows_handoff_payload(
         },
         "macosArtifact": {
             "path": macos_artifact,
-            "artifactSha256": macos_summary.get("artifactSha256"),
+            "artifactSha256": macos_summary.get("artifactSha256") or macos_artifact_sha256,
+            "artifactBytes": macos_summary.get("artifactBytes") or macos_artifact_bytes,
             "parityRunId": parity_run_id,
             "hostPlatform": macos_summary.get("hostPlatform"),
             "hostFingerprint": macos_summary.get("hostFingerprint"),
@@ -1208,20 +1813,402 @@ def build_windows_handoff_payload(
         "windowsProof": {
             "outputPath": windows_output,
             "localCopyPath": windows_local_copy,
+            "requiredProofFacets": list(REQUIRED_WINDOWS_PROOF_FACETS),
+            "proofFacetCount": len(REQUIRED_WINDOWS_PROOF_FACETS),
+            "failureStages": failure_stages,
+            "readinessGates": readiness_gates,
             "commands": {
+                "nativeSetup": native_setup,
+                "nativeStart": native_start,
+                "nativeStatusJson": native_status,
+                "nativeLogsJson": native_logs,
+                "nativeReportBundle": native_report,
+                "nativeStop": native_stop,
+                "nativeRestart": native_restart,
+                "nativePermissionsStatusJson": native_permissions_status,
+                "nativePermissionsSetFullAuto": native_permissions_set,
+                "nativeProviderStatusProbeJson": native_provider_status,
+                "nativeProviderReferenceJson": native_provider_reference,
+                "nativeProviderEnvJson": native_provider_env,
+                "nativeProviderLoginChatGPT": native_provider_login_chatgpt,
+                "nativeProviderLoginClaudeCode": native_provider_login_claude,
+                "nativeProviderDisconnectChatGPT": native_provider_disconnect_chatgpt,
+                "nativeProviderDisconnectClaudeCode": native_provider_disconnect_claude,
+                "nativeToolsStatusJson": native_tools_status,
+                "nativeToolsCatalogJson": native_tools_catalog,
+                "mcpGatewaySetupJson": mcp_gateway_setup,
+                "mcpGatewayStatusJson": mcp_gateway_status,
+                "mcpGatewayProbeJson": mcp_gateway_probe,
+                "nativeBrowserDesktopSmoke": native_browser_desktop_smoke,
+                "windowsProbe": windows_probe,
                 "sourceValidate": windows_source,
                 "liveProof": windows_live,
                 "artifactValidate": windows_artifact,
+                "windowsArtifactValidateOnWindows": windows_artifact,
+                "acceptWindowsArtifact": accept_windows,
             },
             "copyInstruction": f"Copy {windows_output} from the Windows host to {windows_local_copy} on this host.",
+            "operatorChecklist": operator_checklist,
         },
         "finalVerification": {
             "commands": {
+                "acceptWindowsArtifact": accept_windows,
                 "report": report,
                 "audit": audit,
             },
-            "requiredGate": "Run report with copied Windows artifact, then audit must pass before claiming OpenClaw-level Windows parity.",
+            "operatorChecklist": operator_checklist[-3:],
+            "requiredGate": "Run accept-windows with the copied Windows artifact; it must validate, write the report, and audit must pass before claiming OpenClaw-level Windows parity.",
         },
+    }
+
+
+def _current_handoff_payload(path: str | Path, current_source: dict[str, object]) -> dict[str, object]:
+    handoff_path = Path(path).expanduser()
+    if not handoff_path.is_absolute():
+        handoff_path = ROOT / handoff_path
+    payload, error = _load_json_file(handoff_path)
+    if error or not isinstance(payload, dict):
+        raise StepFailure(
+            "Windows proof handoff is not readable",
+            next_step=f"Run {local_cli_command('automation', 'handoff')} after generating a current macOS proof artifact. Detail: {error or 'invalid handoff'}",
+        )
+    if payload.get("ok") is not True or payload.get("kind") != "atrium.hostBridge.windowsProofHandoff":
+        raise StepFailure("Windows proof handoff is not a valid ATRIUM handoff packet")
+    handoff_source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+    current_fingerprint = current_source.get("sourceFingerprint")
+    current_manifest = current_source.get("sourceManifestSha256")
+    current_count = current_source.get("sourceFileCount")
+    if handoff_source.get("sourceFingerprint") != current_fingerprint:
+        raise StepFailure(
+            "Windows proof handoff source fingerprint is stale",
+            next_step=(
+                f"Current source is {current_fingerprint}; handoff has {handoff_source.get('sourceFingerprint')}. "
+                f"Regenerate macOS proof and rerun {local_cli_command('automation', 'handoff')}."
+            ),
+        )
+    if handoff_source.get("sourceManifestSha256") != current_manifest or handoff_source.get("sourceFileCount") != current_count:
+        raise StepFailure(
+            "Windows proof handoff source manifest is stale",
+            next_step=f"Regenerate macOS proof and rerun {local_cli_command('automation', 'handoff')} before accepting a Windows artifact.",
+        )
+    contract_findings = _windows_handoff_contract_findings(payload)
+    if contract_findings:
+        raise StepFailure(
+            "Windows proof handoff contract is not OpenClaw-complete",
+            next_step="; ".join(contract_findings[:6]),
+        )
+    return payload
+
+
+def _windows_handoff_contract_findings(handoff: dict[str, object]) -> list[str]:
+    findings: list[str] = []
+    windows_proof = handoff.get("windowsProof") if isinstance(handoff.get("windowsProof"), dict) else {}
+    required_facets = windows_proof.get("requiredProofFacets")
+    required_set = {str(item) for item in required_facets} if isinstance(required_facets, list) else set()
+    expected_set = set(REQUIRED_WINDOWS_PROOF_FACETS)
+    if required_set != expected_set:
+        missing = sorted(expected_set - required_set)
+        extra = sorted(required_set - expected_set)
+        detail = []
+        if missing:
+            detail.append("missing=" + ",".join(missing[:6]))
+        if extra:
+            detail.append("extra=" + ",".join(extra[:6]))
+        findings.append("requiredProofFacets mismatch" + (": " + "; ".join(detail) if detail else ""))
+    if windows_proof.get("proofFacetCount") != len(REQUIRED_WINDOWS_PROOF_FACETS):
+        findings.append(
+            "proofFacetCount mismatch: "
+            f"handoff={windows_proof.get('proofFacetCount')}; expected={len(REQUIRED_WINDOWS_PROOF_FACETS)}"
+        )
+    output_path = str(windows_proof.get("outputPath") or "").strip()
+    local_copy_path = str(windows_proof.get("localCopyPath") or "").strip()
+    if not output_path:
+        findings.append("windowsProof.outputPath is missing")
+    if not local_copy_path:
+        findings.append("windowsProof.localCopyPath is missing")
+    failure_stages = windows_proof.get("failureStages") if isinstance(windows_proof.get("failureStages"), dict) else {}
+    for stage_id in WINDOWS_LIVE_PROOF_FAILURE_STAGE_IDS:
+        stage = failure_stages.get(stage_id) if isinstance(failure_stages, dict) else None
+        if not isinstance(stage, dict) or stage.get("stage") != stage_id:
+            findings.append(f"failureStages.{stage_id} is missing or invalid")
+    readiness_gates = windows_proof.get("readinessGates") if isinstance(windows_proof.get("readinessGates"), dict) else {}
+    for gate_id in WINDOWS_LIVE_PROOF_READINESS_GATE_IDS:
+        gate = readiness_gates.get(gate_id) if isinstance(readiness_gates, dict) else None
+        if not isinstance(gate, dict) or not gate.get("stage"):
+            findings.append(f"readinessGates.{gate_id} is missing or invalid")
+    mcp_gate = readiness_gates.get("mcpExternalWrite") if isinstance(readiness_gates, dict) else {}
+    if not isinstance(mcp_gate, dict) or mcp_gate.get("stage") != "mcp_external_write" or mcp_gate.get("proofFacet") != "mcpExternalWriteReady":
+        findings.append("readinessGates.mcpExternalWrite must bind mcp_external_write to mcpExternalWriteReady")
+    return findings
+
+
+def _windows_artifact_summary_contract_findings(summary: dict[str, object], handoff: dict[str, object]) -> list[str]:
+    findings: list[str] = []
+    windows_proof = handoff.get("windowsProof") if isinstance(handoff.get("windowsProof"), dict) else {}
+    expected_facets = windows_proof.get("requiredProofFacets")
+    expected_set = {str(item) for item in expected_facets} if isinstance(expected_facets, list) else set(REQUIRED_WINDOWS_PROOF_FACETS)
+    summary_facets = summary.get("requiredProofFacets")
+    summary_set = {str(item) for item in summary_facets} if isinstance(summary_facets, list) else set()
+    if summary_set != expected_set:
+        findings.append("Windows artifact requiredProofFacets do not match the current handoff")
+    if summary.get("proofFacetCount") != len(expected_set):
+        findings.append(
+            "Windows artifact proofFacetCount mismatch: "
+            f"artifact={summary.get('proofFacetCount')}; expected={len(expected_set)}"
+        )
+    if summary.get("missingProofFacetCount") not in (0, None):
+        findings.append(f"Windows artifact has missing proof facets: {summary.get('missingProofFacets')}")
+    return findings
+
+
+def _normalize_windows_artifact_source_path(value: object) -> str:
+    text = str(value or "").strip().strip("\"'")
+    return text.replace("/", "\\").rstrip("\\").lower()
+
+
+def _accept_windows_local_artifact_findings(
+    local_artifacts: dict[str, object],
+    *,
+    parity_run_id: str,
+    source_fingerprint: str,
+) -> list[str]:
+    findings: list[str] = []
+    for label in ("macos", "handoff", "windowsLocal"):
+        item = local_artifacts.get(label) if isinstance(local_artifacts.get(label), dict) else {}
+        if not isinstance(item, dict) or item.get("usable") is not True:
+            findings.append(f"localArtifacts.{label}.usable must be true")
+    windows_item = local_artifacts.get("windowsLocal") if isinstance(local_artifacts.get("windowsLocal"), dict) else {}
+    if isinstance(windows_item, dict):
+        if windows_item.get("parityRunId") != parity_run_id:
+            findings.append(
+                "localArtifacts.windowsLocal.parityRunId mismatch: "
+                f"artifact={windows_item.get('parityRunId')}; expected={parity_run_id}"
+            )
+        if windows_item.get("sourceFingerprint") != source_fingerprint:
+            findings.append(
+                "localArtifacts.windowsLocal.sourceFingerprint mismatch: "
+                f"artifact={windows_item.get('sourceFingerprint')}; expected={source_fingerprint}"
+            )
+        if windows_item.get("sourceStatus") != "current":
+            findings.append(
+                "localArtifacts.windowsLocal.sourceStatus must be current: "
+                f"got={windows_item.get('sourceStatus')}"
+            )
+    return findings
+
+
+def _accept_windows_report_findings(
+    audit_payload: dict[str, object],
+    source: dict[str, object],
+    *,
+    parity_run_id: str,
+    macos_summary: dict[str, object],
+    windows_summary: dict[str, object],
+) -> list[str]:
+    findings: list[str] = []
+    report = audit_payload.get("report") if isinstance(audit_payload.get("report"), dict) else {}
+    details = report.get("details") if isinstance(report.get("details"), dict) else {}
+    proof_id = details.get("proofId")
+    expected_proof_id = details.get("expectedProofId")
+    if report.get("ok") is not True:
+        findings.append("report.ok must be true after accept-windows")
+    if not (
+        isinstance(proof_id, str)
+        and re.fullmatch(r"[0-9a-f]{64}", proof_id)
+        and proof_id == expected_proof_id
+    ):
+        findings.append("report.details.proofId must match expectedProofId after accept-windows")
+    if details.get("currentSourceFingerprint") != source.get("sourceFingerprint"):
+        findings.append("report.details.currentSourceFingerprint must match the accepted source")
+    if details.get("currentSourceManifestSha256") != source.get("sourceManifestSha256"):
+        findings.append("report.details.currentSourceManifestSha256 must match the accepted source")
+    if details.get("currentSourceFileCount") != source.get("sourceFileCount"):
+        findings.append("report.details.currentSourceFileCount must match the accepted source")
+    if source.get("gitHead") and details.get("currentGitHead") != source.get("gitHead"):
+        findings.append("report.details.currentGitHead must match the accepted checkout")
+    if details.get("parityRunId") != parity_run_id:
+        findings.append("report.details.parityRunId must match the accepted handoff")
+    artifact_shas = details.get("artifactSha256") if isinstance(details.get("artifactSha256"), dict) else {}
+    artifact_bytes = details.get("artifactBytes") if isinstance(details.get("artifactBytes"), dict) else {}
+    for label, summary in (("macos", macos_summary), ("windows", windows_summary)):
+        expected_sha = summary.get("artifactSha256")
+        if not (
+            isinstance(expected_sha, str)
+            and re.fullmatch(r"[0-9a-f]{64}", expected_sha)
+            and artifact_shas.get(label) == expected_sha
+        ):
+            findings.append(f"report.details.artifactSha256.{label} must match the accepted artifact")
+        expected_bytes = summary.get("artifactBytes")
+        if not (
+            isinstance(expected_bytes, int)
+            and not isinstance(expected_bytes, bool)
+            and expected_bytes > 0
+            and artifact_bytes.get(label) == expected_bytes
+        ):
+            findings.append(f"report.details.artifactBytes.{label} must match the accepted artifact")
+    host_fingerprints = details.get("hostFingerprint") if isinstance(details.get("hostFingerprint"), dict) else {}
+    host_platforms = details.get("hostPlatform") if isinstance(details.get("hostPlatform"), dict) else {}
+    host_names = details.get("hostName") if isinstance(details.get("hostName"), dict) else {}
+    for label, expected_platform in (("macos", "darwin"), ("windows", "win32")):
+        fingerprint = host_fingerprints.get(label)
+        if not (isinstance(fingerprint, str) and re.fullmatch(r"[0-9a-f]{64}", fingerprint)):
+            findings.append(f"report.details.hostFingerprint.{label} must be recorded")
+        if host_platforms.get(label) != expected_platform:
+            findings.append(f"report.details.hostPlatform.{label} must be {expected_platform}")
+        if not str(host_names.get(label) or "").strip():
+            findings.append(f"report.details.hostName.{label} must be recorded")
+    return findings
+
+
+def accept_windows_artifact(
+    *,
+    artifact: str,
+    handoff_path: str,
+    output: str,
+    max_artifact_age_hours: float,
+    windows_source_path: str | None,
+) -> dict[str, object]:
+    source = current_source_summary()
+    if not isinstance(source, dict):
+        raise StepFailure("Could not compute current HostBridge source summary")
+    handoff = _current_handoff_payload(handoff_path, source)
+    macos_artifact = handoff.get("macosArtifact") if isinstance(handoff.get("macosArtifact"), dict) else {}
+    windows_proof = handoff.get("windowsProof") if isinstance(handoff.get("windowsProof"), dict) else {}
+    macos_path = str(macos_artifact.get("path") or DEFAULT_MACOS_PROOF_PATH)
+    local_copy = str(windows_proof.get("localCopyPath") or DEFAULT_WINDOWS_LOCAL_COPY_PATH)
+    parity_run_id = str(macos_artifact.get("parityRunId") or "")
+    source_fingerprint = str(source.get("sourceFingerprint") or "")
+    source_manifest = str(source.get("sourceManifestSha256") or "")
+    source_count = source.get("sourceFileCount")
+    if not parity_run_id:
+        raise StepFailure("Windows proof handoff does not include a parityRunId")
+    if not isinstance(source_count, int):
+        raise StepFailure("Current HostBridge source summary does not include sourceFileCount")
+    expected_windows_source = str(windows_proof.get("outputPath") or DEFAULT_WINDOWS_PROOF_PATH)
+    if windows_source_path and (
+        _normalize_windows_artifact_source_path(windows_source_path)
+        != _normalize_windows_artifact_source_path(expected_windows_source)
+    ):
+        raise StepFailure(
+            "Windows artifact source path does not match the current handoff",
+            next_step=(
+                f"Handoff expects {expected_windows_source}; got {windows_source_path}. "
+                "Regenerate the handoff for a custom Windows output path or pass the handoff outputPath."
+            ),
+        )
+
+    macos_summary = _artifact_summary(
+        macos_path,
+        label="macos",
+        expect_parity_run_id=parity_run_id,
+        expect_source_fingerprint=source_fingerprint,
+        expect_source_manifest_sha256=source_manifest,
+        expect_source_file_count=source_count,
+        max_artifact_age_hours=max_artifact_age_hours,
+    )
+    windows_summary = _artifact_summary(
+        artifact,
+        label="windows",
+        expect_parity_run_id=parity_run_id,
+        expect_source_fingerprint=source_fingerprint,
+        expect_source_manifest_sha256=source_manifest,
+        expect_source_file_count=source_count,
+        max_artifact_age_hours=max_artifact_age_hours,
+    )
+    windows_contract_findings = _windows_artifact_summary_contract_findings(windows_summary, handoff)
+    if windows_contract_findings:
+        raise StepFailure(
+            "Windows artifact does not satisfy the current OpenClaw handoff contract",
+            next_step="; ".join(windows_contract_findings[:6]),
+        )
+
+    artifact_path = Path(artifact).expanduser()
+    if not artifact_path.is_absolute():
+        artifact_path = ROOT / artifact_path
+    local_path = Path(local_copy).expanduser()
+    if not local_path.is_absolute():
+        local_path = ROOT / local_path
+    copied = False
+    if artifact_path.resolve() != local_path.resolve():
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(artifact_path, local_path)
+        copied = True
+
+    output_path = resolve_repo_output_path(output)
+    backend_report_path = is_backend_parity_report_path(output_path)
+    if not backend_report_path:
+        raise StepFailure(
+            "accept-windows must write the backend parity report path",
+            next_step="Use automation report manually for historical/custom output; accept-windows is the current OpenClaw gate.",
+        )
+    original_windows_source = windows_source_path or expected_windows_source
+    report_command = uv_python_command("ops/host_bridge_parity_report.py")
+    report_command.extend([
+        "--macos",
+        macos_path,
+        "--windows",
+        str(local_path),
+        "--output",
+        str(output_path),
+        "--max-artifact-age-hours",
+        str(max_artifact_age_hours),
+        "--windows-source-path",
+        original_windows_source,
+    ])
+    report_result = run(report_command, cwd=ROOT, timeout=60)
+    if report_result.returncode != 0:
+        detail = redact_text((report_result.stderr or report_result.stdout).strip())
+        raise StepFailure("HostBridge parity report failed after accepting Windows artifact", next_step=detail[:1200])
+
+    ok, raw, audit_payload = backend_json("/api/host-bridge/parity", timeout=HOST_BRIDGE_PARITY_TIMEOUT_SECONDS)
+    if not ok or not isinstance(audit_payload, dict):
+        raise StepFailure(
+            "Accepted Windows artifact and wrote the parity report, but backend audit is unavailable",
+            next_step=raw[:1200] if isinstance(raw, str) else "Start the backend and rerun automation audit.",
+        )
+    local_artifacts = collect_local_proof_artifacts(source)
+    audit_payload = normalize_parity_payload_for_cli(audit_payload, current_source=source)
+    audit_payload["localArtifacts"] = local_artifacts
+    audit_payload["commands"] = align_parity_commands_with_local_artifacts(audit_payload.get("commands"), local_artifacts)
+    contract = audit_payload.get("contract") if isinstance(audit_payload.get("contract"), dict) else {}
+    local_findings = _accept_windows_local_artifact_findings(
+        local_artifacts,
+        parity_run_id=parity_run_id,
+        source_fingerprint=source_fingerprint,
+    )
+    report_findings = _accept_windows_report_findings(
+        audit_payload,
+        source,
+        parity_run_id=parity_run_id,
+        macos_summary=macos_summary,
+        windows_summary=windows_summary,
+    )
+    accept_findings = [*report_findings, *local_findings]
+    if accept_findings:
+        audit_payload["ok"] = False
+        audit_payload["status"] = "cross_os_unverified"
+        audit_payload.setdefault("gaps", [])
+        gaps = audit_payload.get("gaps")
+        if isinstance(gaps, list):
+            gaps.extend(accept_findings)
+    audit_passed = (
+        audit_payload.get("ok") is True
+        and contract.get("status") == "cross_os_verified"
+        and not accept_findings
+    )
+    return {
+        "ok": audit_passed,
+        "status": audit_payload.get("status"),
+        "parityRunId": parity_run_id,
+        "sourceFingerprint": source_fingerprint,
+        "windowsArtifact": str(artifact_path),
+        "windowsLocalCopy": str(local_path),
+        "copied": copied,
+        "reportPath": str(output_path),
+        "macosProofFacetCount": macos_summary.get("proofFacetCount"),
+        "windowsProofFacetCount": windows_summary.get("proofFacetCount"),
+        "windowsMissingProofFacetCount": windows_summary.get("missingProofFacetCount"),
+        "audit": audit_payload,
     }
 
 
@@ -1248,6 +2235,56 @@ def _source_fingerprint_status(value: object, current_source: dict[str, object])
     return "stale"
 
 
+def _mark_artifact_usability(item: dict[str, object]) -> None:
+    source_status = item.get("sourceStatus")
+    contract_status = item.get("contractStatus")
+    exists = item.get("exists") is True
+    ok = item.get("ok") is True
+    contract_current = contract_status in (None, "current")
+    item["usable"] = bool(exists and ok and source_status == "current" and contract_current)
+    item["refreshRequired"] = source_status == "stale" or contract_status == "stale"
+
+
+def _failed_artifact_checks(payload: dict[str, object]) -> list[str]:
+    checks = payload.get("checks")
+    if not isinstance(checks, dict):
+        mode = str(payload.get("mode") or "").strip()
+        if payload.get("ok") is False and mode == "windows_live_proof_failed":
+            return ["windows_live_proof_failed"]
+        return ["artifact ok=false"] if payload.get("ok") is False else []
+    failed: list[str] = []
+    for name, value in checks.items():
+        if not isinstance(name, str) or not isinstance(value, dict):
+            continue
+        return_code = value.get("returnCode")
+        if (
+            value.get("ok") is False
+            or value.get("verified") is False
+            or (return_code not in (None, 0))
+            or bool(value.get("error"))
+            or bool(value.get("stderr"))
+        ):
+            failed.append(name)
+    if not failed and payload.get("ok") is False:
+        failed.append("artifact ok=false")
+    return failed
+
+
+def _artifact_source_fingerprint(payload: dict[str, object]) -> object:
+    artifact_source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
+    nested = artifact_source.get("sourceFingerprint")
+    if isinstance(nested, str) and nested.strip():
+        return nested
+    top_level = payload.get("sourceFingerprint")
+    if isinstance(top_level, str) and top_level.strip():
+        return top_level
+    preflight = payload.get("preflight") if isinstance(payload.get("preflight"), dict) else {}
+    preflight_value = preflight.get("sourceFingerprint")
+    if isinstance(preflight_value, str) and preflight_value.strip():
+        return preflight_value
+    return top_level
+
+
 def collect_local_proof_artifacts(current_source: dict[str, object] | None = None) -> dict[str, object]:
     source = current_source if isinstance(current_source, dict) else current_source_summary()
     source = source if isinstance(source, dict) else {}
@@ -1265,8 +2302,7 @@ def collect_local_proof_artifacts(current_source: dict[str, object] | None = Non
         if error:
             item["status"] = error
         if isinstance(payload, dict):
-            artifact_source = payload.get("source") if isinstance(payload.get("source"), dict) else {}
-            fingerprint = artifact_source.get("sourceFingerprint")
+            fingerprint = _artifact_source_fingerprint(payload)
             item.update({
                 "ok": payload.get("ok") is True,
                 "mode": payload.get("mode"),
@@ -1275,6 +2311,30 @@ def collect_local_proof_artifacts(current_source: dict[str, object] | None = Non
                 "sourceStatus": _source_fingerprint_status(fingerprint, source),
                 "generatedAt": payload.get("generatedAt"),
             })
+            error_text = str(payload.get("error") or "").strip()
+            if error_text:
+                item["error"] = error_text[:240]
+            failed_stage = str(payload.get("failedStage") or "").strip()
+            if failed_stage:
+                item["failureStage"] = failed_stage
+            next_steps = payload.get("nextSteps")
+            if isinstance(next_steps, dict):
+                item["failureNextSteps"] = next_steps
+            partial_artifact = payload.get("partialArtifact")
+            if isinstance(partial_artifact, dict):
+                item["failurePartialArtifact"] = partial_artifact
+            preflight = payload.get("preflight") if isinstance(payload.get("preflight"), dict) else {}
+            os_preflight = preflight.get("os") if isinstance(preflight.get("os"), dict) else {}
+            if os_preflight:
+                item["preflight"] = {
+                    "sessionName": os_preflight.get("sessionName"),
+                    "isElevated": os_preflight.get("isElevated"),
+                    "isWindows": os_preflight.get("isWindows"),
+                }
+            failed_checks = _failed_artifact_checks(payload)
+            if failed_checks:
+                item["failedChecks"] = failed_checks[:8]
+        _mark_artifact_usability(item)
         artifacts[label] = item
     handoff, handoff_error = _load_json_file(handoff_path)
     handoff_item: dict[str, object] = {"path": str(handoff_path), "exists": handoff is not None}
@@ -1283,15 +2343,89 @@ def collect_local_proof_artifacts(current_source: dict[str, object] | None = Non
     if isinstance(handoff, dict):
         handoff_source = handoff.get("source") if isinstance(handoff.get("source"), dict) else {}
         macos_artifact = handoff.get("macosArtifact") if isinstance(handoff.get("macosArtifact"), dict) else {}
+        windows_proof = handoff.get("windowsProof") if isinstance(handoff.get("windowsProof"), dict) else {}
+        windows_commands = windows_proof.get("commands") if isinstance(windows_proof.get("commands"), dict) else {}
+        operator_checklist = windows_proof.get("operatorChecklist") if isinstance(windows_proof.get("operatorChecklist"), list) else []
+        required_facets = (
+            windows_proof.get("requiredProofFacets")
+            if isinstance(windows_proof.get("requiredProofFacets"), list)
+            else []
+        )
+        proof_facet_count = windows_proof.get("proofFacetCount")
+        if not isinstance(proof_facet_count, int) or proof_facet_count < 0:
+            proof_facet_count = len(required_facets)
         fingerprint = handoff_source.get("sourceFingerprint")
+        handoff_source_status = _source_fingerprint_status(fingerprint, source)
         handoff_item.update({
             "ok": handoff.get("ok") is True,
             "kind": handoff.get("kind"),
             "parityRunId": macos_artifact.get("parityRunId"),
             "sourceFingerprint": fingerprint,
-            "sourceStatus": _source_fingerprint_status(fingerprint, source),
+            "sourceStatus": handoff_source_status,
             "generatedAt": handoff.get("generatedAt"),
+            "proofFacetCount": proof_facet_count,
         })
+        if required_facets:
+            handoff_item["requiredProofFacets"] = required_facets
+        contract_findings = _windows_handoff_contract_findings(handoff)
+        handoff_item["contractStatus"] = "stale" if contract_findings else "current"
+        if contract_findings:
+            handoff_item["contractFindings"] = contract_findings[:8]
+        windows_item = artifacts.get("windowsLocal")
+        if isinstance(windows_item, dict):
+            windows_item["expectedProofFacetCount"] = proof_facet_count
+            windows_item["expectedContractStatus"] = handoff_item["contractStatus"]
+            if contract_findings:
+                windows_item["contractStatus"] = "stale"
+                windows_item["contractFindings"] = contract_findings[:8]
+            if required_facets:
+                windows_item["requiredProofFacets"] = required_facets
+            if windows_item.get("exists") is not True:
+                windows_item["sourceStatus"] = handoff_source_status
+                windows_item["refreshRequired"] = handoff_source_status == "stale"
+                windows_item["usable"] = False
+            if isinstance(windows_proof.get("outputPath"), str):
+                windows_item["copySourcePath"] = windows_proof["outputPath"]
+            if isinstance(windows_proof.get("copyInstruction"), str):
+                windows_item["copyInstruction"] = windows_proof["copyInstruction"]
+            if isinstance(windows_commands.get("artifactValidate"), str):
+                windows_item["validateOnWindowsCommand"] = windows_commands["artifactValidate"]
+            if isinstance(windows_commands.get("liveProof"), str):
+                windows_item["liveProofCommand"] = windows_commands["liveProof"]
+            if operator_checklist:
+                normalized_checklist = [dict(item) for item in operator_checklist if isinstance(item, dict)]
+                accept_command = str(windows_commands.get("acceptWindowsArtifact") or "").strip()
+                if not accept_command:
+                    windows_source_path = str(windows_proof.get("outputPath") or DEFAULT_WINDOWS_PROOF_PATH)
+                    accept_command = (
+                        f"{local_cli_command('automation', 'accept-windows')} "
+                        f"{shell_quote(str(windows_path))} "
+                        f"--handoff {shell_quote(DEFAULT_WINDOWS_HANDOFF_PATH)} "
+                        "--max-artifact-age-hours 24.0 "
+                        f"--windows-source-path {shell_quote(windows_source_path)}"
+                    )
+                if (
+                    not any(item.get("id") == "accept_windows_artifact" for item in normalized_checklist)
+                    and accept_command
+                ):
+                    accept_item = {
+                        "id": "accept_windows_artifact",
+                        "host": "repo",
+                        "command": accept_command,
+                        "successCondition": "artifact validates, is installed at the local copy path, report is generated, and audit passes",
+                    }
+                    insert_at = next(
+                        (idx for idx, item in enumerate(normalized_checklist) if item.get("id") in {"generate_report", "audit_gate"}),
+                        len(normalized_checklist),
+                    )
+                    normalized_checklist.insert(insert_at, accept_item)
+                windows_item["operatorChecklist"] = normalized_checklist
+            if isinstance(macos_artifact.get("parityRunId"), str):
+                windows_item["expectedParityRunId"] = macos_artifact["parityRunId"]
+            if isinstance(fingerprint, str):
+                windows_item["expectedSourceFingerprint"] = fingerprint
+            _mark_artifact_usability(windows_item)
+    _mark_artifact_usability(handoff_item)
     artifacts["handoff"] = handoff_item
     return artifacts
 
@@ -1312,16 +2446,64 @@ def summarize_local_proof_artifacts(payload: object) -> list[str]:
         exists = bool_text(item.get("exists"))
         status = item.get("status")
         if item.get("exists") is not True:
-            lines.append(f"{label}: exists={exists}, status={status or 'missing'}")
+            parts = [f"exists={exists}", f"status={status or 'missing'}"]
+            source_status = item.get("sourceStatus")
+            if isinstance(source_status, str) and source_status:
+                parts.append(f"source={source_status}")
+            contract_status = item.get("contractStatus") or item.get("expectedContractStatus")
+            if isinstance(contract_status, str) and contract_status:
+                parts.append(f"contract={contract_status}")
+            if item.get("refreshRequired") is True:
+                parts.append("refreshRequired=true")
+            if label == "windowsLocal":
+                copy_source = item.get("copySourcePath")
+                expected_run = item.get("expectedParityRunId")
+                expected_facets = item.get("expectedProofFacetCount")
+                if isinstance(copy_source, str) and copy_source:
+                    parts.append(f"copyFrom={copy_source}")
+                if isinstance(expected_run, str) and expected_run:
+                    parts.append(f"run={expected_run}")
+                if isinstance(expected_facets, int) and expected_facets > 0:
+                    parts.append(f"proofFacets={expected_facets}")
+            lines.append(f"{label}: " + ", ".join(parts))
             continue
         parts = [
             f"exists={exists}",
             f"ok={bool_text(item.get('ok'))}",
             f"source={item.get('sourceStatus') or 'unknown'}",
+            f"usable={bool_text(item.get('usable'))}",
         ]
+        contract_status = item.get("contractStatus") or item.get("expectedContractStatus")
+        if isinstance(contract_status, str) and contract_status:
+            parts.append(f"contract={contract_status}")
+        if item.get("refreshRequired") is True:
+            parts.append("refreshRequired=true")
+        contract_findings = item.get("contractFindings")
+        if isinstance(contract_findings, list) and contract_findings:
+            parts.append(f"contractFinding={str(contract_findings[0])[:120]}")
+        failed_checks = item.get("failedChecks")
+        if isinstance(failed_checks, list) and failed_checks:
+            parts.append("failed=" + "|".join(str(check) for check in failed_checks[:3]))
+        failure_stage = str(item.get("failureStage") or "").strip()
+        if failure_stage:
+            parts.append(f"failureStage={failure_stage}")
+        error_text = str(item.get("error") or "").strip()
+        if error_text:
+            parts.append(f"error={error_text[:120]}")
+        preflight = item.get("preflight")
+        if isinstance(preflight, dict):
+            session_name = preflight.get("sessionName")
+            is_windows = preflight.get("isWindows")
+            if session_name is not None:
+                parts.append(f"session={session_name}")
+            if is_windows is not None:
+                parts.append(f"isWindows={bool_text(is_windows)}")
         run_id = item.get("parityRunId")
         if isinstance(run_id, str) and run_id:
             parts.append(f"run={run_id}")
+        proof_facets = item.get("proofFacetCount") or item.get("expectedProofFacetCount")
+        if isinstance(proof_facets, int) and proof_facets > 0:
+            parts.append(f"proofFacets={proof_facets}")
         lines.append(f"{label}: " + ", ".join(parts))
     return lines
 
@@ -1402,6 +2584,15 @@ def normalize_parity_commands(commands: object, *, current_source: dict[str, obj
                     value = f"{value} --json"
                 if key in {"windowsArtifactValidateOnWindows", "windowsArtifactValidateLocal"} and "automation artifact" in value and "--json" not in value:
                     value = f"{value} --json"
+                if key == "windowsProbe" and "automation windows-probe" in value:
+                    if "--output" in value:
+                        value = re.sub(
+                            r"--output\s+(?:\"[^\"]*\"|'[^']*'|\S+)",
+                            lambda _match: f"--output {DEFAULT_WINDOWS_PROBE_PATH}",
+                            value,
+                        )
+                    else:
+                        value = f"{value} --output {DEFAULT_WINDOWS_PROBE_PATH}"
                 normalized[key] = value
         live = normalized.get("windowsLiveProofRunner")
         if isinstance(live, str) and (
@@ -1443,14 +2634,136 @@ def normalize_parity_commands(commands: object, *, current_source: dict[str, obj
     return normalized
 
 
+def _reusable_handoff_parity_run_id(local_artifacts: object) -> str | None:
+    if not isinstance(local_artifacts, dict):
+        return None
+    handoff = local_artifacts.get("handoff")
+    if not isinstance(handoff, dict):
+        return None
+    run_id = handoff.get("parityRunId")
+    if (
+        isinstance(run_id, str)
+        and run_id.strip()
+        and handoff.get("usable") is True
+        and handoff.get("sourceStatus") == "current"
+    ):
+        return run_id
+    return None
+
+
+def align_parity_commands_with_local_artifacts(commands: object, local_artifacts: object) -> dict[str, object]:
+    if not isinstance(commands, dict):
+        return {}
+    normalized = dict(commands)
+    reusable_run_id = _reusable_handoff_parity_run_id(local_artifacts)
+    existing_run_id = normalized.get("parityRunId")
+    if (
+        isinstance(reusable_run_id, str)
+        and isinstance(existing_run_id, str)
+        and existing_run_id
+        and existing_run_id != reusable_run_id
+    ):
+        for key, value in list(normalized.items()):
+            if isinstance(value, str):
+                normalized[key] = value.replace(existing_run_id, reusable_run_id)
+        normalized["backendParityRunId"] = existing_run_id
+        normalized["parityRunId"] = reusable_run_id
+        normalized["parityRunIdSource"] = "local_handoff"
+    return normalized
+
+
+def build_windows_operator_checklist_from_commands(commands: object) -> list[dict[str, object]]:
+    if not isinstance(commands, dict):
+        return []
+    checklist: list[dict[str, object]] = []
+
+    def add_command(step_id: str, label: str, command_key: str) -> None:
+        if any(item.get("id") == step_id for item in checklist):
+            return
+        command = commands.get(command_key)
+        if isinstance(command, str) and command.strip():
+            checklist.append({"id": step_id, "label": label, "command": command})
+
+    add_command("source_validate", "Validate the checked-out source on Windows", "windowsSourceValidate")
+    add_command("mcp_gateway_setup", "Prepare MCP external-write gateway settings on Windows", "mcpGatewaySetupJson")
+    add_command("mcp_gateway_probe", "Probe MCP external-write gateway readiness on Windows", "mcpGatewayProbeJson")
+    add_command("mcp_gateway_status", "Validate MCP connector catalog readiness on Windows", "mcpGatewayStatusJson")
+    add_command("native_browser_desktop_smoke", "Run native Windows browser/desktop smoke diagnostics", "nativeBrowserDesktopSmoke")
+    add_command("windows_raw_probe", "Run raw Windows HostBridge probe diagnostics", "windowsProbe")
+    add_command("windows_live_proof", "Run the native Windows live proof", "windowsLiveProofRunner")
+    add_command("artifact_validate_on_windows", "Validate the Windows proof artifact on Windows", "windowsArtifactValidateOnWindows")
+
+    copy_hint = commands.get("windowsArtifactCopyHint")
+    copy_item: dict[str, object] | None = None
+    if isinstance(copy_hint, str) and copy_hint.strip():
+        copy_item = {
+            "id": "copy_to_repo_host",
+            "label": "Copy the Windows proof artifact back to this repo host",
+            "command": copy_hint,
+        }
+    else:
+        windows_source = commands.get("windowsProofPath") or commands.get("windowsOutputPath") or DEFAULT_WINDOWS_PROOF_PATH
+        local_copy = commands.get("windowsLocalCopyPath") or commands.get("windowsLocalPath") or DEFAULT_WINDOWS_LOCAL_COPY_PATH
+        if isinstance(windows_source, str) and isinstance(local_copy, str):
+            copy_item = {
+                "id": "copy_to_repo_host",
+                "label": "Copy the Windows proof artifact back to this repo host",
+                "from": windows_source,
+                "to": local_copy,
+            }
+    if copy_item is not None:
+        checklist.append(copy_item)
+
+    accept_windows = commands.get("acceptWindowsArtifact")
+    if isinstance(accept_windows, str) and accept_windows.strip():
+        checklist.append({"id": "accept_windows_artifact", "label": "Accept and install the copied Windows proof artifact", "command": accept_windows})
+    report = commands.get("automationReport") or commands.get("report")
+    if isinstance(report, str) and report.strip():
+        checklist.append({"id": "generate_report", "label": "Generate the cross-OS parity report", "command": report})
+    verify = commands.get("verify")
+    if isinstance(verify, str) and verify.strip():
+        checklist.append({"id": "audit_gate", "label": "Run the OpenClaw Windows audit gate", "command": verify})
+    return checklist
+
+
+def normalize_native_parity_matrix_payload(payload: object) -> object:
+    if not isinstance(payload, dict):
+        return payload
+    normalized = dict(payload)
+    legacy_fallback = normalized.pop("windows" + "SubsystemFallback", None)
+    if "windowsNativeHostOnly" not in normalized and legacy_fallback is False:
+        normalized["windowsNativeHostOnly"] = True
+    return normalized
+
+
+def normalize_runtime_payload_for_cli(payload: object) -> object:
+    if not isinstance(payload, dict):
+        return payload
+    normalized = dict(payload)
+    v2 = normalized.get("v2")
+    if isinstance(v2, dict):
+        normalized_v2 = dict(v2)
+        native_runtime = normalized_v2.get("nativeRuntime")
+        if isinstance(native_runtime, dict):
+            normalized_v2["nativeRuntime"] = normalize_native_parity_matrix_payload(native_runtime)
+        normalized["v2"] = normalized_v2
+    return normalized
+
+
 def normalize_parity_payload_for_cli(payload: object, *, current_source: dict[str, object] | None = None) -> object:
     if not isinstance(payload, dict):
         return payload
     source_summary = current_source if current_source is not None else current_source_summary()
     normalized = dict(payload)
+    native_parity = normalize_native_parity_matrix_payload(normalized.get("nativeParityMatrix"))
+    if isinstance(native_parity, dict):
+        normalized["nativeParityMatrix"] = native_parity
     commands = normalize_parity_commands(normalized.get("commands"), current_source=source_summary)
     if commands:
         normalized["commands"] = commands
+        operator_checklist = build_windows_operator_checklist_from_commands(commands)
+        if operator_checklist:
+            normalized["windowsProofOperatorChecklist"] = operator_checklist
     gaps = normalized.get("gaps")
     if isinstance(gaps, list):
         normalized["gaps"] = [_host_bridge_gap_text(gap) for gap in gaps if _host_bridge_gap_text(gap)]
@@ -1566,6 +2879,21 @@ def summarize_parity_command_payload(payload: object) -> list[str]:
         value = commands.get(key)
         if isinstance(value, str) and value.strip():
             lines.append(f"{key}={value}")
+    checklist = payload.get("windowsProofOperatorChecklist")
+    if not isinstance(checklist, list):
+        checklist = build_windows_operator_checklist_from_commands(commands)
+    for index, item in enumerate(checklist[:8], start=1):
+        if not isinstance(item, dict):
+            continue
+        step_id = item.get("id") or f"step_{index}"
+        command = item.get("command")
+        if isinstance(command, str) and command.strip():
+            lines.append(f"windowsProofChecklist[{index}].{step_id}={command}")
+            continue
+        source = item.get("from")
+        target = item.get("to")
+        if isinstance(source, str) and isinstance(target, str):
+            lines.append(f"windowsProofChecklist[{index}].{step_id}=copy {source} -> {target}")
     return lines or ["commands=unavailable"]
 
 
@@ -1777,6 +3105,32 @@ def install_missing_tools(
         run_interactive([brew, "install", "--cask", "google-chrome"], dry_run=dry_run)
 
 
+def run_winget_install(winget: str, package_id: str, display_name: str, *, dry_run: bool) -> None:
+    command = [winget, "install", "--id", package_id, "--exact", "--accept-source-agreements", "--accept-package-agreements"]
+    try:
+        run_interactive(command, dry_run=dry_run)
+        return
+    except StepFailure as first_error:
+        if dry_run:
+            raise
+        print_check(False, f"{display_name} winget install", f"retrying after source refresh; {str(first_error)[:180]}")
+        try:
+            run_interactive([winget, "source", "update"], dry_run=False)
+        except StepFailure as source_error:
+            print_check(False, "winget source update", f"{str(source_error)[:180]}; retrying install anyway")
+        try:
+            run_interactive(command, dry_run=False)
+        except StepFailure as retry_error:
+            raise StepFailure(
+                f"{display_name} winget install failed after source refresh",
+                next_step=(
+                    f"First attempt: {str(first_error)[:400]}\n"
+                    f"Retry: {str(retry_error)[:400]}\n"
+                    f"Install {display_name} manually, then run .\\atrium.ps1 setup again."
+                ),
+            ) from retry_error
+
+
 def install_missing_windows_tools(dry_run: bool, *, wait_docker: bool = False, assume_yes: bool = False) -> None:
     winget = command_path("winget")
     installs = {
@@ -1792,10 +3146,7 @@ def install_missing_windows_tools(dry_run: bool, *, wait_docker: bool = False, a
             )
         for tool in missing:
             package_id = installs[tool][0]
-            run_interactive(
-                [winget, "install", "--id", package_id, "--exact", "--accept-source-agreements", "--accept-package-agreements"],
-                dry_run=dry_run,
-            )
+            run_winget_install(winget, package_id, f"{tool} for Windows", dry_run=dry_run)
         ensure_common_paths()
     if not command_path("python3"):
         if not winget:
@@ -1803,10 +3154,7 @@ def install_missing_windows_tools(dry_run: bool, *, wait_docker: bool = False, a
                 "Python 3 is missing",
                 next_step="Install Python 3 for Windows, restart PowerShell, then run .\\atrium.ps1 setup again.",
             )
-        run_interactive(
-            [winget, "install", "--id", "Python.Python.3.12", "--exact", "--accept-source-agreements", "--accept-package-agreements"],
-            dry_run=dry_run,
-        )
+        run_winget_install(winget, "Python.Python.3.12", "Python 3", dry_run=dry_run)
         ensure_common_paths()
         if not dry_run and not command_path("python3"):
             raise StepFailure(
@@ -1832,10 +3180,7 @@ def install_missing_windows_tools(dry_run: bool, *, wait_docker: bool = False, a
     if not command_path("docker"):
         if not winget:
             raise StepFailure("Docker Desktop is missing", next_step="Install Docker Desktop for Windows, open it once, then run .\\atrium.ps1 setup again.")
-        run_interactive(
-            [winget, "install", "--id", "Docker.DockerDesktop", "--exact", "--accept-source-agreements", "--accept-package-agreements"],
-            dry_run=dry_run,
-        )
+        run_winget_install(winget, "Docker.DockerDesktop", "Docker Desktop", dry_run=dry_run)
         ensure_common_paths()
         if not dry_run:
             if wait_docker:
@@ -1851,20 +3196,14 @@ def install_missing_windows_tools(dry_run: bool, *, wait_docker: bool = False, a
                 )
     if not browser_installed() and winget:
         try:
-            run_interactive(
-                [winget, "install", "--id", "Google.Chrome", "--exact", "--accept-source-agreements", "--accept-package-agreements"],
-                dry_run=dry_run,
-            )
+            run_winget_install(winget, "Google.Chrome", "Google Chrome", dry_run=dry_run)
         except StepFailure as exc:
             print_check(False, "Chromium browser", f"winget install failed; install Chrome/Edge/Brave/Chromium manually, then run .\\atrium.ps1 automation status --commands; {str(exc)[:180]}")
     if not command_path("claude"):
         winget_error = ""
         if winget:
             try:
-                run_interactive(
-                    [winget, "install", "--id", "Anthropic.ClaudeCode", "--exact", "--accept-source-agreements", "--accept-package-agreements"],
-                    dry_run=dry_run,
-                )
+                run_winget_install(winget, "Anthropic.ClaudeCode", "Claude Code", dry_run=dry_run)
             except StepFailure as exc:
                 winget_error = str(exc)
             ensure_common_paths()
@@ -1923,6 +3262,17 @@ def windows_native() -> bool:
     return platform.system() == "Windows"
 
 
+def launcher_mode() -> str:
+    if windows_native():
+        return "windows-native"
+    system = platform.system()
+    if system == "Darwin":
+        return "macos-screen"
+    if system == "Linux":
+        return "linux-screen"
+    return f"{system.lower() or 'unknown'}-screen"
+
+
 def local_cli_command(*parts: str) -> str:
     launcher = r".\atrium.ps1" if windows_native() else "./atrium"
     suffix = " ".join(part for part in parts if part)
@@ -1958,6 +3308,37 @@ def process_running(pid: int | None) -> bool:
         return False
 
 
+def windows_process_identity(pid: int | None) -> dict[str, object] | None:
+    if platform.system() != "Windows" or not pid or pid <= 0:
+        return None
+    powershell = powershell_command()
+    if not powershell:
+        return {"ok": False, "error": "PowerShell unavailable"}
+    script = (
+        "$p = Get-CimInstance Win32_Process -Filter "
+        f"{ps_single_quote(f'ProcessId = {pid}')}"
+        " -ErrorAction SilentlyContinue | Select-Object -First 1 "
+        "ProcessId,ParentProcessId,Name,ExecutablePath,CommandLine; "
+        "if ($null -eq $p) { exit 1 }; "
+        "$p | ConvertTo-Json -Compress"
+    )
+    result = run([powershell, "-NoProfile", "-Command", script], timeout=5)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "process not found").strip()[:240]
+        return {"ok": False, "error": detail}
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return {"ok": False, "error": "Unable to parse process identity"}
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "Unexpected process identity payload"}
+    payload["ok"] = True
+    redacted = redact_json_value(payload)
+    if isinstance(redacted, dict):
+        return redacted
+    return {"ok": False, "error": "Unexpected process identity after redaction"}
+
+
 def pid_status(label: str, pid_path: Path, log_path: Path) -> str:
     pid = read_pid(pid_path)
     if process_running(pid):
@@ -1970,7 +3351,7 @@ def pid_status(label: str, pid_path: Path, log_path: Path) -> str:
 def pid_detail(label: str, pid_path: Path, log_path: Path) -> dict[str, object]:
     pid = read_pid(pid_path)
     running = process_running(pid)
-    return {
+    detail: dict[str, object] = {
         "label": label,
         "pid": pid,
         "running": running,
@@ -1980,6 +3361,10 @@ def pid_detail(label: str, pid_path: Path, log_path: Path) -> dict[str, object]:
         "logExists": log_path.exists(),
         "ownedByAtriumLauncher": pid is not None,
     }
+    identity = windows_process_identity(pid)
+    if identity is not None:
+        detail["processIdentity"] = identity
+    return detail
 
 
 def windows_process_details() -> dict[str, object]:
@@ -2000,10 +3385,626 @@ def windows_process_status() -> str:
 
 def collect_process_payload() -> dict[str, object]:
     return {
-        "mode": "windows-native" if windows_native() else "screen-or-macos",
+        "mode": launcher_mode(),
         "summary": windows_process_status() if windows_native() else screen_sessions().replace("\n", " | "),
         "details": windows_process_details() if windows_native() else None,
     }
+
+
+def collect_windows_runtime_payload() -> dict[str, object]:
+    payload: dict[str, object] = {
+        "windowsNative": windows_native(),
+        "platform": platform.platform(),
+        "launcher": local_cli_command("status"),
+        "sessionName": os.environ.get("SESSIONNAME"),
+    }
+    if not windows_native():
+        return payload
+    powershell = powershell_command()
+    payload["powershell"] = {
+        "command": powershell,
+        "version": None,
+    }
+    if powershell:
+        result = run([powershell, "-NoProfile", "-Command", "$PSVersionTable.PSVersion.ToString()"], timeout=5)
+        payload["powershell"]["version"] = result.stdout.strip() if result.returncode == 0 else None
+        payload["powershell"]["error"] = result.stderr.strip()[:240] if result.returncode != 0 else None
+    payload["commands"] = {name: report_command_path(name) for name in report_tool_names()}
+    payload["dockerDesktop"] = [
+        {
+            "path": str(candidate),
+            "exists": candidate.exists(),
+        }
+        for candidate in (
+            Path(os.environ.get("ProgramFiles", "C:/Program Files")) / "Docker" / "Docker" / "Docker Desktop.exe",
+            Path(os.environ.get("LocalAppData", "")) / "Docker" / "Docker Desktop.exe",
+        )
+    ]
+    payload["process"] = collect_process_payload()
+    return payload
+
+
+def _source_file_metadata(path: Path) -> dict[str, object]:
+    digest, size = file_sha256_and_size(path)
+    payload: dict[str, object] = {
+        "path": str(path),
+        "relativePath": rel(path),
+        "exists": path.exists(),
+        "sha256": digest,
+        "bytes": size,
+    }
+    try:
+        payload["modifiedAt"] = int(path.stat().st_mtime)
+    except OSError:
+        payload["modifiedAt"] = None
+    return payload
+
+
+def _read_source_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
+def windows_openclaw_lifecycle_commands() -> dict[str, object]:
+    windows_artifact = DEFAULT_WINDOWS_PROOF_PATH
+    local_windows_artifact = DEFAULT_WINDOWS_LOCAL_COPY_PATH
+    macos_artifact = DEFAULT_MACOS_PROOF_PATH
+    handoff_artifact = DEFAULT_WINDOWS_HANDOFF_PATH
+    native_setup = ".\\atrium.ps1 setup --yes"
+    native_start = ".\\atrium.ps1 start"
+    native_status = ".\\atrium.ps1 status --json"
+    native_logs = ".\\atrium.ps1 logs --json"
+    native_report = ".\\atrium.ps1 report --bundle"
+    native_stop = ".\\atrium.ps1 stop"
+    native_restart = ".\\atrium.ps1 restart --force"
+    native_permissions_status = ".\\atrium.ps1 permissions status --json"
+    native_permissions_set = ".\\atrium.ps1 permissions set full_auto --agent-full-access true"
+    native_provider_status = ".\\atrium.ps1 provider status --probe --json"
+    native_provider_reference = ".\\atrium.ps1 provider reference --json"
+    native_provider_env = ".\\atrium.ps1 provider env --json"
+    native_provider_login_chatgpt = ".\\atrium.ps1 provider login chatgpt"
+    native_provider_login_claude = ".\\atrium.ps1 provider login claude-code"
+    native_provider_disconnect_chatgpt = ".\\atrium.ps1 provider disconnect chatgpt"
+    native_provider_disconnect_claude = ".\\atrium.ps1 provider disconnect claude-code"
+    native_tools_status = ".\\atrium.ps1 tools status --json"
+    native_tools_catalog = ".\\atrium.ps1 tools catalog --json"
+    mcp_gateway_setup = ".\\atrium.ps1 tools mcp-gateway --json"
+    mcp_gateway_status = ".\\atrium.ps1 tools status --json"
+    mcp_gateway_probe = ".\\atrium.ps1 tools mcp-probe --json"
+    native_browser_desktop_smoke = f".\\atrium.ps1 automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium --output {DEFAULT_WINDOWS_SMOKE_PATH}"
+    windows_probe = f".\\atrium.ps1 automation windows-probe --full --browser-url http://127.0.0.1:5173 --browser-profile atrium --output {DEFAULT_WINDOWS_PROBE_PATH}"
+    windows_source_validate = (
+        ".\\atrium.ps1 automation source "
+        "--expect-source-fingerprint <fingerprint> "
+        "--expect-source-manifest-sha256 <manifest-sha256> "
+        "--expect-source-file-count <count> --json"
+    )
+    windows_live_proof = (
+        ".\\atrium.ps1 automation windows-live-proof "
+        "--parity-run-id <parity-run-id> "
+        "--source-fingerprint <fingerprint> "
+        "--source-manifest-sha256 <manifest-sha256> "
+        "--source-file-count <count> "
+        "--max-artifact-age-hours 24.0 "
+        f"--output {ps_single_quote(windows_artifact)}"
+    )
+    windows_artifact_validate = (
+        ".\\atrium.ps1 automation artifact --label windows "
+        "--expect-parity-run-id <parity-run-id> "
+        "--expect-source-fingerprint <fingerprint> "
+        "--expect-source-manifest-sha256 <manifest-sha256> "
+        "--expect-source-file-count <count> "
+        "--max-artifact-age-hours 24.0 --json "
+        f"{ps_single_quote(windows_artifact)}"
+    )
+    report = (
+        f"{local_cli_command('automation', 'report')} "
+        f"--macos {shell_quote(macos_artifact)} "
+        f"--windows {shell_quote(local_windows_artifact)} "
+        "--max-artifact-age-hours 24.0 "
+        f"--windows-source-path {shell_quote(windows_artifact)}"
+    )
+    accept_windows = (
+        f"{local_cli_command('automation', 'accept-windows')} "
+        f"{shell_quote(local_windows_artifact)} "
+        f"--handoff {shell_quote(handoff_artifact)} "
+        "--max-artifact-age-hours 24.0 "
+        f"--windows-source-path {shell_quote(windows_artifact)}"
+    )
+    commands = {
+        "nativeSetup": native_setup,
+        "nativeStart": native_start,
+        "nativeStatusJson": native_status,
+        "nativeLogsJson": native_logs,
+        "nativeReportBundle": native_report,
+        "nativeStop": native_stop,
+        "nativeRestart": native_restart,
+        "nativePermissionsStatusJson": native_permissions_status,
+        "nativePermissionsSetFullAuto": native_permissions_set,
+        "nativeProviderStatusProbeJson": native_provider_status,
+        "nativeProviderReferenceJson": native_provider_reference,
+        "nativeProviderEnvJson": native_provider_env,
+        "nativeProviderLoginChatGPT": native_provider_login_chatgpt,
+        "nativeProviderLoginClaudeCode": native_provider_login_claude,
+        "nativeProviderDisconnectChatGPT": native_provider_disconnect_chatgpt,
+        "nativeProviderDisconnectClaudeCode": native_provider_disconnect_claude,
+        "nativeToolsStatusJson": native_tools_status,
+        "nativeToolsCatalogJson": native_tools_catalog,
+        "mcpGatewaySetupJson": mcp_gateway_setup,
+        "mcpGatewayStatusJson": mcp_gateway_status,
+        "mcpGatewayProbeJson": mcp_gateway_probe,
+        "nativeBrowserDesktopSmoke": native_browser_desktop_smoke,
+        "windowsProbe": windows_probe,
+        "sourceValidate": windows_source_validate,
+        "handoff": (
+            f"{local_cli_command('automation', 'handoff')} "
+            f"--macos {shell_quote(macos_artifact)} "
+            f"--output {shell_quote(handoff_artifact)} "
+            f"--windows-output {shell_quote(windows_artifact)} "
+            f"--windows-local-copy {shell_quote(local_windows_artifact)}"
+        ),
+        "windowsLiveProof": windows_live_proof,
+        "windowsArtifactValidate": windows_artifact_validate,
+        "windowsArtifactValidateOnWindows": windows_artifact_validate,
+        "copyToRepoHost": f"Copy {windows_artifact} from Windows to {local_windows_artifact} on this repo host.",
+        "acceptWindowsArtifact": accept_windows,
+        "report": report,
+        "audit": local_cli_command("automation", "audit"),
+    }
+    checklist = [
+        {"id": "native_setup_start", "host": "windows", "command": f"{native_setup}; {native_start}; {native_status}"},
+        {"id": "native_permissions", "host": "windows", "command": f"{native_permissions_status}; {native_permissions_set}; {native_permissions_status}"},
+        {
+            "id": "native_provider_ai_tools",
+            "host": "windows",
+            "command": f"{native_provider_status}; {native_provider_reference}; {native_provider_env}; {native_tools_status}; {native_tools_catalog}",
+            "loginCommands": [native_provider_login_chatgpt, native_provider_login_claude],
+            "accountSwitchCommands": [native_provider_disconnect_chatgpt, native_provider_disconnect_claude],
+        },
+        {"id": "native_logs_report", "host": "windows", "command": f"{native_logs}; {native_report}"},
+        {"id": "native_stop_restart", "host": "windows", "command": f"{native_stop}; {native_restart}; {native_status}"},
+        {"id": "mcp_gateway_setup", "host": "windows", "command": mcp_gateway_setup},
+        {"id": "mcp_gateway_probe", "host": "windows", "command": mcp_gateway_probe},
+        {"id": "mcp_gateway_status", "host": "windows", "command": mcp_gateway_status},
+        {"id": "native_browser_desktop_smoke", "host": "windows", "command": native_browser_desktop_smoke},
+        {"id": "windows_raw_probe", "host": "windows", "command": windows_probe},
+        {"id": "source_validate", "host": "windows", "command": windows_source_validate},
+        {"id": "windows_live_proof", "host": "windows", "command": windows_live_proof},
+        {"id": "artifact_validate_on_windows", "host": "windows", "command": windows_artifact_validate},
+        {"id": "copy_to_repo_host", "host": "transfer", "command": commands["copyToRepoHost"]},
+        {"id": "accept_windows_artifact", "host": "repo", "command": accept_windows},
+        {"id": "generate_report", "host": "repo", "command": report},
+        {"id": "audit_gate", "host": "repo", "command": commands["audit"]},
+    ]
+    return {
+        "ok": True,
+        "commands": commands,
+        "operatorChecklist": checklist,
+        "requiredGate": "Run accept-windows with the copied Windows artifact; it must validate, write the report, and audit must pass before claiming OpenClaw-level Windows parity.",
+    }
+
+
+def macos_native_next_check_commands() -> list[dict[str, object]]:
+    commands = [
+        ("doctor_json", "./atrium doctor --json"),
+        ("status_json", "./atrium status --json"),
+        ("provider_status", "./atrium provider status --probe --json"),
+        ("provider_reference", "./atrium provider reference --json"),
+        ("provider_env", "./atrium provider env --json"),
+        ("provider_login_chatgpt", "./atrium provider login chatgpt"),
+        ("provider_login_claude_code", "./atrium provider login claude-code"),
+        ("provider_disconnect_chatgpt", "./atrium provider disconnect chatgpt"),
+        ("provider_disconnect_claude_code", "./atrium provider disconnect claude-code"),
+        ("permissions_status", "./atrium permissions status --json"),
+        ("permissions_full_auto", "./atrium permissions set full_auto --agent-full-access true"),
+        ("tools_status", "./atrium tools status --json"),
+        ("tools_mcp_gateway", "./atrium tools mcp-gateway --json"),
+        ("tools_mcp_probe", "./atrium tools mcp-probe --json"),
+        ("tools_catalog", "./atrium tools catalog --json"),
+        ("automation_status", "./atrium automation status --commands"),
+        (
+            "automation_smoke",
+            "./atrium automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium --output /tmp/atrium_host_bridge_macos_smoke.json",
+        ),
+        ("automation_probe", "uv --project system run python ops/macos_host_bridge_probe.py --full"),
+        ("logs_json", "./atrium logs --json"),
+        ("report_bundle", "./atrium report --bundle"),
+    ]
+    return [{"id": item_id, "host": "macos", "command": command} for item_id, command in commands]
+
+
+def native_next_checks_payload() -> dict[str, object]:
+    if windows_native():
+        proof = windows_openclaw_lifecycle_commands()
+        commands = proof.get("commands")
+        checklist = proof.get("operatorChecklist")
+        return {
+            "host": "windows",
+            "launcherMode": launcher_mode(),
+            "commands": commands if isinstance(commands, dict) else {},
+            "operatorChecklist": checklist if isinstance(checklist, list) else [],
+            "requiredGate": proof.get("requiredGate"),
+        }
+    host = "macos" if platform.system() == "Darwin" else "non-windows"
+    return {
+        "host": host,
+        "launcherMode": launcher_mode(),
+        "operatorChecklist": macos_native_next_check_commands(),
+    }
+
+
+def native_parity_matrix_payload() -> dict[str, object]:
+    windows_commands = windows_openclaw_lifecycle_commands().get("commands")
+    windows_commands = windows_commands if isinstance(windows_commands, dict) else {}
+    macos_commands = {item["id"]: item["command"] for item in macos_native_next_check_commands()}
+    surfaces = [
+        {
+            "id": "install",
+            "label": "Native install and setup",
+            "macos": ["./atrium setup --yes", "ops/install_macos.sh"],
+            "windows": [str(windows_commands.get("nativeSetup") or ".\\atrium.ps1 setup --yes"), "ops/install_windows_native.ps1"],
+        },
+        {
+            "id": "lifecycle",
+            "label": "Start, stop, restart, and process truth",
+            "macos": ["./atrium start", "./atrium stop", "./atrium restart", str(macos_commands.get("status_json") or "./atrium status --json")],
+            "windows": [
+                str(windows_commands.get("nativeStart") or ".\\atrium.ps1 start"),
+                str(windows_commands.get("nativeStop") or ".\\atrium.ps1 stop"),
+                str(windows_commands.get("nativeRestart") or ".\\atrium.ps1 restart --force"),
+                str(windows_commands.get("nativeStatusJson") or ".\\atrium.ps1 status --json"),
+            ],
+        },
+        {
+            "id": "runtime_status",
+            "label": "Runtime and provider readiness status",
+            "macos": [
+                str(macos_commands.get("doctor_json") or "./atrium doctor --json"),
+                str(macos_commands.get("status_json") or "./atrium status --json"),
+                str(macos_commands.get("provider_status") or "./atrium provider status --probe --json"),
+            ],
+            "windows": [
+                ".\\atrium.ps1 doctor --json",
+                str(windows_commands.get("nativeStatusJson") or ".\\atrium.ps1 status --json"),
+                str(windows_commands.get("nativeProviderStatusProbeJson") or ".\\atrium.ps1 provider status --probe --json"),
+            ],
+        },
+        {
+            "id": "provider_login",
+            "label": "Provider login, account switch, and credential reference",
+            "macos": [
+                str(macos_commands.get("provider_reference") or "./atrium provider reference --json"),
+                str(macos_commands.get("provider_env") or "./atrium provider env --json"),
+                str(macos_commands.get("provider_login_chatgpt") or "./atrium provider login chatgpt"),
+                str(macos_commands.get("provider_login_claude_code") or "./atrium provider login claude-code"),
+                str(macos_commands.get("provider_disconnect_chatgpt") or "./atrium provider disconnect chatgpt"),
+                str(macos_commands.get("provider_disconnect_claude_code") or "./atrium provider disconnect claude-code"),
+            ],
+            "windows": [
+                str(windows_commands.get("nativeProviderReferenceJson") or ".\\atrium.ps1 provider reference --json"),
+                str(windows_commands.get("nativeProviderEnvJson") or ".\\atrium.ps1 provider env --json"),
+                str(windows_commands.get("nativeProviderLoginChatGPT") or ".\\atrium.ps1 provider login chatgpt"),
+                str(windows_commands.get("nativeProviderLoginClaudeCode") or ".\\atrium.ps1 provider login claude-code"),
+                str(windows_commands.get("nativeProviderDisconnectChatGPT") or ".\\atrium.ps1 provider disconnect chatgpt"),
+                str(windows_commands.get("nativeProviderDisconnectClaudeCode") or ".\\atrium.ps1 provider disconnect claude-code"),
+            ],
+        },
+        {
+            "id": "ai_tools",
+            "label": "AI tool registry, catalog, and MCP gateway",
+            "macos": [
+                str(macos_commands.get("tools_status") or "./atrium tools status --json"),
+                str(macos_commands.get("tools_mcp_gateway") or "./atrium tools mcp-gateway --json"),
+                str(macos_commands.get("tools_mcp_probe") or "./atrium tools mcp-probe --json"),
+                str(macos_commands.get("tools_catalog") or "./atrium tools catalog --json"),
+            ],
+            "windows": [
+                str(windows_commands.get("nativeToolsStatusJson") or ".\\atrium.ps1 tools status --json"),
+                str(windows_commands.get("mcpGatewaySetupJson") or ".\\atrium.ps1 tools mcp-gateway --json"),
+                str(windows_commands.get("mcpGatewayProbeJson") or ".\\atrium.ps1 tools mcp-probe --json"),
+                str(windows_commands.get("nativeToolsCatalogJson") or ".\\atrium.ps1 tools catalog --json"),
+            ],
+        },
+        {
+            "id": "browser_desktop_tools",
+            "label": "Browser and desktop automation tools",
+            "macos": [
+                str(macos_commands.get("automation_status") or "./atrium automation status --commands"),
+                str(macos_commands.get("automation_smoke") or "./atrium automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium"),
+                str(macos_commands.get("automation_probe") or "uv --project system run python ops/macos_host_bridge_probe.py --full"),
+            ],
+            "windows": [
+                ".\\atrium.ps1 automation status --commands",
+                str(windows_commands.get("nativeBrowserDesktopSmoke") or ".\\atrium.ps1 automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium"),
+                str(windows_commands.get("windowsLiveProof") or ".\\atrium.ps1 automation windows-live-proof"),
+            ],
+        },
+        {
+            "id": "logs_support_report",
+            "label": "Logs and support report",
+            "macos": [
+                str(macos_commands.get("logs_json") or "./atrium logs --json"),
+                str(macos_commands.get("report_bundle") or "./atrium report --bundle"),
+            ],
+            "windows": [
+                str(windows_commands.get("nativeLogsJson") or ".\\atrium.ps1 logs --json"),
+                str(windows_commands.get("nativeReportBundle") or ".\\atrium.ps1 report --bundle"),
+            ],
+        },
+        {
+            "id": "automation_permission",
+            "label": "Owner automation permission and OpenClaw audit gate",
+            "macos": [
+                str(macos_commands.get("permissions_status") or "./atrium permissions status --json"),
+                str(macos_commands.get("permissions_full_auto") or "./atrium permissions set full_auto --agent-full-access true"),
+                "./atrium automation audit",
+            ],
+            "windows": [
+                str(windows_commands.get("nativePermissionsStatusJson") or ".\\atrium.ps1 permissions status --json"),
+                str(windows_commands.get("nativePermissionsSetFullAuto") or ".\\atrium.ps1 permissions set full_auto --agent-full-access true"),
+                str(windows_commands.get("audit") or ".\\atrium.ps1 automation audit"),
+            ],
+        },
+    ]
+    return {
+        "host": "windows" if windows_native() else ("macos" if platform.system() == "Darwin" else "non-windows"),
+        "launcherMode": launcher_mode(),
+        "nativeOnly": True,
+        "windowsNativeHostOnly": True,
+        "evidenceType": "command_surface_and_handoff; live Windows proof artifact is still required for final parity",
+        "surfaces": surfaces,
+    }
+
+
+def summarize_native_parity_matrix(payload: object) -> list[str]:
+    if not isinstance(payload, dict):
+        return ["native.parity=unavailable"]
+    surfaces = payload.get("surfaces")
+    lines = [
+        f"native.parity.host={payload.get('host') or 'unknown'}",
+        f"native.parity.launcher={payload.get('launcherMode') or 'unknown'}",
+        f"native.parity.nativeOnly={bool_text(payload.get('nativeOnly'))}",
+        f"native.parity.windowsNativeHostOnly={bool_text(payload.get('windowsNativeHostOnly'))}",
+    ]
+    if isinstance(surfaces, list):
+        lines.append(f"native.parity.surfaces={len(surfaces)}")
+        for surface in surfaces:
+            if not isinstance(surface, dict):
+                continue
+            surface_id = str(surface.get("id") or "unknown")
+            macos_commands = surface.get("macos") if isinstance(surface.get("macos"), list) else []
+            windows_commands = surface.get("windows") if isinstance(surface.get("windows"), list) else []
+            lines.append(
+                f"native.parity.{surface_id}=macos:{len(macos_commands)} commands; "
+                f"windows:{len(windows_commands)} commands"
+            )
+    evidence_type = payload.get("evidenceType")
+    if isinstance(evidence_type, str) and evidence_type.strip():
+        lines.append(f"native.parity.evidence={evidence_type}")
+    return lines
+
+
+def collect_windows_entrypoints_payload() -> dict[str, object]:
+    files = {
+        "atriumPs1": ROOT / "atrium.ps1",
+        "atriumCmd": ROOT / "atrium.cmd",
+        "nativeInstaller": ROOT / "ops" / "install_windows_native.ps1",
+        "liveProofRunner": ROOT / "ops" / "windows_host_bridge_live_proof.ps1",
+        "atriumCli": ROOT / "ops" / "atrium_cli.py",
+    }
+    texts = {name: _read_source_text(path) for name, path in files.items()}
+    checks = {
+        "atriumPs1Runner": all(
+            token in texts["atriumPs1"]
+            for token in ("Add-PythonInstallPaths", "system\\.venv\\Scripts\\python.exe", "uv", "Python 3 is required")
+        ),
+        "atriumCmdForwarder": all(
+            token.lower() in texts["atriumCmd"].lower()
+            for token in ("powershell.exe", "pwsh.exe", "-ExecutionPolicy Bypass", "atrium.ps1", "%*", "missing_powershell")
+        ),
+        "standardPowerShellPathFallback": (
+            "%systemroot%\\system32\\windowspowershell\\v1.0\\powershell.exe" in texts["atriumCmd"].lower()
+            and "%systemroot%\\syswow64\\windowspowershell\\v1.0\\powershell.exe" in texts["atriumCmd"].lower()
+            and "%programfiles%\\powershell\\7\\pwsh.exe" in texts["atriumCmd"].lower()
+            and "%programfiles(x86)%\\powershell\\7\\pwsh.exe" in texts["atriumCmd"].lower()
+            and "SystemRoot" in texts["atriumCli"]
+        ),
+        "postStartReadiness": all(
+            token in texts["atriumCli"]
+            for token in (
+                "def print_post_start_readiness",
+                "Post-start Readiness",
+                "/api/runtime",
+                "/api/provider-auth/status",
+                "/api/permissions/mode",
+                "/api/tools/catalog",
+                "/api/connectors",
+                "/api/host-bridge/parity",
+            )
+        ),
+        "nativeInstallerSetupHandoff": all(
+            token in texts["nativeInstaller"]
+            for token in ("Resolve-PowerShell", "Invoke-Native", '".\\atrium.ps1"', '"setup"', '"--yes"')
+        ),
+        "nativeInstallerNextChecks": all(
+            token in texts["nativeInstaller"]
+            for token in (
+                ".\\atrium.ps1 doctor --json",
+                ".\\atrium.ps1 start",
+                ".\\atrium.ps1 provider status --probe --json",
+                ".\\atrium.ps1 provider reference --json",
+                ".\\atrium.ps1 provider env --json",
+                ".\\atrium.ps1 permissions status --json",
+                ".\\atrium.ps1 permissions set full_auto --agent-full-access true",
+                ".\\atrium.ps1 tools status --json",
+                ".\\atrium.ps1 automation status --commands",
+                ".\\atrium.ps1 automation source --json",
+                ".\\atrium.ps1 automation windows-live-proof",
+                "--source-fingerprint <fingerprint>",
+                "--source-manifest-sha256 <manifest>",
+                "--source-file-count <count>",
+                ".\\atrium.ps1 automation smoke",
+                ".\\atrium.ps1 automation artifact --label windows",
+                "--max-artifact-age-hours 24.0",
+                ".\\atrium.ps1 automation windows-probe --full",
+                "raw diagnostic; automation smoke is the normal native smoke command",
+                ".\\atrium.ps1 report --bundle",
+                ".\\atrium.ps1 stop",
+            )
+        ),
+        "liveProofRunner": all(
+            token in texts["liveProofRunner"]
+            for token in (
+                "windows_host_bridge_probe.py",
+                "host_bridge_artifact_summary.py",
+                "MaxArtifactAgeHours",
+                "--full",
+                "Get-LiveProofPreflight",
+                "Write-LiveProofFailureArtifact",
+                "windows_live_proof_failed",
+            )
+        ),
+        "openclawLifecycleProofPackage": all(
+            token in texts["atriumCli"]
+            for token in (
+                "windows_openclaw_lifecycle_commands",
+                "native_setup_start",
+                "native_permissions",
+                "native_provider_ai_tools",
+                "native_logs_report",
+                "native_stop_restart",
+                '"nativeStart"',
+                '"nativeStop"',
+                '"nativeRestart"',
+                '"nativeStatusJson"',
+                '"nativeLogsJson"',
+                '"nativeReportBundle"',
+                '"nativePermissionsStatusJson"',
+                '"nativePermissionsSetFullAuto"',
+                '"nativeProviderStatusProbeJson"',
+                '"nativeProviderReferenceJson"',
+                '"nativeProviderEnvJson"',
+                '"nativeProviderLoginChatGPT"',
+                '"nativeProviderLoginClaudeCode"',
+                '"nativeProviderDisconnectChatGPT"',
+                '"nativeProviderDisconnectClaudeCode"',
+                '"nativeToolsStatusJson"',
+                '"nativeToolsCatalogJson"',
+                '"mcpGatewayStatusJson"',
+                '"mcpGatewayProbeJson"',
+                '"nativeBrowserDesktopSmoke"',
+                "source_validate",
+                "mcp_gateway_setup",
+                "mcp_gateway_probe",
+                "mcp_gateway_status",
+                "native_browser_desktop_smoke",
+                "windows_raw_probe",
+                "accountSwitchCommands",
+                "windows_live_proof",
+                "artifact_validate_on_windows",
+                "copy_to_repo_host",
+                "generate_report",
+                "audit_gate",
+                "requiredGate",
+            )
+        ),
+    }
+    return {
+        "windowsNative": windows_native(),
+        "launcher": local_cli_command("status"),
+        "powershellCommand": powershell_command(),
+        "files": {name: _source_file_metadata(path) for name, path in files.items()},
+        "checks": checks,
+        "openclawLifecycleProof": windows_openclaw_lifecycle_commands(),
+        "ok": all(bool(value) for value in checks.values()) and all(path.exists() for path in files.values()),
+    }
+
+
+def summarize_windows_entrypoints_payload(payload: object) -> list[str]:
+    if not isinstance(payload, dict):
+        return ["windows.entrypoints=unavailable"]
+    lines = [
+        f"windows.entrypoints.ok={bool_text(payload.get('ok'))}",
+        f"windows.entrypoints.launcher={payload.get('launcher') or 'unknown'}",
+        f"windows.entrypoints.powershell={payload.get('powershellCommand') or 'missing'}",
+    ]
+    checks = payload.get("checks")
+    if isinstance(checks, dict):
+        for name, value in checks.items():
+            lines.append(f"windows.entrypoint.{name}={bool_text(value)}")
+    proof = payload.get("openclawLifecycleProof")
+    if isinstance(proof, dict):
+        lines.append(f"windows.entrypoints.openclawLifecycleProof.ok={bool_text(proof.get('ok'))}")
+        commands = proof.get("commands")
+        if isinstance(commands, dict):
+            for name in (
+                "nativeSetup",
+                "nativeStart",
+                "nativeStatusJson",
+                "nativeLogsJson",
+                "nativeReportBundle",
+                "nativeStop",
+                "nativeRestart",
+                "nativePermissionsStatusJson",
+                "nativePermissionsSetFullAuto",
+                "nativeProviderStatusProbeJson",
+                "nativeProviderReferenceJson",
+                "nativeProviderEnvJson",
+                "nativeProviderLoginChatGPT",
+                "nativeProviderLoginClaudeCode",
+                "nativeProviderDisconnectChatGPT",
+                "nativeProviderDisconnectClaudeCode",
+                "nativeToolsStatusJson",
+                "nativeToolsCatalogJson",
+                "mcpGatewaySetupJson",
+                "mcpGatewayProbeJson",
+                "mcpGatewayStatusJson",
+                "nativeBrowserDesktopSmoke",
+                "windowsProbe",
+                "sourceValidate",
+                "windowsLiveProof",
+                "windowsArtifactValidate",
+                "windowsArtifactValidateOnWindows",
+                "acceptWindowsArtifact",
+                "report",
+                "audit",
+            ):
+                command = commands.get(name)
+                if isinstance(command, str) and command.strip():
+                    lines.append(f"windows.entrypoints.openclawLifecycleProof.{name}={command}")
+        checklist = proof.get("operatorChecklist")
+        if isinstance(checklist, list):
+            ids = [str(item.get("id")) for item in checklist if isinstance(item, dict) and item.get("id")]
+            if ids:
+                lines.append("windows.entrypoints.openclawLifecycleProof.checklist=" + ", ".join(ids))
+    files = payload.get("files")
+    if isinstance(files, dict):
+        for name, meta in files.items():
+            if not isinstance(meta, dict):
+                continue
+            digest = str(meta.get("sha256") or "")
+            digest_label = digest[:12] if digest else "missing"
+            lines.append(
+                "windows.entrypoint.file."
+                f"{name}=exists={bool_text(meta.get('exists'))}; "
+                f"path={meta.get('relativePath') or meta.get('path') or 'unknown'}; "
+                f"bytes={meta.get('bytes') if meta.get('bytes') is not None else 'unknown'}; "
+                f"sha256={digest_label}"
+            )
+    return lines
+
+
+def windows_popen_command(command: Sequence[str]) -> list[str]:
+    prepared = list(command)
+    if not prepared or platform.system() != "Windows":
+        return prepared
+    suffix = Path(prepared[0]).suffix.lower()
+    if suffix not in {".cmd", ".bat"}:
+        return prepared
+    cmd = command_path("cmd.exe") or os.environ.get("ComSpec") or "cmd.exe"
+    return [cmd, "/D", "/S", "/C", subprocess.list2cmdline(prepared)]
 
 
 def windows_start_process(label: str, command: Sequence[str], cwd: Path, log_path: Path, pid_path: Path) -> None:
@@ -2021,7 +4022,7 @@ def windows_start_process(label: str, command: Sequence[str], cwd: Path, log_pat
         flags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
     with log_path.open("ab") as log:
         process = subprocess.Popen(
-            list(command),
+            windows_popen_command(command),
             cwd=str(cwd),
             stdin=subprocess.DEVNULL,
             stdout=log,
@@ -2140,6 +4141,7 @@ def command_provider(args: argparse.Namespace) -> int:
     ensure_repo_root()
     action = args.provider_action
     target = normalize_provider_auth_target(getattr(args, "provider", "chatgpt"))
+    start_hint = local_cli_command("start")
 
     if action == "status":
         probe = bool(getattr(args, "probe", False))
@@ -2148,13 +4150,43 @@ def command_provider(args: argparse.Namespace) -> int:
         if not ok:
             raise StepFailure(
                 "ATRIUM backend is not reachable for provider status",
-                next_step="Start ATRIUM first, then rerun provider status.\nWindows: .\\atrium.ps1 start\nmacOS: ./atrium start",
+                next_step=f"Start ATRIUM first, then rerun provider status.\n{start_hint}",
             )
         if getattr(args, "json", False):
             print(json.dumps(redact_json_value(payload), ensure_ascii=False, indent=2, sort_keys=True))
             return 0
         print_header("Provider Auth")
         for line in summarize_provider_auth_payload(payload):
+            print_info(line)
+        return 0
+
+    if action == "reference":
+        ok, raw, payload = backend_json("/api/provider-auth/reference", timeout=10.0)
+        if not ok:
+            raise StepFailure(
+                "ATRIUM backend is not reachable for provider credential reference",
+                next_step=f"Start ATRIUM first, then rerun provider reference.\n{start_hint}\nBackend response: {redact_text(raw)[:800]}",
+            )
+        if getattr(args, "json", False):
+            print(json.dumps(redact_json_value(payload), ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+        print_header("Provider Reference")
+        for line in summarize_provider_reference_payload(payload):
+            print_info(line)
+        return 0
+
+    if action == "env":
+        ok, raw, payload = backend_json("/api/provider-auth/env", timeout=10.0)
+        if not ok:
+            raise StepFailure(
+                "ATRIUM backend is not reachable for provider environment settings",
+                next_step=f"Start ATRIUM first, then rerun provider env.\n{start_hint}\nBackend response: {redact_text(raw)[:800]}",
+            )
+        if getattr(args, "json", False):
+            print(json.dumps(redact_json_value(payload), ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+        print_header("Provider Environment")
+        for line in summarize_provider_env_payload(payload):
             print_info(line)
         return 0
 
@@ -2172,7 +4204,7 @@ def command_provider(args: argparse.Namespace) -> int:
                 next_step=(
                     f"Backend response: {redact_text(raw)[:800]}\n"
                     "Start ATRIUM and retry from the native terminal.\n"
-                    "Windows: .\\atrium.ps1 start\nmacOS: ./atrium start"
+                    f"{start_hint}"
                 ),
             )
         print_header("Provider Login")
@@ -2236,6 +4268,7 @@ def command_provider(args: argparse.Namespace) -> int:
 
 def collect_tools_status_payload() -> tuple[dict[str, object], dict[str, bool], dict[str, str]]:
     ok_runtime, raw_runtime, runtime_payload = backend_json("/api/runtime", timeout=15.0)
+    runtime_payload = normalize_runtime_payload_for_cli(runtime_payload) if ok_runtime else runtime_payload
     ok_catalog, raw_catalog, catalog_payload = backend_json("/api/tools/catalog", timeout=8.0)
     ok_connectors, raw_connectors, connectors_payload = backend_json("/api/connectors", timeout=8.0)
     payload = {
@@ -2249,21 +4282,88 @@ def collect_tools_status_payload() -> tuple[dict[str, object], dict[str, bool], 
 
 
 def collect_automation_status_payload() -> tuple[bool, dict[str, object]]:
-    ok, raw, payload = backend_json("/api/host-bridge/parity", timeout=8.0)
+    ok, raw, payload = backend_json("/api/host-bridge/parity", timeout=HOST_BRIDGE_PARITY_TIMEOUT_SECONDS)
     if not ok or not isinstance(payload, dict):
         return False, {"ok": False, "backendReachable": False, "error": raw[:400]}
     source_summary = current_source_summary()
     normalized = normalize_parity_payload_for_cli(payload, current_source=source_summary)
     normalized["backendReachable"] = True
-    normalized["localArtifacts"] = collect_local_proof_artifacts(source_summary)
+    local_artifacts = collect_local_proof_artifacts(source_summary)
+    normalized["localArtifacts"] = local_artifacts
+    normalized["commands"] = align_parity_commands_with_local_artifacts(
+        normalized.get("commands"),
+        local_artifacts,
+    )
+    normalized["windowsProofOperatorChecklist"] = build_windows_operator_checklist_from_commands(
+        normalized.get("commands"),
+    )
     ok_permission, raw_permission, permission_payload = backend_json("/api/permissions/mode", timeout=5.0)
     normalized["permissionMode"] = permission_payload if ok_permission else {"ok": False, "error": raw_permission[:400]}
     return True, normalized
 
 
+def command_permissions(args: argparse.Namespace) -> int:
+    ensure_repo_root()
+    action = args.permissions_action
+    start_hint = local_cli_command("start")
+    if action == "status":
+        ok, raw, payload = backend_json("/api/permissions/mode", timeout=5.0)
+        if not ok:
+            raise StepFailure(
+                "ATRIUM backend is not reachable for permission mode",
+                next_step=f"Start ATRIUM first, then rerun permissions status.\n{start_hint}\nBackend response: {redact_text(raw)[:800]}",
+            )
+        if getattr(args, "json", False):
+            print(json.dumps(redact_json_value(payload), ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+        print_header("Owner Permissions")
+        for line in summarize_full_autonomy(payload):
+            print_info(line)
+        return 0
+
+    if action == "set":
+        payload: dict[str, object] = {
+            "mode": args.mode,
+            "updatedBy": getattr(args, "updated_by", None) or "atrium-cli",
+        }
+        if getattr(args, "agent_full_access", None) is not None:
+            payload["agentFullAccess"] = args.agent_full_access
+        for flag, key in (
+            ("allowed_tools", "allowedTools"),
+            ("denied_tools", "deniedTools"),
+            ("allowed_risk_classes", "allowedRiskClasses"),
+            ("denied_risk_classes", "deniedRiskClasses"),
+            ("command_allowlist", "commandAllowlist"),
+            ("command_denylist", "commandDenylist"),
+        ):
+            values = split_csv_values(getattr(args, flag, None))
+            if values:
+                payload[key] = values
+        if getattr(args, "ask_fallback", None):
+            payload["askFallback"] = args.ask_fallback
+        if getattr(args, "strict_inline_eval", None) is not None:
+            payload["strictInlineEval"] = args.strict_inline_eval
+        ok, raw, result = backend_json_request("/api/permissions/mode", method="PATCH", payload=payload, timeout=15.0)
+        if not ok:
+            raise StepFailure(
+                "Could not update permission mode through ATRIUM backend",
+                next_step=f"Start ATRIUM first, then retry permissions set.\n{start_hint}\nBackend response: {redact_text(raw)[:800]}",
+            )
+        if getattr(args, "json", False):
+            print(json.dumps(redact_json_value(result), ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+        print_header("Owner Permissions")
+        for line in summarize_full_autonomy(result):
+            print_info(line)
+        return 0
+
+    raise StepFailure(f"Unknown permissions action: {action}")
+
+
 def command_tools(args: argparse.Namespace) -> int:
     ensure_repo_root()
     action = args.tools_action
+    start_hint = local_cli_command("start")
     tools_payload, tool_ok, tool_raw = collect_tools_status_payload()
     runtime_payload = tools_payload.get("runtime") if tool_ok["runtime"] else None
     catalog_payload = tools_payload.get("toolCatalog") if tool_ok["toolCatalog"] else None
@@ -2280,7 +4380,7 @@ def command_tools(args: argparse.Namespace) -> int:
                 next_step=(
                     f"runtime: {redact_text(raw_runtime)[:400]}\n"
                     f"catalog: {redact_text(raw_catalog)[:400]}\n"
-                    "Start ATRIUM first, then rerun tools status.\nWindows: .\\atrium.ps1 start\nmacOS: ./atrium start"
+                    f"Start ATRIUM first, then rerun tools status.\n{start_hint}"
                 ),
             )
         if getattr(args, "json", False):
@@ -2320,19 +4420,54 @@ def command_tools(args: argparse.Namespace) -> int:
                 print_info(name, f"executor={executor}; risk={risk}; mutates={mutates}")
         return 0
 
+    if action == "mcp-gateway":
+        if not ok_runtime or not tool_ok["connectors"]:
+            raise StepFailure(
+                "ATRIUM backend is not reachable for MCP gateway readiness",
+                next_step=(
+                    f"runtime: {redact_text(raw_runtime)[:400]}\n"
+                    f"connectors: {redact_text(tool_raw['connectors'])[:400]}\n"
+                    f"Start ATRIUM first, then rerun tools mcp-gateway.\n{start_hint}"
+                ),
+            )
+        payload = mcp_gateway_setup_payload(runtime_payload, connectors_payload)
+        if getattr(args, "json", False):
+            print(json.dumps(redact_json_value(payload), ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+        print_header("MCP External-Write Gateway")
+        for line in summarize_mcp_gateway_setup_payload(payload):
+            print_info(line)
+        return 0
+
+    if action == "mcp-probe":
+        ok, raw, payload = backend_json("/api/tools/mcp-gateway?probe=true", timeout=15.0)
+        if not ok or not isinstance(payload, dict):
+            raise StepFailure(
+                "ATRIUM backend is not reachable for MCP gateway probe",
+                next_step=redact_text(raw)[:800] or "Start ATRIUM first, then rerun tools mcp-probe.",
+            )
+        if getattr(args, "json", False):
+            print(json.dumps(redact_json_value(payload), ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+        print_header("MCP External-Write Gateway Probe")
+        for line in summarize_mcp_gateway_setup_payload(payload):
+            print_info(line)
+        return 0
+
     raise StepFailure(f"Unknown tools action: {action}")
 
 
 def command_automation(args: argparse.Namespace) -> int:
     ensure_repo_root()
     action = args.automation_action
+    start_hint = local_cli_command("start")
 
     if action == "status":
         backend_ok, payload = collect_automation_status_payload()
         if not backend_ok:
             raise StepFailure(
                 "ATRIUM backend is not reachable for automation status",
-                next_step="Start ATRIUM first, then rerun automation status.\nWindows: .\\atrium.ps1 start\nmacOS: ./atrium start",
+                next_step=f"Start ATRIUM first, then rerun automation status.\n{start_hint}",
             )
         if getattr(args, "json", False):
             print(json.dumps(redact_json_value(payload), ensure_ascii=False, indent=2, sort_keys=True))
@@ -2357,7 +4492,7 @@ def command_automation(args: argparse.Namespace) -> int:
         return 0
 
     if action == "audit":
-        ok, raw, payload = backend_json("/api/host-bridge/parity", timeout=8.0)
+        ok, raw, payload = backend_json("/api/host-bridge/parity", timeout=HOST_BRIDGE_PARITY_TIMEOUT_SECONDS)
         if not ok or not isinstance(payload, dict):
             raise StepFailure(
                 "ATRIUM backend is not reachable for OpenClaw Windows audit",
@@ -2365,7 +4500,15 @@ def command_automation(args: argparse.Namespace) -> int:
             )
         source_summary = current_source_summary()
         payload = normalize_parity_payload_for_cli(payload, current_source=source_summary)
-        payload["localArtifacts"] = collect_local_proof_artifacts(source_summary)
+        local_artifacts = collect_local_proof_artifacts(source_summary)
+        payload["localArtifacts"] = local_artifacts
+        payload["commands"] = align_parity_commands_with_local_artifacts(
+            payload.get("commands"),
+            local_artifacts,
+        )
+        payload["windowsProofOperatorChecklist"] = build_windows_operator_checklist_from_commands(
+            payload.get("commands"),
+        )
         if args.json:
             print(json.dumps(redact_json_value(payload), ensure_ascii=False, indent=2, sort_keys=True))
         else:
@@ -2416,6 +4559,28 @@ def command_automation(args: argparse.Namespace) -> int:
         run_interactive(command, cwd=ROOT)
         return 0
 
+    if action == "smoke":
+        host_system = platform.system()
+        if host_system == "Windows":
+            script = "ops/windows_host_bridge_probe.py"
+            output_path = args.output or DEFAULT_WINDOWS_SMOKE_PATH
+        elif host_system == "Darwin":
+            script = "ops/macos_host_bridge_probe.py"
+            output_path = args.output or DEFAULT_MACOS_SMOKE_PATH
+        else:
+            raise StepFailure(
+                "Browser/desktop automation smoke is supported only on native Windows or macOS hosts",
+                next_step="Run this command from Windows PowerShell or macOS Terminal on a signed-in desktop session.",
+            )
+        command = uv_python_command(script)
+        command.append("--full")
+        append_optional_flag(command, args.simulate, "--simulate")
+        append_optional_value(command, "--browser-url", args.browser_url)
+        append_optional_value(command, "--browser-profile", args.browser_profile)
+        append_optional_value(command, "--output", output_path)
+        run_interactive(command, cwd=ROOT)
+        return 0
+
     if action == "windows-probe":
         command = uv_python_command("ops/windows_host_bridge_probe.py")
         append_optional_flag(command, args.simulate, "--simulate")
@@ -2429,7 +4594,8 @@ def command_automation(args: argparse.Namespace) -> int:
         append_optional_value(command, "--expect-source-fingerprint", args.expect_source_fingerprint)
         append_optional_value(command, "--expect-source-manifest-sha256", args.expect_source_manifest_sha256)
         append_optional_value(command, "--expect-source-file-count", args.expect_source_file_count)
-        append_optional_value(command, "--output", args.output)
+        output_path = args.output or (DEFAULT_WINDOWS_PROBE_PATH if args.full else None)
+        append_optional_value(command, "--output", output_path)
         run_interactive(command, cwd=ROOT)
         return 0
 
@@ -2442,7 +4608,7 @@ def command_automation(args: argparse.Namespace) -> int:
                     "Run this command from a signed-in Windows PowerShell session:\n"
                     ".\\atrium.ps1 automation windows-live-proof --parity-run-id <run-id> "
                     "--source-fingerprint <fingerprint> --source-manifest-sha256 <manifest> "
-                    "--source-file-count <count>"
+                    "--source-file-count <count> --max-artifact-age-hours 24.0"
                 ),
             )
         script = ROOT / "ops" / "windows_host_bridge_live_proof.ps1"
@@ -2488,16 +4654,17 @@ def command_automation(args: argparse.Namespace) -> int:
             expect_source_file_count=source_file_count,
             max_artifact_age_hours=args.max_artifact_age_hours,
         )
+        output_path = Path(args.output).expanduser()
+        if not output_path.is_absolute():
+            output_path = ROOT / output_path
         payload = build_windows_handoff_payload(
             macos_artifact=args.macos,
             macos_summary=macos,
             source_summary=source,
             windows_output=args.windows_output,
             windows_local_copy=args.windows_local_copy,
+            handoff_output=str(output_path),
         )
-        output_path = Path(args.output).expanduser()
-        if not output_path.is_absolute():
-            output_path = ROOT / output_path
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         if args.json:
@@ -2540,10 +4707,9 @@ def command_automation(args: argparse.Namespace) -> int:
         return 0
 
     if action == "report":
-        output_path = Path(args.output).expanduser()
-        if not output_path.is_absolute():
-            output_path = ROOT / output_path
-        if args.skip_current_source_check and output_path.resolve() == HOST_BRIDGE_PARITY_REPORT.resolve():
+        output_path = resolve_repo_output_path(args.output)
+        backend_report_path = is_backend_parity_report_path(output_path)
+        if args.skip_current_source_check and backend_report_path:
             raise StepFailure(
                 "--skip-current-source-check is only allowed for offline historical audits written to a custom --output path",
                 next_step=(
@@ -2554,20 +4720,48 @@ def command_automation(args: argparse.Namespace) -> int:
         command = uv_python_command("ops/host_bridge_parity_report.py")
         append_optional_value(command, "--macos", args.macos)
         append_optional_value(command, "--windows", args.windows)
-        append_optional_value(command, "--output", args.output)
+        append_optional_value(command, "--output", str(output_path))
         append_optional_value(command, "--max-artifact-age-hours", args.max_artifact_age_hours)
         append_optional_value(command, "--windows-source-path", args.windows_source_path)
         append_optional_flag(command, args.skip_current_source_check, "--skip-current-source-check")
         run_interactive(command, cwd=ROOT)
-        destination = "backend default report path" if output_path == HOST_BRIDGE_PARITY_REPORT else "custom report path"
+        destination = "backend default report path" if backend_report_path else "custom report path"
         print_check(True, "HostBridge parity report", f"verified and wrote {destination}: {rel(output_path)}")
         return 0
+
+    if action == "accept-windows":
+        payload = accept_windows_artifact(
+            artifact=args.artifact,
+            handoff_path=args.handoff,
+            output=args.output,
+            max_artifact_age_hours=args.max_artifact_age_hours,
+            windows_source_path=args.windows_source_path,
+        )
+        redacted = redact_json_value(payload)
+        if args.json:
+            print(json.dumps(redacted, ensure_ascii=False, indent=2, sort_keys=True))
+        else:
+            print_header("Accept Windows Proof Artifact")
+            action_label = "copied" if payload.get("copied") is True else "already at local path"
+            print_check(True, "Windows artifact", f"{action_label}: {payload.get('windowsLocalCopy') or ''}")
+            print_info("parityRunId", str(payload.get("parityRunId") or ""))
+            print_info("sourceFingerprint", str(payload.get("sourceFingerprint") or ""))
+            print_info("windowsProofFacets", str(payload.get("windowsProofFacetCount") or "unknown"))
+            print_info("reportPath", str(payload.get("reportPath") or ""))
+            if payload.get("ok") is True:
+                print_check(True, "OpenClaw Windows audit", "cross_os_verified")
+            else:
+                print_check(False, "OpenClaw Windows audit", str(payload.get("status") or "not verified"))
+        return 0 if payload.get("ok") is True else 2
 
     raise StepFailure(f"Unknown automation action: {action}")
 
 
 def command_doctor(_args: argparse.Namespace) -> int:
     ensure_repo_root()
+    if getattr(_args, "json", False):
+        print(json.dumps(redact_json_value(collect_doctor_payload()), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
     print_header("Machine")
     print_info("repo", str(ROOT))
     print_info("OS", platform.platform())
@@ -2588,6 +4782,14 @@ def command_doctor(_args: argparse.Namespace) -> int:
     compose_cmd = docker_compose_cmd()
     print_check(bool(compose_cmd), "docker compose", " ".join(compose_cmd) if compose_cmd else "missing")
     print_check(browser_installed(), "Chromium browser", "Chrome/Edge/Brave/Chromium installed" if browser_installed() else "missing")
+
+    print_header("Windows Native Entrypoints")
+    for line in summarize_windows_entrypoints_payload(collect_windows_entrypoints_payload()):
+        print_info(line)
+
+    print_header("Native Parity Matrix")
+    for line in summarize_native_parity_matrix(native_parity_matrix_payload()):
+        print_info(line)
 
     print_header("Ports")
     for port, label in PORTS.items():
@@ -2610,6 +4812,7 @@ def command_doctor(_args: argparse.Namespace) -> int:
     for path in ("/health", "/api/runtime", "/api/provider-auth/status", "/api/permissions/mode"):
         ok, raw, payload = backend_json(path, timeout=15.0 if path == "/api/runtime" else 3.0)
         if path == "/api/runtime" and ok:
+            payload = normalize_runtime_payload_for_cli(payload)
             runtime_payload = payload
         if path == "/api/provider-auth/status" and ok:
             provider_auth_payload = payload
@@ -2630,7 +4833,18 @@ def command_doctor(_args: argparse.Namespace) -> int:
         print_info(line)
     for line in summarize_provider_auth_payload(provider_auth_payload):
         print_info(line)
-
+    ok, raw, provider_reference_payload = backend_json("/api/provider-auth/reference", timeout=10.0)
+    if ok:
+        for line in summarize_provider_reference_payload(provider_reference_payload):
+            print_info(line)
+    else:
+        print_check(False, "provider reference", redact_text(raw)[:240] or "unavailable")
+    ok, raw, provider_env_payload = backend_json("/api/provider-auth/env", timeout=10.0)
+    if ok:
+        for line in summarize_provider_env_payload(provider_env_payload):
+            print_info(line)
+    else:
+        print_check(False, "provider env", redact_text(raw)[:240] or "unavailable")
     print_header("Owner Permissions")
     for line in summarize_full_autonomy(permission_payload):
         print_info(line)
@@ -2646,7 +4860,26 @@ def command_doctor(_args: argparse.Namespace) -> int:
         for line in summarize_connectors_payload(connectors_payload):
             print_info(line)
 
-    ok, _raw, parity_payload = backend_json("/api/host-bridge/parity", timeout=8.0)
+    try:
+        tools_payload, _tool_ok, _tool_raw = collect_tools_status_payload()
+        print_header("MCP External Tools")
+        for line in summarize_mcp_gateway_setup_payload(
+            mcp_gateway_setup_payload(
+                tools_payload.get("runtime"),
+                tools_payload.get("connectors"),
+            )
+        ):
+            print_info(line)
+        ok, raw, mcp_probe_payload = backend_json("/api/tools/mcp-gateway?probe=true", timeout=15.0)
+        if ok:
+            for line in summarize_mcp_gateway_setup_payload(mcp_probe_payload):
+                print_info(line)
+        else:
+            print_check(False, "MCP probe", redact_text(raw)[:240] or "unavailable")
+    except Exception as exc:
+        print_check(False, "MCP external tools", str(exc)[:240])
+
+    ok, _raw, parity_payload = backend_json("/api/host-bridge/parity", timeout=HOST_BRIDGE_PARITY_TIMEOUT_SECONDS)
     if ok:
         parity_payload = normalize_parity_payload_for_cli(parity_payload)
         print_header("Automation Permission")
@@ -2657,6 +4890,97 @@ def command_doctor(_args: argparse.Namespace) -> int:
     for line in summarize_local_proof_artifacts(collect_local_proof_artifacts(current_source_summary())):
         print_info(line)
     return 0
+
+
+def collect_doctor_payload() -> dict[str, object]:
+    risky, path_detail = is_i_cloud_risky(ROOT)
+    remote_ready, remote_detail = remote_ok()
+    tools = {tool: report_command_path(tool) for tool in doctor_tool_names()}
+    docker_payload = collect_docker_payload()
+    runtime_http: dict[str, object] = {}
+    runtime_payload: object | None = None
+    provider_auth_payload: object | None = None
+    permission_payload: object | None = None
+    for path in ("/health", "/api/runtime", "/api/provider-auth/status", "/api/permissions/mode"):
+        ok, raw, payload = backend_json(path, timeout=15.0 if path == "/api/runtime" else 3.0)
+        if path == "/api/runtime" and ok:
+            payload = normalize_runtime_payload_for_cli(payload)
+            runtime_payload = payload
+        if path == "/api/provider-auth/status" and ok:
+            provider_auth_payload = payload
+        if path == "/api/permissions/mode" and ok:
+            permission_payload = payload
+        runtime_http[path] = {
+            "ok": ok,
+            "summary": summarize_runtime_payload(payload) if ok and path == "/api/runtime" else raw[:180],
+            "payload": payload if ok else None,
+        }
+    ok_connectors, raw_connectors, connectors_payload = backend_json("/api/connectors", timeout=8.0)
+    ok_catalog, raw_catalog, catalog_payload = backend_json("/api/tools/catalog", timeout=8.0)
+    ok_parity, raw_parity, parity_payload = backend_json("/api/host-bridge/parity", timeout=HOST_BRIDGE_PARITY_TIMEOUT_SECONDS)
+    ok_provider_reference, raw_provider_reference, provider_reference_payload = backend_json("/api/provider-auth/reference", timeout=10.0)
+    ok_provider_env, raw_provider_env, provider_env_payload = backend_json("/api/provider-auth/env", timeout=10.0)
+    try:
+        tools_status_payload, _tool_ok, _tool_raw = collect_tools_status_payload()
+        mcp_gateway_payload: object = mcp_gateway_setup_payload(
+            tools_status_payload.get("runtime"),
+            tools_status_payload.get("connectors"),
+        )
+    except Exception as exc:
+        tools_status_payload = {"ok": False, "error": str(exc)[:400]}
+        mcp_gateway_payload = {"ok": False, "error": str(exc)[:400]}
+    ok_mcp_probe, raw_mcp_probe, mcp_probe_payload = backend_json("/api/tools/mcp-gateway?probe=true", timeout=15.0)
+    source = current_source_summary()
+    parity_payload = normalize_parity_payload_for_cli(parity_payload, current_source=source) if ok_parity else {"ok": False, "error": raw_parity[:400]}
+    if isinstance(parity_payload, dict):
+        parity_payload = dict(parity_payload)
+        parity_payload["localArtifacts"] = collect_local_proof_artifacts(source)
+    return {
+        "repo": str(ROOT),
+        "platform": platform.platform(),
+        "machine": platform.machine() or "unknown",
+        "ram": memory_gb(),
+        "launcherMode": launcher_mode(),
+        "git": {
+            "remoteOk": remote_ready,
+            "remote": remote_detail,
+            "status": git_status_summary(),
+        },
+        "installPath": {
+            "ok": not risky,
+            "detail": path_detail,
+        },
+        "tools": tools,
+        "docker": {**docker_payload, "browserInstalled": browser_installed()},
+        "ports": {
+            label: {
+                "port": port,
+                "open": port_open(port),
+                "owner": port_owner(port) if port_open(port) else "free",
+            }
+            for port, label in PORTS.items()
+        },
+        "env": {
+            "system": {"path": str(SYSTEM_ENV), "exists": SYSTEM_ENV.exists(), "summary": render_env_status(SYSTEM_ENV, FULL_STACK_DEFAULTS.keys())},
+            "ui": {"path": str(UI_ENV), "exists": UI_ENV.exists(), "summary": render_env_status(UI_ENV, UI_DEFAULTS.keys())},
+        },
+        "runtimeHttp": runtime_http,
+        "runtime": runtime_payload,
+        "providerAuth": provider_auth_payload,
+        "providerReference": provider_reference_payload if ok_provider_reference else {"ok": False, "error": raw_provider_reference[:400]},
+        "providerEnv": provider_env_payload if ok_provider_env else {"ok": False, "error": raw_provider_env[:400]},
+        "permissionMode": permission_payload,
+        "connectors": connectors_payload if ok_connectors else {"ok": False, "error": raw_connectors[:400]},
+        "toolCatalog": catalog_payload if ok_catalog else {"ok": False, "error": raw_catalog[:400]},
+        "toolsStatus": tools_status_payload,
+        "mcpGateway": mcp_gateway_payload,
+        "mcpProbe": mcp_probe_payload if ok_mcp_probe and isinstance(mcp_probe_payload, dict) else {"ok": False, "error": raw_mcp_probe[:400]},
+        "automationPermission": parity_payload,
+        "nativeNextChecks": native_next_checks_payload(),
+        "nativeParityMatrix": native_parity_matrix_payload(),
+        "windowsRuntime": collect_windows_runtime_payload(),
+        "windowsEntryPoints": collect_windows_entrypoints_payload(),
+    }
 
 
 def command_bootstrap(args: argparse.Namespace) -> int:
@@ -2788,8 +5112,13 @@ def command_setup(args: argparse.Namespace) -> int:
     if args.dry_run:
         print_info("mode", "dry-run; no files, services, or installs will be changed")
     elif not args.yes:
+        setup_scope = (
+            "This setup can install winget packages, Docker Desktop, Python/Node dependencies, Claude Code, browser support, and start native Windows services."
+            if windows_native()
+            else "This setup can install Homebrew packages, Docker Desktop, Python/Node dependencies, and start local services."
+        )
         prompt_enter(
-            "This setup can install Homebrew packages, Docker Desktop, Python/Node dependencies, and start local services.",
+            setup_scope,
             assume_yes=args.yes,
         )
 
@@ -2808,10 +5137,12 @@ def command_setup(args: argparse.Namespace) -> int:
 
     if args.no_start:
         print("\nSetup prepared ATRIUM without starting services.")
+        print_native_next_checks()
         return 0
     if args.dry_run:
         print(f"\n[DRY-RUN] {local_cli_command('start')}")
         print(f"[DRY-RUN] {local_cli_command('status')}")
+        print_native_next_checks()
         return 0
 
     print_header("Start")
@@ -2825,7 +5156,34 @@ def command_setup(args: argparse.Namespace) -> int:
         print_header("Open")
         open_frontend_url()
         print_info("frontend", FRONTEND_URL)
+    print_native_next_checks()
     return 0
+
+
+def print_native_next_checks() -> None:
+    print_header("Next Native Checks")
+    payload = native_next_checks_payload()
+    checklist = payload.get("operatorChecklist") if isinstance(payload.get("operatorChecklist"), list) else []
+    for item in checklist:
+        if not isinstance(item, dict):
+            continue
+        item_id = str(item.get("id") or "check")
+        command = item.get("command")
+        if isinstance(command, str) and command.strip():
+            print_info(item_id, command)
+        login_commands = item.get("loginCommands")
+        if isinstance(login_commands, list):
+            for login in login_commands:
+                if isinstance(login, str) and login.strip():
+                    print_info(f"{item_id}.login", login)
+        account_switch_commands = item.get("accountSwitchCommands")
+        if isinstance(account_switch_commands, list):
+            for command_text in account_switch_commands:
+                if isinstance(command_text, str) and command_text.strip():
+                    print_info(f"{item_id}.accountSwitch", command_text)
+    required_gate = payload.get("requiredGate")
+    if isinstance(required_gate, str) and required_gate.strip():
+        print_info("requiredGate", required_gate)
 
 
 def command_start(args: argparse.Namespace) -> int:
@@ -2872,6 +5230,7 @@ def command_start(args: argparse.Namespace) -> int:
         print_info("frontend", f"started in screen {UI_SCREEN}; log {rel(ui_log)}")
 
     wait_for_urls(args.wait_seconds)
+    print_post_start_readiness()
     print(f"\nFrontend: {FRONTEND_URL}")
     print(f"Backend:  {BACKEND_URL}")
     print(f"Run {local_cli_command('status')} for readiness details.")
@@ -2904,6 +5263,7 @@ def command_start_windows(args: argparse.Namespace) -> int:
     windows_start_process("frontend", native_ui_command(), UI_DIR, LOG_DIR / "ui.log", UI_PID)
 
     wait_for_urls(args.wait_seconds)
+    print_post_start_readiness()
     print(f"\nFrontend: {FRONTEND_URL}")
     print(f"Backend:  {BACKEND_URL}")
     print("Run .\\atrium.ps1 status for readiness details.")
@@ -2918,12 +5278,58 @@ def wait_for_urls(seconds: int) -> None:
     if seconds <= 0:
         return
     deadline = time.time() + seconds
+    last_health = "not checked"
+    last_frontend = False
     while time.time() < deadline:
-        health, _, _ = http_get_json(f"{BACKEND_URL}/health", timeout=1.5)
+        health, raw_health, _ = http_get_json(f"{BACKEND_URL}/health", timeout=1.5)
+        last_health = raw_health[:180]
         frontend = port_open(5173)
+        last_frontend = frontend
         if health and frontend:
             return
         time.sleep(1)
+    backend_owner = port_owner(8787) if port_open(8787) else "free"
+    frontend_owner = port_owner(5173) if last_frontend or port_open(5173) else "free"
+    raise StepFailure(
+        f"ATRIUM did not become ready within {seconds}s",
+        next_step=(
+            f"Backend /health: {redact_text(last_health) or 'not reachable'}\n"
+            f"Backend :8787 listener: {backend_owner}\n"
+            f"Frontend :5173 listener: {frontend_owner}\n"
+            f"Logs: {rel(LOG_DIR / 'backend.log')} and {rel(LOG_DIR / 'ui.log')}\n"
+            f"Run {local_cli_command('status --json')} and {local_cli_command('logs --json')} for redacted diagnostics."
+        ),
+    )
+
+
+def print_post_start_readiness() -> None:
+    print_header("Post-start Readiness")
+    probes: tuple[tuple[str, str, float], ...] = (
+        ("/api/runtime", "runtime", 15.0),
+        ("/api/provider-auth/status", "provider auth", 5.0),
+        ("/api/permissions/mode", "owner permissions", 5.0),
+        ("/api/tools/catalog", "AI tool catalog", 8.0),
+        ("/api/connectors", "connectors", 8.0),
+        ("/api/host-bridge/parity", "automation permission", HOST_BRIDGE_PARITY_TIMEOUT_SECONDS),
+    )
+    for path, label, timeout in probes:
+        ok, raw, payload = backend_json(path, timeout=timeout)
+        if path == "/api/runtime" and ok:
+            payload = normalize_runtime_payload_for_cli(payload)
+            print_check(True, label, summarize_runtime_payload(payload))
+        elif path == "/api/provider-auth/status" and ok:
+            print_check(True, label, "; ".join(summarize_provider_auth_payload(payload)[:2]))
+        elif path == "/api/permissions/mode" and ok:
+            print_check(True, label, "; ".join(summarize_full_autonomy(payload)[:2]))
+        elif path == "/api/tools/catalog" and ok:
+            print_check(True, label, "; ".join(summarize_tool_catalog_payload(payload, limit=2)[:2]))
+        elif path == "/api/connectors" and ok:
+            print_check(True, label, "; ".join(summarize_connectors_payload(payload)[:3]))
+        elif path == "/api/host-bridge/parity" and ok:
+            normalized = normalize_parity_payload_for_cli(payload, current_source=current_source_summary())
+            print_check(True, label, "; ".join(summarize_parity_payload(normalized)[:2]))
+        else:
+            print_check(False, label, redact_text(raw)[:240] or f"{path} unavailable")
 
 
 def summarize_runtime_payload(payload: object) -> str:
@@ -2932,11 +5338,20 @@ def summarize_runtime_payload(payload: object) -> str:
     parts = [f"ok={payload.get('ok', 'unknown')}"]
     if "running" in payload:
         parts.append(f"running={payload.get('running')}")
-    agent = payload.get("agentRuntime")
+    v2 = payload.get("v2") if isinstance(payload.get("v2"), dict) else {}
+    agent = v2.get("agentRuntime") if isinstance(v2.get("agentRuntime"), dict) else payload.get("agentRuntime")
     if isinstance(agent, dict):
         parts.append(f"agentRuntime.ok={agent.get('ok', 'unknown')}")
         parts.append(f"backend={agent.get('configuredBackend', agent.get('backend', 'unknown'))}")
-    memory = payload.get("memory")
+    native_runtime = v2.get("nativeRuntime") if isinstance(v2.get("nativeRuntime"), dict) else {}
+    if native_runtime:
+        parts.append(f"native.launcher={native_runtime.get('launcher', 'unknown')}")
+        parts.append(f"nativeOnly={bool_text(native_runtime.get('nativeOnly'))}")
+        parts.append(f"browserTools={bool_text(native_runtime.get('browserAutomationReady'))}")
+        parts.append(f"desktopTools={bool_text(native_runtime.get('desktopAutomationReady'))}")
+    if "toolRegistryCount" in v2:
+        parts.append(f"tools={v2.get('toolRegistryCount')}")
+    memory = v2.get("memory") if isinstance(v2.get("memory"), dict) else payload.get("memory")
     if isinstance(memory, dict):
         parts.append(f"memory.ok={memory.get('ok', 'unknown')}")
     graph = payload.get("graph")
@@ -2955,13 +5370,7 @@ def collect_status_payload() -> dict[str, object]:
         }
         for port, label in PORTS.items()
     }
-    docker = command_path("docker")
-    compose_cmd = docker_compose_cmd() if docker else None
-    docker_payload: dict[str, object] = {
-        "cli": docker or None,
-        "compose": compose_cmd,
-        "running": bool(docker and run([docker, "info"], timeout=10).returncode == 0),
-    }
+    docker_payload = collect_docker_payload()
     http_payload: dict[str, object] = {}
     runtime_payload: object | None = None
     provider_auth_payload: object | None = None
@@ -2969,6 +5378,7 @@ def collect_status_payload() -> dict[str, object]:
     for path in ("/health", "/api/runtime", "/api/provider-auth/status", "/api/permissions/mode"):
         ok, raw, payload = backend_json(path, timeout=15.0 if path == "/api/runtime" else 3.0)
         if path == "/api/runtime" and ok:
+            payload = normalize_runtime_payload_for_cli(payload)
             runtime_payload = payload
         if path == "/api/provider-auth/status" and ok:
             provider_auth_payload = payload
@@ -2980,9 +5390,23 @@ def collect_status_payload() -> dict[str, object]:
             "payload": payload if ok else None,
         }
     ok_connectors, raw_connectors, connectors_payload = backend_json("/api/connectors", timeout=8.0)
-    ok_parity, raw_parity, parity_payload = backend_json("/api/host-bridge/parity", timeout=8.0)
-    parity_payload = normalize_parity_payload_for_cli(parity_payload) if ok_parity else None
-    local_artifacts = collect_local_proof_artifacts(current_source_summary())
+    ok_catalog, raw_catalog, catalog_payload = backend_json("/api/tools/catalog", timeout=8.0)
+    ok_parity, raw_parity, parity_payload = backend_json("/api/host-bridge/parity", timeout=HOST_BRIDGE_PARITY_TIMEOUT_SECONDS)
+    ok_provider_reference, raw_provider_reference, provider_reference_payload = backend_json("/api/provider-auth/reference", timeout=10.0)
+    ok_provider_env, raw_provider_env, provider_env_payload = backend_json("/api/provider-auth/env", timeout=10.0)
+    try:
+        tools_status_payload, _tool_ok, _tool_raw = collect_tools_status_payload()
+        mcp_gateway_payload: object = mcp_gateway_setup_payload(
+            tools_status_payload.get("runtime"),
+            tools_status_payload.get("connectors"),
+        )
+    except Exception as exc:
+        tools_status_payload = {"ok": False, "error": str(exc)[:400]}
+        mcp_gateway_payload = {"ok": False, "error": str(exc)[:400]}
+    ok_mcp_probe, raw_mcp_probe, mcp_probe_payload = backend_json("/api/tools/mcp-gateway?probe=true", timeout=15.0)
+    source_summary = current_source_summary()
+    parity_payload = normalize_parity_payload_for_cli(parity_payload, current_source=source_summary) if ok_parity else None
+    local_artifacts = collect_local_proof_artifacts(source_summary)
     automation_permission_payload: dict[str, object]
     if isinstance(parity_payload, dict):
         automation_permission_payload = dict(parity_payload)
@@ -2992,16 +5416,28 @@ def collect_status_payload() -> dict[str, object]:
     return {
         "repo": str(ROOT),
         "platform": platform.platform(),
-        "launcherMode": "windows-native" if windows_native() else "screen-or-macos",
+        "launcherMode": launcher_mode(),
         "process": process_payload,
+        "windowsRuntime": collect_windows_runtime_payload(),
+        "windowsEntryPoints": collect_windows_entrypoints_payload(),
         "ports": ports_payload,
         "docker": docker_payload,
         "http": http_payload,
         "providerAuth": provider_auth_payload,
+        "providerReference": provider_reference_payload if ok_provider_reference else {"ok": False, "error": raw_provider_reference[:400]},
+        "providerEnv": provider_env_payload if ok_provider_env else {"ok": False, "error": raw_provider_env[:400]},
         "permissionMode": permission_payload,
         "runtime": runtime_payload,
+        "toolCatalog": catalog_payload if ok_catalog else {"ok": False, "error": raw_catalog[:400]},
+        "toolsStatus": tools_status_payload,
+        "mcpGateway": mcp_gateway_payload,
+        "mcpProbe": mcp_probe_payload if ok_mcp_probe and isinstance(mcp_probe_payload, dict) else {"ok": False, "error": raw_mcp_probe[:400]},
         "connectors": connectors_payload if ok_connectors else {"ok": False, "error": raw_connectors[:400]},
+        "hostBridgeSource": source_summary if isinstance(source_summary, dict) else {"ok": False, "error": "source summary unavailable"},
+        "localProofArtifacts": local_artifacts,
         "automationPermission": automation_permission_payload,
+        "nativeNextChecks": native_next_checks_payload(),
+        "nativeParityMatrix": native_parity_matrix_payload(),
         "urls": {"frontend": FRONTEND_URL, "backend": BACKEND_URL},
     }
 
@@ -3018,6 +5454,14 @@ def command_status(args: argparse.Namespace) -> int:
         print_info("screen", screen_sessions().replace("\n", " | "))
     for port, label in PORTS.items():
         print_info(f"{label} :{port}", port_owner(port) if port_open(port) else "free")
+
+    print_header("Windows Native Entrypoints")
+    for line in summarize_windows_entrypoints_payload(collect_windows_entrypoints_payload()):
+        print_info(line)
+
+    print_header("Native Parity Matrix")
+    for line in summarize_native_parity_matrix(native_parity_matrix_payload()):
+        print_info(line)
 
     print_header("Docker")
     docker = command_path("docker")
@@ -3040,6 +5484,7 @@ def command_status(args: argparse.Namespace) -> int:
     for path in ("/health", "/api/runtime", "/api/provider-auth/status", "/api/permissions/mode"):
         ok, raw, payload = backend_json(path, timeout=15.0 if path == "/api/runtime" else 3.0)
         if path == "/api/runtime" and ok:
+            payload = normalize_runtime_payload_for_cli(payload)
             runtime_payload = payload
         if path == "/api/provider-auth/status" and ok:
             provider_auth_payload = payload
@@ -3059,6 +5504,18 @@ def command_status(args: argparse.Namespace) -> int:
         print_info(line)
     for line in summarize_provider_auth_payload(provider_auth_payload):
         print_info(line)
+    ok, raw, provider_reference_payload = backend_json("/api/provider-auth/reference", timeout=10.0)
+    if ok:
+        for line in summarize_provider_reference_payload(provider_reference_payload):
+            print_info(line)
+    else:
+        print_check(False, "provider reference", redact_text(raw)[:240] or "unavailable")
+    ok, raw, provider_env_payload = backend_json("/api/provider-auth/env", timeout=10.0)
+    if ok:
+        for line in summarize_provider_env_payload(provider_env_payload):
+            print_info(line)
+    else:
+        print_check(False, "provider env", redact_text(raw)[:240] or "unavailable")
 
     print_header("Owner Permissions")
     for line in summarize_full_autonomy(permission_payload):
@@ -3069,13 +5526,38 @@ def command_status(args: argparse.Namespace) -> int:
         for line in summarize_runtime_ai_tools(runtime_payload):
             print_info(line)
 
+    ok, _raw, tool_catalog_payload = backend_json("/api/tools/catalog", timeout=8.0)
+    if ok:
+        print_header("AI Tool Catalog")
+        for line in summarize_tool_catalog_payload(tool_catalog_payload):
+            print_info(line)
+
     ok, _raw, connectors_payload = backend_json("/api/connectors", timeout=8.0)
     if ok:
         print_header("Connectors")
         for line in summarize_connectors_payload(connectors_payload):
             print_info(line)
 
-    ok, _raw, parity_payload = backend_json("/api/host-bridge/parity", timeout=8.0)
+    try:
+        tools_payload, _tool_ok, _tool_raw = collect_tools_status_payload()
+        print_header("MCP External Tools")
+        for line in summarize_mcp_gateway_setup_payload(
+            mcp_gateway_setup_payload(
+                tools_payload.get("runtime"),
+                tools_payload.get("connectors"),
+            )
+        ):
+            print_info(line)
+        ok, raw, mcp_probe_payload = backend_json("/api/tools/mcp-gateway?probe=true", timeout=15.0)
+        if ok:
+            for line in summarize_mcp_gateway_setup_payload(mcp_probe_payload):
+                print_info(line)
+        else:
+            print_check(False, "MCP probe", redact_text(raw)[:240] or "unavailable")
+    except Exception as exc:
+        print_check(False, "MCP external tools", str(exc)[:240])
+
+    ok, _raw, parity_payload = backend_json("/api/host-bridge/parity", timeout=HOST_BRIDGE_PARITY_TIMEOUT_SECONDS)
     if ok:
         parity_payload = normalize_parity_payload_for_cli(parity_payload)
         print_header("Automation Permission")
@@ -3177,6 +5659,10 @@ def command_logs(args: argparse.Namespace) -> int:
 def support_bundle_json_payloads() -> dict[str, object]:
     payloads: dict[str, object] = {}
     try:
+        payloads["diagnostics/doctor.json"] = collect_doctor_payload()
+    except Exception as exc:
+        payloads["diagnostics/doctor.json"] = {"ok": False, "error": str(exc)[:400]}
+    try:
         payloads["diagnostics/status.json"] = collect_status_payload()
     except Exception as exc:
         payloads["diagnostics/status.json"] = {"ok": False, "error": str(exc)[:400]}
@@ -3185,18 +5671,87 @@ def support_bundle_json_payloads() -> dict[str, object]:
     except Exception as exc:
         payloads["diagnostics/process.json"] = {"ok": False, "error": str(exc)[:400]}
     try:
+        payloads["diagnostics/windows-runtime.json"] = collect_windows_runtime_payload()
+    except Exception as exc:
+        payloads["diagnostics/windows-runtime.json"] = {"ok": False, "error": str(exc)[:400]}
+    try:
+        payloads["diagnostics/windows-entrypoints.json"] = collect_windows_entrypoints_payload()
+    except Exception as exc:
+        payloads["diagnostics/windows-entrypoints.json"] = {"ok": False, "error": str(exc)[:400]}
+    try:
+        payloads["diagnostics/native-next-checks.json"] = native_next_checks_payload()
+    except Exception as exc:
+        payloads["diagnostics/native-next-checks.json"] = {"ok": False, "error": str(exc)[:400]}
+    try:
+        payloads["diagnostics/native-parity-matrix.json"] = native_parity_matrix_payload()
+    except Exception as exc:
+        payloads["diagnostics/native-parity-matrix.json"] = {"ok": False, "error": str(exc)[:400]}
+    try:
+        payloads["diagnostics/docker.json"] = collect_docker_payload()
+    except Exception as exc:
+        payloads["diagnostics/docker.json"] = {"ok": False, "error": str(exc)[:400]}
+    try:
+        source_summary = current_source_summary()
+        payloads["diagnostics/host-bridge-source.json"] = source_summary if isinstance(source_summary, dict) else {"ok": False, "error": "source summary unavailable"}
+    except Exception as exc:
+        payloads["diagnostics/host-bridge-source.json"] = {"ok": False, "error": str(exc)[:400]}
+    try:
+        source_for_artifacts = payloads.get("diagnostics/host-bridge-source.json")
+        payloads["diagnostics/local-proof-artifacts.json"] = collect_local_proof_artifacts(
+            source_for_artifacts if isinstance(source_for_artifacts, dict) else None
+        )
+    except Exception as exc:
+        payloads["diagnostics/local-proof-artifacts.json"] = {"ok": False, "error": str(exc)[:400]}
+    try:
+        handoff_payload, handoff_error = _load_json_file(Path(DEFAULT_WINDOWS_HANDOFF_PATH))
+        payloads["diagnostics/windows-proof-handoff.json"] = (
+            handoff_payload
+            if isinstance(handoff_payload, dict)
+            else {"ok": False, "path": DEFAULT_WINDOWS_HANDOFF_PATH, "error": handoff_error or "handoff packet is missing"}
+        )
+    except Exception as exc:
+        payloads["diagnostics/windows-proof-handoff.json"] = {"ok": False, "path": DEFAULT_WINDOWS_HANDOFF_PATH, "error": str(exc)[:400]}
+    try:
         payloads["diagnostics/logs.json"] = collect_logs_payload("all", 200)
     except Exception as exc:
         payloads["diagnostics/logs.json"] = {"ok": False, "error": str(exc)[:400]}
+    ok_runtime, raw_runtime, runtime_payload = backend_json("/api/runtime", timeout=15.0)
+    runtime_payload = normalize_runtime_payload_for_cli(runtime_payload) if ok_runtime else runtime_payload
+    payloads["diagnostics/runtime.json"] = runtime_payload if ok_runtime else {"ok": False, "error": raw_runtime[:400]}
+    ok_connectors, raw_connectors, connectors_payload = backend_json("/api/connectors", timeout=8.0)
+    payloads["diagnostics/connectors.json"] = connectors_payload if ok_connectors else {"ok": False, "error": raw_connectors[:400]}
+    ok_catalog, raw_catalog, catalog_payload = backend_json("/api/tools/catalog", timeout=8.0)
+    payloads["diagnostics/tools-catalog.json"] = catalog_payload if ok_catalog else {"ok": False, "error": raw_catalog[:400]}
+    ok_parity, raw_parity, parity_payload = backend_json("/api/host-bridge/parity", timeout=HOST_BRIDGE_PARITY_TIMEOUT_SECONDS)
+    payloads["diagnostics/host-bridge-parity.json"] = (
+        normalize_parity_payload_for_cli(parity_payload) if ok_parity else {"ok": False, "error": raw_parity[:400]}
+    )
     ok_permission, raw_permission, permission_payload = backend_json("/api/permissions/mode", timeout=5.0)
     payloads["diagnostics/permission-mode.json"] = permission_payload if ok_permission else {"ok": False, "error": raw_permission[:400]}
     ok_provider, raw_provider, provider_payload = backend_json("/api/provider-auth/status?probe=true", timeout=15.0)
     payloads["diagnostics/provider-status.json"] = provider_payload if ok_provider else {"ok": False, "error": raw_provider[:400]}
+    ok_provider_reference, raw_provider_reference, provider_reference_payload = backend_json("/api/provider-auth/reference", timeout=10.0)
+    payloads["diagnostics/provider-reference.json"] = (
+        provider_reference_payload if ok_provider_reference else {"ok": False, "error": raw_provider_reference[:400]}
+    )
+    ok_provider_env, raw_provider_env, provider_env_payload = backend_json("/api/provider-auth/env", timeout=10.0)
+    payloads["diagnostics/provider-env.json"] = (
+        provider_env_payload if ok_provider_env else {"ok": False, "error": raw_provider_env[:400]}
+    )
     try:
         tools_payload, _tool_ok, _tool_raw = collect_tools_status_payload()
         payloads["diagnostics/tools-status.json"] = tools_payload
+        payloads["diagnostics/tools-mcp-gateway.json"] = mcp_gateway_setup_payload(
+            tools_payload.get("runtime"),
+            tools_payload.get("connectors"),
+        )
     except Exception as exc:
         payloads["diagnostics/tools-status.json"] = {"ok": False, "error": str(exc)[:400]}
+        payloads["diagnostics/tools-mcp-gateway.json"] = {"ok": False, "error": str(exc)[:400]}
+    ok_mcp_probe, raw_mcp_probe, mcp_probe_payload = backend_json("/api/tools/mcp-gateway?probe=true", timeout=15.0)
+    payloads["diagnostics/tools-mcp-probe.json"] = (
+        mcp_probe_payload if ok_mcp_probe and isinstance(mcp_probe_payload, dict) else {"ok": False, "error": raw_mcp_probe[:400]}
+    )
     try:
         _automation_ok, automation_payload = collect_automation_status_payload()
         payloads["diagnostics/automation-status.json"] = automation_payload
@@ -3212,7 +5767,7 @@ def report_lines() -> list[str]:
         f"platform={platform.platform()}",
         f"machine={platform.machine()}",
         f"ram={memory_gb()}",
-        f"launcher_mode={'windows-native' if windows_native() else 'screen-or-macos'}",
+        f"launcher_mode={launcher_mode()}",
         f"git_status={git_status_summary().replace(chr(10), ' | ')}",
     ]
     ok, remote = remote_ok()
@@ -3223,8 +5778,76 @@ def report_lines() -> list[str]:
     lines.append(f"path_detail={detail}")
     if windows_native():
         lines.append(f"process.windows={windows_process_status()}")
+        windows_runtime = collect_windows_runtime_payload()
+        powershell_payload = windows_runtime.get("powershell") if isinstance(windows_runtime.get("powershell"), dict) else {}
+        lines.append(f"windows.session={windows_runtime.get('sessionName') or 'unknown'}")
+        lines.append(f"windows.powershell={powershell_payload.get('command') or 'missing'}")
+        lines.append(f"windows.powershell.version={powershell_payload.get('version') or 'unknown'}")
     else:
         lines.append(f"process.screen={screen_sessions().replace(chr(10), ' | ')}")
+    entrypoints = collect_windows_entrypoints_payload()
+    checks = entrypoints.get("checks") if isinstance(entrypoints.get("checks"), dict) else {}
+    lines.append(f"windows.entrypoints.ok={bool_text(entrypoints.get('ok'))}")
+    for name, value in checks.items():
+        lines.append(f"windows.entrypoint.{name}={bool_text(value)}")
+    proof = entrypoints.get("openclawLifecycleProof")
+    if isinstance(proof, dict):
+        lines.append(f"windows.entrypoints.openclawLifecycleProof.ok={bool_text(proof.get('ok'))}")
+        commands = proof.get("commands")
+        if isinstance(commands, dict):
+            for name in (
+                "nativeSetup",
+                "nativeStart",
+                "nativeStatusJson",
+                "nativeLogsJson",
+                "nativeReportBundle",
+                "nativeStop",
+                "nativeRestart",
+                "nativePermissionsStatusJson",
+                "nativePermissionsSetFullAuto",
+                "nativeProviderStatusProbeJson",
+                "nativeProviderReferenceJson",
+                "nativeProviderEnvJson",
+                "nativeProviderLoginChatGPT",
+                "nativeProviderLoginClaudeCode",
+                "nativeProviderDisconnectChatGPT",
+                "nativeProviderDisconnectClaudeCode",
+                "nativeToolsStatusJson",
+                "nativeToolsCatalogJson",
+                "mcpGatewaySetupJson",
+                "mcpGatewayProbeJson",
+                "mcpGatewayStatusJson",
+                "nativeBrowserDesktopSmoke",
+                "windowsProbe",
+                "sourceValidate",
+                "windowsLiveProof",
+                "windowsArtifactValidate",
+                "windowsArtifactValidateOnWindows",
+                "acceptWindowsArtifact",
+                "report",
+                "audit",
+            ):
+                command = commands.get(name)
+                if isinstance(command, str) and command.strip():
+                    lines.append(f"windows.entrypoints.openclawLifecycleProof.{name}={command}")
+        checklist = proof.get("operatorChecklist")
+        if isinstance(checklist, list):
+            ids = [str(item.get("id")) for item in checklist if isinstance(item, dict) and item.get("id")]
+            if ids:
+                lines.append("windows.entrypoints.openclawLifecycleProof.checklist=" + ", ".join(ids))
+    lines.extend(summarize_native_parity_matrix(native_parity_matrix_payload()))
+    files = entrypoints.get("files") if isinstance(entrypoints.get("files"), dict) else {}
+    for name, meta in files.items():
+        if not isinstance(meta, dict):
+            continue
+        digest = str(meta.get("sha256") or "")
+        lines.append(
+            "windows.entrypoint.file."
+            f"{name}=exists={bool_text(meta.get('exists'))};"
+            f"path={meta.get('relativePath') or meta.get('path') or 'unknown'};"
+            f"bytes={meta.get('bytes') if meta.get('bytes') is not None else 'unknown'};"
+            f"sha256={digest[:12] if digest else 'missing'}"
+        )
     for tool in report_tool_names():
         lines.append(f"tool.{tool}={'present' if report_command_path(tool) else 'missing'}")
     lines.extend(docker_report_lines())
@@ -3236,6 +5859,7 @@ def report_lines() -> list[str]:
     for path in ("/health", "/api/runtime", "/api/provider-auth/status", "/api/permissions/mode"):
         ok, raw, payload = backend_json(path, timeout=15.0 if path == "/api/runtime" else 3.0)
         if path == "/api/runtime" and ok:
+            payload = normalize_runtime_payload_for_cli(payload)
             runtime_payload = payload
         if path == "/api/provider-auth/status" and ok:
             provider_auth_payload = payload
@@ -3254,6 +5878,12 @@ def report_lines() -> list[str]:
     lines.append("providers:")
     lines.extend(provider_status_from_env())
     lines.extend(summarize_provider_auth_payload(provider_auth_payload))
+    ok, _raw, provider_reference_payload = backend_json("/api/provider-auth/reference", timeout=10.0)
+    lines.append("provider_reference:")
+    lines.extend(summarize_provider_reference_payload(provider_reference_payload if ok else None))
+    ok, _raw, provider_env_payload = backend_json("/api/provider-auth/env", timeout=10.0)
+    lines.append("provider_env:")
+    lines.extend(summarize_provider_env_payload(provider_env_payload if ok else None))
     lines.append("owner_permissions:")
     lines.extend(summarize_full_autonomy(permission_payload))
     lines.append("ai_tools:")
@@ -3264,7 +5894,24 @@ def report_lines() -> list[str]:
     ok, _raw, connectors_payload = backend_json("/api/connectors", timeout=8.0)
     lines.append("connectors:")
     lines.extend(summarize_connectors_payload(connectors_payload if ok else None))
-    ok, _raw, parity_payload = backend_json("/api/host-bridge/parity", timeout=8.0)
+    try:
+        tools_payload, _tool_ok, _tool_raw = collect_tools_status_payload()
+        lines.append("mcp_external_tools:")
+        lines.extend(
+            summarize_mcp_gateway_setup_payload(
+                mcp_gateway_setup_payload(
+                    tools_payload.get("runtime"),
+                    tools_payload.get("connectors"),
+                )
+            )
+        )
+    except Exception as exc:
+        lines.append("mcp_external_tools:")
+        lines.append(f"MCP gateway setup=unavailable: {str(exc)[:240]}")
+    ok, _raw, mcp_probe_payload = backend_json("/api/tools/mcp-gateway?probe=true", timeout=15.0)
+    lines.append("mcp_external_probe:")
+    lines.extend(summarize_mcp_gateway_setup_payload(mcp_probe_payload if ok else None))
+    ok, _raw, parity_payload = backend_json("/api/host-bridge/parity", timeout=HOST_BRIDGE_PARITY_TIMEOUT_SECONDS)
     parity_payload = normalize_parity_payload_for_cli(parity_payload) if ok else None
     local_artifacts = collect_local_proof_artifacts(current_source_summary())
     if isinstance(parity_payload, dict):
@@ -3297,7 +5944,7 @@ def command_report(args: argparse.Namespace) -> int:
             manifest = {
                 "createdAt": int(time.time()),
                 "platform": platform.platform(),
-                "launcherMode": "windows-native" if windows_native() else "screen-or-macos",
+                "launcherMode": launcher_mode(),
                 "redacted": True,
                 "included": ["support-report.txt"],
             }
@@ -3311,6 +5958,7 @@ def command_report(args: argparse.Namespace) -> int:
             for name, payload in support_bundle_json_payloads().items():
                 archive.writestr(name, json.dumps(redact_json_value(payload), ensure_ascii=False, indent=2, sort_keys=True) + "\n")
                 manifest["included"].append(name)
+            manifest["included"].append("manifest.json")
             archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
         print(f"wrote bundle {bundle}")
     return 0
@@ -3320,7 +5968,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="ATRIUM local full-stack setup shortcut")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("doctor", help="check local setup without changing files").set_defaults(func=command_doctor)
+    doctor = sub.add_parser("doctor", help="check local setup without changing files")
+    doctor.add_argument("--json", action="store_true", help="print redacted machine-readable preflight diagnostics")
+    doctor.set_defaults(func=command_doctor)
 
     bootstrap = sub.add_parser("bootstrap", help="prepare the full local stack")
     bootstrap.add_argument("--full", action="store_true", help="prepare Postgres/Ollama/backend/frontend")
@@ -3360,6 +6010,14 @@ def build_parser() -> argparse.ArgumentParser:
     provider_status.add_argument("--json", action="store_true", help="print redacted provider auth status JSON")
     provider_status.set_defaults(func=command_provider)
 
+    provider_reference = provider_sub.add_parser("reference", help="show provider credential meanings and configured route readiness")
+    provider_reference.add_argument("--json", action="store_true", help="print redacted provider credential reference JSON")
+    provider_reference.set_defaults(func=command_provider)
+
+    provider_env = provider_sub.add_parser("env", help="show provider environment settings without printing secret values")
+    provider_env.add_argument("--json", action="store_true", help="print redacted provider environment settings JSON")
+    provider_env.set_defaults(func=command_provider)
+
     provider_login = provider_sub.add_parser("login", help="start provider login from the native terminal")
     provider_login.add_argument("provider", choices=tuple(PROVIDER_AUTH_TARGETS.keys()), help="provider login target")
     provider_login.add_argument("--timeout-seconds", type=int, default=300, help="ChatGPT OAuth callback session timeout")
@@ -3372,6 +6030,26 @@ def build_parser() -> argparse.ArgumentParser:
     provider_disconnect.add_argument("provider", choices=tuple(PROVIDER_AUTH_TARGETS.keys()), help="provider disconnect target")
     provider_disconnect.set_defaults(func=command_provider)
 
+    permissions = sub.add_parser("permissions", help="inspect or update owner automation permission mode")
+    permissions_sub = permissions.add_subparsers(dest="permissions_action", required=True)
+    permissions_status = permissions_sub.add_parser("status", help="show owner automation permission mode")
+    permissions_status.add_argument("--json", action="store_true", help="print redacted permission mode JSON")
+    permissions_status.set_defaults(func=command_permissions)
+    permissions_set = permissions_sub.add_parser("set", help="set owner automation permission mode from the native terminal")
+    permissions_set.add_argument("mode", choices=PERMISSION_MODE_CHOICES, help="permission mode to apply")
+    permissions_set.add_argument("--agent-full-access", type=parse_bool_option, help="set whether the local agent has full filesystem/terminal/browser access")
+    permissions_set.add_argument("--allow-tool", dest="allowed_tools", action="append", help="allowed tool id or comma-separated ids; repeatable")
+    permissions_set.add_argument("--deny-tool", dest="denied_tools", action="append", help="denied tool id or comma-separated ids; repeatable")
+    permissions_set.add_argument("--allow-risk", dest="allowed_risk_classes", action="append", help="allowed risk class or comma-separated classes; repeatable")
+    permissions_set.add_argument("--deny-risk", dest="denied_risk_classes", action="append", help="denied risk class or comma-separated classes; repeatable")
+    permissions_set.add_argument("--allow-command", dest="command_allowlist", action="append", help="allowed command pattern or comma-separated patterns; repeatable")
+    permissions_set.add_argument("--deny-command", dest="command_denylist", action="append", help="denied command pattern or comma-separated patterns; repeatable")
+    permissions_set.add_argument("--ask-fallback", choices=("ask", "deny"), help="fallback behavior for ask-gated actions")
+    permissions_set.add_argument("--strict-inline-eval", type=parse_bool_option, help="set strict inline evaluation true/false")
+    permissions_set.add_argument("--updated-by", default="atrium-cli", help="audit actor label for the permission change")
+    permissions_set.add_argument("--json", action="store_true", help="print redacted updated permission mode JSON")
+    permissions_set.set_defaults(func=command_permissions)
+
     tools = sub.add_parser("tools", help="inspect AI tool registry, catalog, and connector readiness")
     tools_sub = tools.add_subparsers(dest="tools_action", required=True)
     tools_status = tools_sub.add_parser("status", help="show AI tool registry and connector readiness")
@@ -3382,6 +6060,12 @@ def build_parser() -> argparse.ArgumentParser:
     tools_catalog.add_argument("--limit", type=int, default=20, help="number of catalog rows to print")
     tools_catalog.add_argument("--json", action="store_true", help="print redacted AI tool catalog JSON")
     tools_catalog.set_defaults(func=command_tools)
+    tools_mcp_gateway = tools_sub.add_parser("mcp-gateway", help="show MCP external-write gateway setup and readiness")
+    tools_mcp_gateway.add_argument("--json", action="store_true", help="print redacted MCP gateway setup JSON")
+    tools_mcp_gateway.set_defaults(func=command_tools)
+    tools_mcp_probe = tools_sub.add_parser("mcp-probe", help="probe MCP external-write gateway health")
+    tools_mcp_probe.add_argument("--json", action="store_true", help="print redacted MCP gateway probe JSON")
+    tools_mcp_probe.set_defaults(func=command_tools)
 
     automation = sub.add_parser("automation", help="inspect and prove browser/desktop automation readiness")
     automation_sub = automation.add_subparsers(dest="automation_action", required=True)
@@ -3401,6 +6085,13 @@ def build_parser() -> argparse.ArgumentParser:
     automation_source.add_argument("--json", action="store_true", help="print pure source summary JSON without command trace")
     automation_source.set_defaults(func=command_automation)
 
+    automation_smoke = automation_sub.add_parser("smoke", help="run native browser/desktop smoke diagnostics for the current OS")
+    automation_smoke.add_argument("--browser-url", default=FRONTEND_URL, help="URL to open through browser.open during smoke diagnostics")
+    automation_smoke.add_argument("--browser-profile", default="atrium", help="browser profile for browser probes")
+    automation_smoke.add_argument("--output", help="write the stamped smoke artifact JSON")
+    automation_smoke.add_argument("--simulate", action="store_true", help="simulate the current host probe where the underlying probe supports it")
+    automation_smoke.set_defaults(func=command_automation)
+
     windows_probe = automation_sub.add_parser("windows-probe", help="run the Windows HostBridge probe through uv")
     windows_probe.add_argument("--simulate", action="store_true", help="simulate Windows branch coverage")
     windows_probe.add_argument("--full", action="store_true", help="run the full live Windows parity probe")
@@ -3409,7 +6100,7 @@ def build_parser() -> argparse.ArgumentParser:
     windows_probe.add_argument("--interactive", action="store_true", help="run interactive Notepad desktop control checks")
     windows_probe.add_argument("--browser-url", help="open a URL through browser.open")
     windows_probe.add_argument("--browser-profile", default="atrium", help="browser profile for browser probes")
-    windows_probe.add_argument("--output", help="write the stamped probe artifact JSON")
+    windows_probe.add_argument("--output", help=f"write the stamped probe artifact JSON; --full defaults to {DEFAULT_WINDOWS_PROBE_PATH}")
     windows_probe.add_argument("--parity-run-id", help="shared macOS/Windows parity run ID")
     windows_probe.add_argument("--expect-source-fingerprint", help="fail if the HostBridge source fingerprint differs")
     windows_probe.add_argument("--expect-source-manifest-sha256", help="fail if the current source manifest SHA-256 differs")
@@ -3453,6 +6144,18 @@ def build_parser() -> argparse.ArgumentParser:
     parity_report.add_argument("--windows-source-path", default="C:\\Temp\\atrium_host_bridge_windows_live.json", help="original Windows-host artifact path for transfer hints")
     parity_report.add_argument("--skip-current-source-check", action="store_true", help="allow offline historical audits; not valid for claiming current OpenClaw-level parity")
     parity_report.set_defaults(func=command_automation)
+
+    accept_windows = automation_sub.add_parser(
+        "accept-windows",
+        help="repo-side gate: validate, import, report, and audit a copied Windows proof artifact",
+    )
+    accept_windows.add_argument("artifact", help="path to the Windows full live proof artifact copied from the Windows host")
+    accept_windows.add_argument("--handoff", default=DEFAULT_WINDOWS_HANDOFF_PATH, help="current Windows proof handoff packet")
+    accept_windows.add_argument("--output", default=str(HOST_BRIDGE_PARITY_REPORT), help="backend parity report path to write")
+    accept_windows.add_argument("--max-artifact-age-hours", type=float, default=24.0, help="reject artifacts older than this many hours")
+    accept_windows.add_argument("--windows-source-path", help="original Windows-host artifact path for transfer hints")
+    accept_windows.add_argument("--json", action="store_true", help="print accept/import/audit result JSON")
+    accept_windows.set_defaults(func=command_automation)
 
     stop = sub.add_parser("stop", help="stop ATRIUM-owned local sessions")
     stop.add_argument("--launchd", action="store_true", help="also uninstall the ATRIUM LaunchAgent")

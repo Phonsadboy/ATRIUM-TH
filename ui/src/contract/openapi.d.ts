@@ -4854,6 +4854,14 @@ export interface components {
             local?: {
                 [key: string]: unknown;
             };
+            /** Localartifacts */
+            localArtifacts?: {
+                [key: string]: unknown;
+            };
+            /** Nativeparitymatrix */
+            nativeParityMatrix?: {
+                [key: string]: unknown;
+            };
             /** Ok */
             ok: boolean;
             /** Report */

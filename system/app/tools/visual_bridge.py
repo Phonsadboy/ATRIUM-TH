@@ -9,6 +9,7 @@ import os
 import plistlib
 import re
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -590,7 +591,9 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+main().then(() => {
+  process.exit(0);
+}).catch((error) => {
   console.log(JSON.stringify({
     returnCode: 1,
     ok: false,
@@ -2175,6 +2178,79 @@ def _run_visual_command(
         }
 
 
+def _is_default_visual_run_process(run_process: Callable[..., dict[str, Any]]) -> bool:
+    return getattr(run_process, "__name__", "") == "_run_process"
+
+
+def _terminate_process_tree(process: subprocess.Popen[bytes], *, grace_seconds: float = 2.0) -> None:
+    if process.poll() is not None:
+        return
+    if _is_windows():
+        with contextlib.suppress(Exception):
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                text=False,
+                capture_output=True,
+                timeout=max(1.0, grace_seconds),
+                check=False,
+            )
+        return
+    with contextlib.suppress(Exception):
+        os.killpg(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(Exception):
+            os.killpg(process.pid, signal.SIGKILL)
+        with contextlib.suppress(Exception):
+            process.wait(timeout=grace_seconds)
+
+
+def _run_browser_playwright_process(
+    command: list[str],
+    *,
+    cwd: Path | None = None,
+    timeout: float | None = 10.0,
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    popen_kwargs: dict[str, Any] = {}
+    if _is_windows():
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kwargs["start_new_session"] = True
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        text=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        **popen_kwargs,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+        return {
+            "command": command,
+            "cwd": str(cwd) if cwd else None,
+            "returnCode": process.returncode,
+            "stdout": _visual_output_text(stdout),
+            "stderr": _visual_output_text(stderr),
+        }
+    except subprocess.TimeoutExpired as exc:
+        _terminate_process_tree(process)
+        stdout, stderr = process.communicate()
+        timeout_stderr = _visual_output_text(stderr) or _visual_output_text(exc.stderr) or f"command timed out after {timeout}s"
+        return {
+            "command": command,
+            "cwd": str(cwd) if cwd else None,
+            "returnCode": None,
+            "timeout": True,
+            "processTreeTerminated": True,
+            "stdout": _visual_output_text(stdout) or _visual_output_text(exc.stdout) or _visual_output_text(getattr(exc, "output", None)),
+            "stderr": timeout_stderr,
+        }
+
+
 def _windows_helper_paths() -> tuple[Path, Path]:
     helper_dir = (get_settings().data_dir / "tool-helpers").resolve()
     return helper_dir / "windows_visual.py", helper_dir / "windows_visual.sha256"
@@ -2658,13 +2734,22 @@ def _execute_browser_playwright(
     helper = _ensure_browser_playwright_helper()
     workdir = _ui_root() if _ui_root().exists() else _repo_root()
     timeout_seconds = max(5.0, min(float(payload.get("timeoutMs", 15_000)) / 1000.0 + 5.0, 130.0))
-    result = _run_visual_command(
-        run_process,
-        [node, str(helper), json.dumps(payload, ensure_ascii=False)],
-        cwd=workdir,
-        timeout=timeout_seconds,
-        env=_browser_playwright_env(),
-    )
+    command = [node, str(helper), json.dumps(payload, ensure_ascii=False)]
+    if _is_default_visual_run_process(run_process):
+        result = _run_browser_playwright_process(
+            command,
+            cwd=workdir,
+            timeout=timeout_seconds,
+            env=_browser_playwright_env(),
+        )
+    else:
+        result = _run_visual_command(
+            run_process,
+            command,
+            cwd=workdir,
+            timeout=timeout_seconds,
+            env=_browser_playwright_env(),
+        )
     parsed = _json_value_from_stdout(result.get("stdout"))
     result.update({
         "backend": "playwright",

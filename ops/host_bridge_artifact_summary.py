@@ -13,7 +13,7 @@ OPS = Path(__file__).resolve().parent
 if str(OPS) not in sys.path:
     sys.path.insert(0, str(OPS))
 
-from host_bridge_parity_report import _proof_summary  # noqa: E402
+from host_bridge_parity_report import _live_proof_failure_details, _proof_summary  # noqa: E402
 
 SYSTEM = OPS.parent / "system"
 if str(SYSTEM) not in sys.path:
@@ -71,6 +71,8 @@ REQUIRED_PROOF_FACETS = {
         "windowsForegroundActivation",
         "windowsUnicodeTyping",
         "windowsKeyboardShortcut",
+        "mcpExternalWriteReady",
+        "windowsLiveProofRunner",
         "notepadNativeAct",
         "clipboardRoundTrip",
     ),
@@ -108,6 +110,35 @@ def _hex40(value: Any) -> bool:
     return isinstance(value, str) and len(value) == 40 and all(ch in "0123456789abcdef" for ch in value)
 
 
+def _append_basic_artifact_metadata_findings(
+    data: dict[str, Any],
+    findings: list[str],
+    *,
+    expect_parity_run_id: str | None,
+    max_artifact_age_hours: float,
+) -> None:
+    if data.get("schemaVersion") != PROBE_SCHEMA_VERSION:
+        findings.append(f"schemaVersion must be {PROBE_SCHEMA_VERSION}, got {data.get('schemaVersion')!r}")
+    generated_at = data.get("generatedAt")
+    now_ms = int(time.time() * 1000)
+    if not isinstance(generated_at, int):
+        findings.append("generatedAt is missing or invalid")
+    else:
+        age_ms = now_ms - generated_at
+        if generated_at > now_ms + 5 * 60 * 1000:
+            findings.append("generatedAt is in the future")
+        if max_artifact_age_hours > 0 and age_ms > int(max_artifact_age_hours * 60 * 60 * 1000):
+            findings.append(
+                f"artifact is stale; ageHours={age_ms / 3600000:.1f}; "
+                f"maxAgeHours={max_artifact_age_hours:.1f}"
+            )
+    parity_run_id = data.get("parityRunId")
+    if not isinstance(parity_run_id, str) or not parity_run_id.strip():
+        findings.append("parityRunId is missing or invalid")
+    elif expect_parity_run_id and parity_run_id != expect_parity_run_id:
+        findings.append(f"parityRunId mismatch: artifact={parity_run_id}; expected={expect_parity_run_id}")
+
+
 def summarize_artifact(
     path: Path,
     *,
@@ -141,6 +172,59 @@ def summarize_artifact(
     host = data.get("host") if isinstance(data.get("host"), dict) else {}
     status = data.get("status") if isinstance(data.get("status"), dict) else {}
     proofs = _proof_summary(label, data)
+    required_proof_facets = list(REQUIRED_PROOF_FACETS[label])
+    missing_proofs = [facet for facet in required_proof_facets if proofs.get(facet) is not True]
+    failure_details = _live_proof_failure_details(label, data)
+    if failure_details is not None:
+        findings.append(str(failure_details["finding"]))
+        _append_basic_artifact_metadata_findings(
+            data,
+            findings,
+            expect_parity_run_id=expect_parity_run_id,
+            max_artifact_age_hours=max_artifact_age_hours,
+        )
+        failure_source_fingerprint = failure_details.get("sourceFingerprint")
+        failure_source_manifest_sha256 = failure_details.get("sourceManifestSha256")
+        failure_source_file_count = failure_details.get("sourceFileCount")
+        if expected_source_fingerprint and failure_source_fingerprint != expected_source_fingerprint:
+            findings.append(
+                "sourceFingerprint mismatch: "
+                f"artifact={failure_source_fingerprint}; expected={expected_source_fingerprint}"
+            )
+        if expected_source_manifest_sha256 and failure_source_manifest_sha256 != expected_source_manifest_sha256:
+            findings.append(
+                "sourceManifestSha256 mismatch: "
+                f"artifact={failure_source_manifest_sha256}; expected={expected_source_manifest_sha256}"
+            )
+        if expect_source_file_count is not None and failure_source_file_count != expect_source_file_count:
+            findings.append(
+                "sourceFileCount mismatch: "
+                f"artifact={failure_source_file_count}; expected={expect_source_file_count}"
+            )
+        return {
+            "ok": False,
+            "path": str(path),
+            "label": label,
+            "findings": findings,
+            "schemaVersion": data.get("schemaVersion"),
+            "mode": data.get("mode"),
+            "probeOk": data.get("ok"),
+            "generatedAt": generated_at,
+            "parityRunId": parity_run_id,
+            "sourceFingerprint": failure_source_fingerprint,
+            "sourceManifestSha256": failure_source_manifest_sha256,
+            "sourceFileCount": failure_source_file_count,
+            "failureError": failure_details.get("error"),
+            "failurePreflight": failure_details.get("preflight"),
+            "failureNextSteps": failure_details.get("nextSteps"),
+            "proofs": proofs,
+            "requiredProofFacets": required_proof_facets,
+            "missingProofFacets": missing_proofs,
+            "proofFacetCount": len(required_proof_facets),
+            "missingProofFacetCount": len(missing_proofs),
+            "failureStage": failure_details.get("failedStage"),
+            "failurePartialArtifact": failure_details.get("partialArtifact"),
+        }
 
     if data.get("schemaVersion") != PROBE_SCHEMA_VERSION:
         findings.append(f"schemaVersion must be {PROBE_SCHEMA_VERSION}, got {data.get('schemaVersion')!r}")
@@ -215,7 +299,6 @@ def summarize_artifact(
         findings.append(f"status.platform must be {expected_platform!r}, got {status.get('platform')!r}")
     if not _hex64(host.get("hostFingerprint")):
         findings.append("hostFingerprint is missing or invalid")
-    missing_proofs = [facet for facet in REQUIRED_PROOF_FACETS[label] if proofs.get(facet) is not True]
     for facet in missing_proofs:
         findings.append(f"required proof facet {facet} is missing or false")
 
@@ -242,6 +325,10 @@ def summarize_artifact(
         "browserBridge": status.get("browserBridge"),
         "desktopBridge": status.get("desktopBridge"),
         "proofs": proofs,
+        "requiredProofFacets": required_proof_facets,
+        "missingProofFacets": missing_proofs,
+        "proofFacetCount": len(required_proof_facets),
+        "missingProofFacetCount": len(missing_proofs),
     }
 
 

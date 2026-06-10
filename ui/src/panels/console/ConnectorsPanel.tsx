@@ -8,6 +8,7 @@ import type {
   ConnectorStatus,
   HostBridgeOpenClawContract,
   HostBridgeOpenClawRequirement,
+  HostBridgeParityCommandKey,
   HostBridgeParityStatusResponse,
 } from '../../contract/types'
 import { Section, Loading, Empty, ErrorNote, Row, GhostBtn, useAsync } from './shared'
@@ -34,6 +35,99 @@ const KIND_LABEL: Record<ConnectorKind, string> = {
   desktop: 'เดสก์ท็อป',
   sandbox: 'แซนด์บ็อกซ์',
   mcp: 'MCP',
+}
+
+const PARITY_COMMAND_KEYS: HostBridgeParityCommandKey[] = [
+  'macosSourceValidate',
+  'macosSmoke',
+  'macosProbe',
+  'macosArtifact',
+  'macosArtifactValidate',
+  'windowsHandoff',
+  'windowsSourceValidate',
+  'mcpGatewaySetupJson',
+  'mcpGatewayProbeJson',
+  'mcpGatewayStatusJson',
+  'nativeBrowserDesktopSmoke',
+  'windowsProbe',
+  'windowsLiveProofRunner',
+  'windowsArtifactValidateOnWindows',
+  'windowsArtifactValidateLocal',
+  'acceptWindowsArtifact',
+  'automationReport',
+  'report',
+  'verify',
+  'legacyParityReport',
+]
+
+const DETAIL_REASON_LABEL: Record<string, string> = {
+  atriumPs1: 'atrium.ps1 missing',
+  atriumPs1Runner: 'atrium.ps1 runner incomplete',
+  atriumCmd: 'atrium.cmd missing',
+  atriumSh: './atrium missing',
+  installMacosSh: 'macOS installer missing',
+  launcherRunsCli: 'macOS launcher incomplete',
+  installerNextChecks: 'installer next checks incomplete',
+  atriumCmdForwarder: 'atrium.cmd fallback incomplete',
+  standardPowerShellPathFallback: 'standard PowerShell path fallback missing',
+  installWindowsNativePs1: 'native installer missing',
+  installWindowsNativeSafety: 'installer safety incomplete',
+  installWindowsNativeBaseSafety: 'installer base checks incomplete',
+  installWindowsNativeSetupRunner: 'installer setup handoff incomplete',
+  atriumCli: 'CLI missing',
+  pidFiles: 'PID truth incomplete',
+  entrypointDiagnostics: 'entrypoint diagnostics incomplete',
+  doctorJson: 'doctor JSON missing',
+  statusJson: 'status JSON missing',
+  python3Validated: 'Python 3 validation missing',
+  wingetRetry: 'winget retry missing',
+  lifecycleCommands: 'lifecycle commands incomplete',
+  startReadinessGate: 'start readiness gate missing',
+  nativeCommandHints: 'native command hints missing',
+  logsJson: 'logs JSON missing',
+  supportBundle: 'support bundle incomplete',
+  permissionsCommandSurface: 'permissions command missing',
+  selfUpdateRestart: 'self-update restart incomplete',
+  automationPermissionMode: 'automation permission incomplete',
+  commandProvider: 'provider command missing',
+  commandTools: 'tools command missing',
+  providerStatusProbe: 'provider probe missing',
+  providerStatusJson: 'provider JSON missing',
+  providerStatusJsonRedaction: 'provider redaction missing',
+  providerLogin: 'provider login missing',
+  providerDisconnect: 'provider disconnect missing',
+  providerReferenceEnv: 'provider reference/env missing',
+  providerTargets: 'provider targets incomplete',
+  providerBackendEndpoints: 'provider backend endpoints incomplete',
+  chatgptStartEndpoint: 'ChatGPT login endpoint missing',
+  chatgptDisconnectEndpoint: 'ChatGPT disconnect endpoint missing',
+  claudeCodeStartEndpoint: 'Claude Code login endpoint missing',
+  claudeCodeDisconnectEndpoint: 'Claude Code disconnect endpoint missing',
+  providerWaitPolling: 'provider wait polling missing',
+  claudeCodeInteractiveLogin: 'Claude Code interactive login missing',
+  windowsUrlOpenNative: 'native URL opener missing',
+  toolsStatusJson: 'tools status JSON missing',
+  toolsCatalogJson: 'tools catalog JSON missing',
+  providerAuthStatusEndpoint: 'provider auth endpoint missing',
+  providerAuthReferenceEndpoint: 'provider reference endpoint missing',
+  providerAuthEnvEndpoint: 'provider env endpoint missing',
+  toolCatalogEndpoint: 'tool catalog endpoint missing',
+  connectorsEndpoint: 'connectors endpoint missing',
+  automationAudit: 'automation audit missing',
+  automationStatusJson: 'automation status JSON missing',
+  automationHandoff: 'automation handoff missing',
+  automationSmoke: 'native smoke command missing',
+  automationWindowsProbe: 'Windows probe missing',
+  automationWindowsLiveProof: 'Windows live proof missing',
+  automationReport: 'automation report missing',
+  artifactFreshnessGate: 'artifact freshness gate missing',
+  defaultReportPath: 'default report path missing',
+  rawVerifier: 'raw verifier missing',
+  historicalOverrideFlag: 'historical override guard missing',
+  contractOutput: 'contract output missing',
+  gatewayConfigured: 'gateway not configured',
+  gatewayHealthy: 'gateway health not ready',
+  externalWriteReady: 'external write not ready',
 }
 
 function shortValue(value: unknown, chars = 8) {
@@ -80,6 +174,89 @@ function proofDetailLine(details?: Record<string, unknown>) {
   return parts.join(' · ')
 }
 
+function stringList(value: unknown) {
+  if (!Array.isArray(value)) return []
+  return value
+    .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+    .map((item) => item.trim())
+}
+
+function stringDetail(value: unknown) {
+  return typeof value === 'string' && value.trim().length > 0 ? value.trim() : ''
+}
+
+function recordDetail(value: unknown) {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {}
+}
+
+function checklistLines(value: unknown) {
+  if (!Array.isArray(value)) return []
+  return value
+    .map((item) => recordDetail(item))
+    .filter((item) => Object.keys(item).length > 0)
+    .map((item, index) => {
+      const step = typeof item.step === 'number' ? item.step : index + 1
+      const id = stringDetail(item.id) || `step_${step}`
+      const host = stringDetail(item.host)
+      const command = stringDetail(item.command)
+      const from = stringDetail(item.from)
+      const to = stringDetail(item.to)
+      const target = command || (from && to ? `${from} -> ${to}` : stringDetail(item.successCondition))
+      return target ? `${step}. ${host ? `${host}: ` : ''}${id}: ${target}` : `${step}. ${id}`
+    })
+}
+
+function nativeParityRows(value: unknown) {
+  const matrix = recordDetail(value)
+  const surfaces = Array.isArray(matrix.surfaces) ? matrix.surfaces.map((item) => recordDetail(item)) : []
+  return surfaces
+    .filter((surface) => stringDetail(surface.id))
+    .map((surface) => {
+      const id = stringDetail(surface.id)
+      const label = stringDetail(surface.label) || id
+      const macosCount = Array.isArray(surface.macos) ? surface.macos.length : 0
+      const windowsCount = Array.isArray(surface.windows) ? surface.windows.length : 0
+      return `${label}: macOS ${macosCount} · Windows ${windowsCount}`
+    })
+}
+
+function localArtifactLine(label: string, item: unknown) {
+  const detail = recordDetail(item)
+  const exists = detail.exists === true
+  const status = stringDetail(detail.status) || (exists ? '' : 'missing')
+  const parts = [`exists=${exists ? 'true' : 'false'}`]
+  if (exists) {
+    parts.push(`ok=${detail.ok === true ? 'true' : 'false'}`)
+    const sourceStatus = stringDetail(detail.sourceStatus)
+    if (sourceStatus) parts.push(`source=${sourceStatus}`)
+    parts.push(`usable=${detail.usable === true ? 'true' : 'false'}`)
+  } else if (status) {
+    parts.push(`status=${status}`)
+    const sourceStatus = stringDetail(detail.sourceStatus)
+    if (sourceStatus) parts.push(`source=${sourceStatus}`)
+  }
+  if (detail.refreshRequired === true) {
+    parts.push('refreshRequired=true')
+  }
+  const failedChecks = stringList(detail.failedChecks)
+  if (failedChecks.length > 0) {
+    parts.push(`failed=${failedChecks.slice(0, 3).join('|')}`)
+  }
+  const proofFacetCount = typeof detail.proofFacetCount === 'number'
+    ? detail.proofFacetCount
+    : typeof detail.expectedProofFacetCount === 'number'
+      ? detail.expectedProofFacetCount
+      : null
+  if (proofFacetCount && proofFacetCount > 0) {
+    parts.push(`proofFacets=${proofFacetCount}`)
+  }
+  const runId = stringDetail(detail.parityRunId) || stringDetail(detail.expectedParityRunId)
+  if (runId) parts.push(`run=${runId}`)
+  const copySource = stringDetail(detail.copySourcePath)
+  if (!exists && copySource) parts.push(`copyFrom=${copySource}`)
+  return `${label}: ${parts.join(', ')}`
+}
+
 function isRequirementBlocked(requirement: HostBridgeOpenClawRequirement) {
   if (requirement.currentHostApplies === false) return false
   if (requirement.currentReady === false) return true
@@ -92,9 +269,17 @@ function isRequirementBlocked(requirement: HostBridgeOpenClawRequirement) {
 function requirementName(requirement: HostBridgeOpenClawRequirement) {
   const name = requirement.id || requirement.label || 'unknown'
   const reasons: string[] = []
+  const details = requirement.currentDetails ?? {}
   if (requirement.degradedByLocalFallback) reasons.push('local fallback only')
   if (requirement.requiresWriteReady && requirement.writeReady === false) reasons.push('write not ready')
   if (requirement.readReady === false) reasons.push('read not ready')
+  const detailReasons = Object.entries(details)
+    .filter(([key, value]) => value === false && Boolean(DETAIL_REASON_LABEL[key]))
+    .map(([key]) => DETAIL_REASON_LABEL[key])
+  reasons.push(...detailReasons.slice(0, 3))
+  if (detailReasons.length > 3) {
+    reasons.push(`+${detailReasons.length - 3} checks`)
+  }
   if (requirement.externalWriteRequires && requirement.externalWriteRequires.length > 0) {
     reasons.push(requirement.externalWriteRequires.slice(0, 2).join(', '))
   }
@@ -141,10 +326,30 @@ export function ConnectorsPanel() {
   const parityStatus = parity ? PROOF_STATUS[parity.status] ?? { label: parity.status, hex: ACCENT_HEX.lavender } : null
   const parityDetail = proofDetailLine(parity?.report)
   const parityCommands = parity?.commands ?? {}
+  const nativeParity = recordDetail(parity?.nativeParityMatrix)
+  const nativeParityRowsList = nativeParityRows(nativeParity)
+  const localArtifacts = recordDetail(parity?.localArtifacts)
+  const localArtifactRows = ['macos', 'handoff', 'windowsLocal']
+    .filter((label) => Object.prototype.hasOwnProperty.call(localArtifacts, label))
+    .map((label) => localArtifactLine(label, localArtifacts[label]))
+  const windowsLocalArtifact = recordDetail(localArtifacts.windowsLocal)
+  const windowsCopyInstruction = stringDetail(windowsLocalArtifact.copyInstruction)
+  const windowsChecklistLines = checklistLines(windowsLocalArtifact.operatorChecklist)
   const contract = parity?.contract ?? null
   const contractStatus = contract?.status ? PROOF_STATUS[contract.status] ?? { label: contract.status, hex: ACCENT_HEX.lavender } : null
   const openClawGapGroups = contractGapGroups(contract)
   const openClawGaps = contractGapNames(contract)
+  const mcpRequirement = contract?.featureRequirements?.find((item) => item.id === 'mcp')
+  const mcpDetails = mcpRequirement?.currentDetails ?? {}
+  const mcpRequiredEnvironment = stringList(mcpDetails.requiredEnvironment)
+  const mcpExternalWriteRequirements = stringList(mcpDetails.externalWriteRequirements)
+  const mcpSetupCommand = stringDetail(mcpDetails.setupCommand)
+  const mcpStatusCommand = stringDetail(mcpDetails.statusCommand)
+  const showMcpExternalWriteSetup = Boolean(
+    mcpRequirement
+      && isRequirementBlocked(mcpRequirement)
+      && (mcpRequiredEnvironment.length > 0 || mcpExternalWriteRequirements.length > 0 || mcpSetupCommand || mcpStatusCommand),
+  )
 
   return (
     <Section
@@ -176,6 +381,37 @@ export function ConnectorsPanel() {
                   gap: {parity.gaps.slice(0, 3).join(' · ')}
                 </div>
               )}
+              {localArtifactRows.length > 0 && (
+                <div className="mt-2 grid gap-1 text-[10px] text-[var(--color-cream-faint)] break-words [overflow-wrap:anywhere]">
+                  <div style={{ color: withAlpha(ACCENT_HEX.sky, 0.9) }}>local proof artifacts</div>
+                  {localArtifactRows.map((line) => (
+                    <div key={line} style={{ fontFamily: 'var(--font-mono)' }}>{line}</div>
+                  ))}
+                  {windowsCopyInstruction && (
+                    <div>{windowsCopyInstruction}</div>
+                  )}
+                  {windowsChecklistLines.length > 0 && (
+                    <div className="grid gap-1">
+                      <div style={{ color: withAlpha(ACCENT_HEX.amber, 0.9) }}>Windows proof checklist</div>
+                      {windowsChecklistLines.slice(0, 6).map((line) => (
+                        <div key={line} style={{ fontFamily: 'var(--font-mono)' }}>{line}</div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+              {nativeParityRowsList.length > 0 && (
+                <div className="mt-2 grid gap-1 text-[10px] text-[var(--color-cream-faint)] break-words [overflow-wrap:anywhere]">
+                  <div style={{ color: withAlpha(ACCENT_HEX.teal, 0.9) }}>native parity matrix</div>
+                  <div className="flex flex-wrap gap-1">
+                    {nativeParity.nativeOnly === true && <Pill color={ACCENT_HEX.teal}>native only</Pill>}
+                    {nativeParity.windowsNativeHostOnly === true && <Pill color={ACCENT_HEX.sky}>native Windows host</Pill>}
+                  </div>
+                  {nativeParityRowsList.slice(0, 8).map((line) => (
+                    <div key={line} style={{ fontFamily: 'var(--font-mono)' }}>{line}</div>
+                  ))}
+                </div>
+              )}
               {contract && (
                 <div className="mt-2 border-t border-[color:var(--color-line-soft)] pt-2">
                   <div className="flex items-start justify-between gap-2">
@@ -205,9 +441,26 @@ export function ConnectorsPanel() {
                       boundary: {contract.osBoundaries.slice(0, 2).join(' · ')}
                     </div>
                   )}
+                  {showMcpExternalWriteSetup && (
+                    <div className="mt-1 grid gap-1 text-[10px] text-[var(--color-cream-faint)] break-words [overflow-wrap:anywhere]">
+                      <div style={{ color: withAlpha(ACCENT_HEX.amber, 0.9) }}>MCP external-write is required for OpenClaw-level parity.</div>
+                      {mcpExternalWriteRequirements.length > 0 && (
+                        <div>requires: {mcpExternalWriteRequirements.join(', ')}</div>
+                      )}
+                      {mcpRequiredEnvironment.length > 0 && (
+                        <div>env: {mcpRequiredEnvironment.join(', ')}</div>
+                      )}
+                      {mcpSetupCommand && (
+                        <div style={{ fontFamily: 'var(--font-mono)' }}>{mcpSetupCommand}</div>
+                      )}
+                      {mcpStatusCommand && (
+                        <div style={{ fontFamily: 'var(--font-mono)' }}>{mcpStatusCommand}</div>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
-              {(parityCommands.parityRunId || parityCommands.sourceFingerprint || parityCommands.sourceManifestSha256 || parityCommands.sourceFileCount || parityCommands.macosSourceValidate || parityCommands.macosProbe || parityCommands.macosArtifactValidate || parityCommands.windowsSourceValidate || parityCommands.windowsProbe || parityCommands.windowsLiveProofRunner || parityCommands.windowsArtifactValidateOnWindows || parityCommands.windowsArtifactSource || parityCommands.windowsArtifactLocal || parityCommands.windowsArtifactCopyHint || parityCommands.windowsArtifactValidateLocal || parityCommands.automationReport || parityCommands.report || parityCommands.verify || parityCommands.legacyParityReport) && (
+              {(parityCommands.parityRunId || parityCommands.sourceFingerprint || parityCommands.sourceManifestSha256 || parityCommands.sourceFileCount || parityCommands.windowsArtifactSource || parityCommands.windowsArtifactLocal || parityCommands.windowsArtifactCopyHint || PARITY_COMMAND_KEYS.some((key) => Boolean(parityCommands[key]))) && (
                 <div className="mt-2 grid gap-1 text-[10px] text-[var(--color-cream-faint)]">
                   {parityCommands.parityRunId && (
                     <div className="break-words [overflow-wrap:anywhere]">
@@ -234,9 +487,19 @@ export function ConnectorsPanel() {
                       {parityCommands.macosSourceValidate}
                     </div>
                   )}
+                  {parityCommands.macosSmoke && (
+                    <div className="break-words [overflow-wrap:anywhere]" style={{ fontFamily: 'var(--font-mono)' }}>
+                      {parityCommands.macosSmoke}
+                    </div>
+                  )}
                   {parityCommands.macosProbe && (
                     <div className="break-words [overflow-wrap:anywhere]" style={{ fontFamily: 'var(--font-mono)' }}>
                       {parityCommands.macosProbe}
+                    </div>
+                  )}
+                  {parityCommands.macosArtifact && (
+                    <div className="break-words [overflow-wrap:anywhere]">
+                      macOS artifact: <span style={{ fontFamily: 'var(--font-mono)' }}>{parityCommands.macosArtifact}</span>
                     </div>
                   )}
                   {parityCommands.macosArtifactValidate && (
@@ -244,9 +507,34 @@ export function ConnectorsPanel() {
                       {parityCommands.macosArtifactValidate}
                     </div>
                   )}
+                  {parityCommands.windowsHandoff && (
+                    <div className="break-words [overflow-wrap:anywhere]" style={{ fontFamily: 'var(--font-mono)' }}>
+                      {parityCommands.windowsHandoff}
+                    </div>
+                  )}
                   {parityCommands.windowsSourceValidate && (
                     <div className="break-words [overflow-wrap:anywhere]" style={{ fontFamily: 'var(--font-mono)' }}>
                       {parityCommands.windowsSourceValidate}
+                    </div>
+                  )}
+                  {parityCommands.mcpGatewaySetupJson && (
+                    <div className="break-words [overflow-wrap:anywhere]" style={{ fontFamily: 'var(--font-mono)' }}>
+                      {parityCommands.mcpGatewaySetupJson}
+                    </div>
+                  )}
+                  {parityCommands.mcpGatewayProbeJson && (
+                    <div className="break-words [overflow-wrap:anywhere]" style={{ fontFamily: 'var(--font-mono)' }}>
+                      {parityCommands.mcpGatewayProbeJson}
+                    </div>
+                  )}
+                  {parityCommands.mcpGatewayStatusJson && (
+                    <div className="break-words [overflow-wrap:anywhere]" style={{ fontFamily: 'var(--font-mono)' }}>
+                      {parityCommands.mcpGatewayStatusJson}
+                    </div>
+                  )}
+                  {parityCommands.nativeBrowserDesktopSmoke && (
+                    <div className="break-words [overflow-wrap:anywhere]" style={{ fontFamily: 'var(--font-mono)' }}>
+                      {parityCommands.nativeBrowserDesktopSmoke}
                     </div>
                   )}
                   {parityCommands.windowsProbe && (
@@ -279,6 +567,11 @@ export function ConnectorsPanel() {
                   {parityCommands.windowsArtifactValidateLocal && (
                     <div className="break-words [overflow-wrap:anywhere]" style={{ fontFamily: 'var(--font-mono)' }}>
                       {parityCommands.windowsArtifactValidateLocal}
+                    </div>
+                  )}
+                  {parityCommands.acceptWindowsArtifact && (
+                    <div className="break-words [overflow-wrap:anywhere]" style={{ fontFamily: 'var(--font-mono)' }}>
+                      {parityCommands.acceptWindowsArtifact}
                     </div>
                   )}
                   {(parityCommands.automationReport || parityCommands.report) && (

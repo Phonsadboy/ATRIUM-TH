@@ -2131,6 +2131,71 @@ export interface HealthResponse {
   counts: Record<string, number>
 }
 
+export type NativeRuntimeCommandKey =
+  | 'doctorJson'
+  | 'statusJson'
+  | 'logsJson'
+  | 'reportBundle'
+  | 'providerStatus'
+  | 'providerReference'
+  | 'providerEnv'
+  | 'providerLoginChatGPT'
+  | 'providerLoginClaudeCode'
+  | 'providerDisconnectChatGPT'
+  | 'providerDisconnectClaudeCode'
+  | 'toolsStatus'
+  | 'toolsMcpGateway'
+  | 'toolsMcpProbe'
+  | 'toolsCatalog'
+  | 'permissionsStatus'
+  | 'permissionsFullAuto'
+  | 'automationStatus'
+  | 'automationSource'
+  | 'automationHandoff'
+  | 'automationSmoke'
+  | 'automationReport'
+  | 'automationAudit'
+  | 'start'
+  | 'stop'
+  | 'restart'
+  | 'automationWindowsProbe'
+  | 'automationWindowsLiveProof'
+  | 'automationWindowsArtifactValidate'
+  | 'automationAcceptWindows'
+
+export type NativeRuntimeCommands = Partial<Record<NativeRuntimeCommandKey, string>> & { [key: string]: string | undefined }
+
+export interface NativeRuntimeStatus {
+  hostPlatform?: string
+  launcher?: string
+  nativeOnly?: boolean
+  windowsNative?: boolean
+  windowsNativePrimary?: boolean
+  windowsNativeHostOnly?: boolean
+  browserAutomationReady?: boolean | null
+  desktopAutomationReady?: boolean | null
+  interactiveSession?: boolean | null
+  commands?: NativeRuntimeCommands
+}
+
+export interface RuntimeStatusResponse {
+  ok: boolean
+  now?: number
+  running?: boolean
+  provider?: Record<string, unknown>
+  wsClients?: number
+  v2?: {
+    agentBackend?: string
+    toolRegistryCount?: number
+    customToolCount?: number
+    hostBridge?: Record<string, unknown>
+    nativeRuntime?: NativeRuntimeStatus
+    fullAutonomy?: Record<string, unknown>
+    mcp?: Record<string, unknown>
+  } & Record<string, unknown>
+  [key: string]: unknown
+}
+
 export type VersionStatus = 'current' | 'outdated' | 'ahead' | 'diverged' | 'unknown'
 
 export interface VersionStatusResponse {
@@ -2281,10 +2346,48 @@ export interface HostBridgeParityStatusResponse {
   gaps: string[]
   report: Record<string, unknown>
   local: Record<string, unknown>
+  localArtifacts?: Record<string, unknown>
+  nativeParityMatrix?: Record<string, unknown>
   contract: HostBridgeOpenClawContract
   connectors: HostBridgeParityConnectorProof[]
-  commands: Record<string, string>
+  commands: HostBridgeParityCommands
 }
+
+export type HostBridgeParityCommandKey =
+  | 'parityRunId'
+  | 'sourceFingerprint'
+  | 'sourceManifestSha256'
+  | 'sourceFileCount'
+  | 'backendSourceFingerprint'
+  | 'backendSourceManifestSha256'
+  | 'sourceFingerprintStatus'
+  | 'macosSourceValidate'
+  | 'macosProbe'
+  | 'macosSmoke'
+  | 'macosArtifact'
+  | 'macosArtifactValidate'
+  | 'windowsHandoff'
+  | 'windowsHandoffArtifact'
+  | 'windowsRunIdSet'
+  | 'windowsSourceValidate'
+  | 'mcpGatewaySetupJson'
+  | 'mcpGatewayProbeJson'
+  | 'mcpGatewayStatusJson'
+  | 'nativeBrowserDesktopSmoke'
+  | 'windowsProbe'
+  | 'windowsLiveProofRunner'
+  | 'windowsArtifactValidateOnWindows'
+  | 'windowsArtifactSource'
+  | 'windowsArtifactLocal'
+  | 'windowsArtifactCopyHint'
+  | 'windowsArtifactValidateLocal'
+  | 'acceptWindowsArtifact'
+  | 'automationReport'
+  | 'report'
+  | 'verify'
+  | 'legacyParityReport'
+
+export type HostBridgeParityCommands = Partial<Record<HostBridgeParityCommandKey, string>> & { [key: string]: string | undefined }
 
 /* ---------- Chat generation control ---------- */
 

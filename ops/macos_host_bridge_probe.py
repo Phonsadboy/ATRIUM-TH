@@ -329,11 +329,48 @@ def _png_file_status(path: Path) -> dict[str, Any]:
     }
 
 
-def _first_desktop_press_ref(snapshot_result: dict[str, Any]) -> str | None:
+def _calculator_digit_value(name: str) -> str | None:
+    normalized = name.strip().lower()
+    aliases = {
+        "0": "0",
+        "zero": "0",
+        "ศูนย์": "0",
+        "1": "1",
+        "one": "1",
+        "หนึ่ง": "1",
+        "2": "2",
+        "two": "2",
+        "สอง": "2",
+        "3": "3",
+        "three": "3",
+        "สาม": "3",
+        "4": "4",
+        "four": "4",
+        "สี่": "4",
+        "5": "5",
+        "five": "5",
+        "ห้า": "5",
+        "6": "6",
+        "six": "6",
+        "หก": "6",
+        "7": "7",
+        "seven": "7",
+        "เจ็ด": "7",
+        "8": "8",
+        "eight": "8",
+        "แปด": "8",
+        "9": "9",
+        "nine": "9",
+        "เก้า": "9",
+    }
+    return aliases.get(normalized)
+
+
+def _first_desktop_press_ref(snapshot_result: dict[str, Any]) -> tuple[str | None, str | None]:
     snapshot = snapshot_result.get("snapshot") if isinstance(snapshot_result.get("snapshot"), dict) else {}
     elements = snapshot.get("elements") if isinstance(snapshot.get("elements"), list) else []
-    preferred_names = {"1", "one", "หนึ่ง"}
-    role_match_ref: str | None = None
+    preferred_order = {value: index for index, value in enumerate(("1", "2", "3", "4", "5", "6", "7", "8", "9", "0"))}
+    candidates: list[tuple[int, bool, str, str]] = []
     for element in elements:
         if not isinstance(element, dict):
             continue
@@ -342,13 +379,15 @@ def _first_desktop_press_ref(snapshot_result: dict[str, Any]) -> str | None:
             continue
         role = str(element.get("role") or "").strip().lower()
         name = str(element.get("name") or "").strip().lower()
-        if role in {"axbutton", "button"} and name in preferred_names:
+        digit_value = _calculator_digit_value(name)
+        if role in {"axbutton", "button"} and digit_value is not None:
             native_actions = {str(item).strip().lower() for item in element.get("nativeSupportedActions") or []}
-            if "click" in native_actions:
-                return ref
-            if role_match_ref is None:
-                role_match_ref = ref
-    return role_match_ref
+            candidates.append((preferred_order.get(digit_value, 99), "click" in native_actions, ref, digit_value))
+    if not candidates:
+        return None, None
+    candidates.sort(key=lambda item: (item[0], not item[1]))
+    _order, _native_click, ref, digit_value = candidates[0]
+    return ref, digit_value
 
 
 def _running_app_names(apps_result: dict[str, Any]) -> set[str]:
@@ -509,7 +548,7 @@ def _browser_snapshot_act_probe(profile: str, run_process: Any = _run_process) -
         "profile": profile,
         "headless": True,
         "maxElements": 20,
-        "timeoutMs": 45_000,
+        "timeoutMs": 90_000,
     }
     checks["browserSnapshotRoute"] = _route_for("browser.snapshot", snapshot_args)
     checks["browserSnapshotRuntimeBlocks"] = _runtime_block_for("browser.snapshot", snapshot_args)
@@ -540,7 +579,7 @@ def _browser_snapshot_act_probe(profile: str, run_process: Any = _run_process) -
         "profile": profile,
         "headless": True,
         "maxElements": 20,
-        "timeoutMs": 45_000,
+        "timeoutMs": 90_000,
         "waitAfterMs": 100,
     }
     checks["browserActRoute"] = _route_for("browser.act", act_args)
@@ -607,9 +646,10 @@ def _interactive_calculator_probe(run_process: Any = _run_process) -> dict[str, 
         else:
             time.sleep(0.2)
         press_ref: str | None = None
+        expected_value: str | None = None
         for snapshot_attempt in range(4):
             checks["desktopSnapshot"] = visual_bridge.execute_desktop_snapshot({**target_args, "maxElements": 200, "maxDepth": 8}, run_process)
-            press_ref = _first_desktop_press_ref(checks["desktopSnapshot"])
+            press_ref, expected_value = _first_desktop_press_ref(checks["desktopSnapshot"])
             if checks["desktopSnapshot"].get("returnCode") == 0 and checks["desktopSnapshot"].get("refCount", 0) > 0 and press_ref:
                 break
             if checks.get("activationDegraded") and _foreground_limited_snapshot(checks["desktopSnapshot"]):
@@ -629,9 +669,10 @@ def _interactive_calculator_probe(run_process: Any = _run_process) -> dict[str, 
             checks["error"] = (
                 "macOS foreground-control limitation prevented Calculator digit refs"
                 if checks.get("foregroundControlLimited")
-                else "desktop.snapshot did not expose the Calculator digit 1 ref for desktop.act"
+                else "desktop.snapshot did not expose a Calculator digit ref for desktop.act"
             )
             return checks
+        checks["expectedDisplayValue"] = expected_value or MACOS_CALCULATOR_EXPECTED_VALUE
         checks["nativeActionMetadataVerified"] = _macos_native_ref_metadata_verified(
             checks["desktopSnapshot"],
             press_ref,
@@ -659,7 +700,7 @@ def _interactive_calculator_probe(run_process: Any = _run_process) -> dict[str, 
             checks["error"] = "desktop.act did not prove Calculator AXPress native Accessibility action"
             return checks
         checks["desktopSnapshotAfter"] = checks["desktopActClick"].get("after") if isinstance(checks["desktopActClick"].get("after"), dict) else {}
-        checks["displayValueVerified"] = _snapshot_contains_text_value(checks["desktopSnapshotAfter"], MACOS_CALCULATOR_EXPECTED_VALUE)
+        checks["displayValueVerified"] = _snapshot_contains_text_value(checks["desktopSnapshotAfter"], str(checks["expectedDisplayValue"]))
         if checks["desktopSnapshotAfter"].get("returnCode") != 0 or checks["displayValueVerified"] is not True:
             checks["error"] = "desktop.snapshot did not confirm Calculator display value after desktop.act"
         return checks
@@ -1303,6 +1344,53 @@ def _simulate() -> dict[str, Any]:
         sys.platform = original_platform
 
 
+def _macos_foreground_session_verified(checks: dict[str, Any]) -> bool:
+    foreground = checks.get("foregroundSnapshot") if isinstance(checks.get("foregroundSnapshot"), dict) else {}
+    return (
+        foreground.get("returnCode") == 0
+        and foreground.get("refCount", 0) > 0
+        and foreground.get("snapshotBackend") == "native_ax"
+    )
+
+
+def _macos_desktop_live_proof_ready(checks: dict[str, Any]) -> bool:
+    calculator = checks.get("interactiveCalculator") if isinstance(checks.get("interactiveCalculator"), dict) else {}
+    textedit = checks.get("interactiveTextEdit") if isinstance(checks.get("interactiveTextEdit"), dict) else {}
+    return (
+        _macos_foreground_session_verified(checks)
+        and (calculator.get("desktopActClick") or {}).get("returnCode") == 0
+        and calculator.get("nativeActionVerified") is True
+        and calculator.get("displayValueVerified") is True
+        and not calculator.get("error")
+        and _commands_ok(calculator)
+        and (textedit.get("desktopActSetText") or {}).get("returnCode") == 0
+        and textedit.get("nativeActionVerified") is True
+        and textedit.get("textValueVerified") is True
+        and not textedit.get("error")
+        and _commands_ok(textedit)
+    )
+
+
+def _status_with_macos_live_proof(status: dict[str, Any], checks: dict[str, Any]) -> dict[str, Any]:
+    enriched = dict(status)
+    status_checks = (
+        dict(status.get("macosVisualPreflightChecks"))
+        if isinstance(status.get("macosVisualPreflightChecks"), dict)
+        else {}
+    )
+    if _macos_foreground_session_verified(checks):
+        status_checks["foregroundSession"] = True
+    if _macos_desktop_live_proof_ready(checks):
+        enriched.setdefault("desktopAutomationPreflightReady", status.get("desktopAutomationReady"))
+        enriched.setdefault("macosVisualPreflightPreProofChecks", status.get("macosVisualPreflightChecks"))
+        enriched["desktopAutomationReady"] = True
+        enriched["desktopAutomationProofSource"] = "live_native_ax_probe"
+        enriched["macosVisualPreflightChecks"] = status_checks
+        if enriched.get("macosVisualPreflightOk") is not True:
+            enriched["macosVisualPreflightProofSource"] = "live_native_ax_probe"
+    return enriched
+
+
 def _live(
     *,
     screenshot: bool,
@@ -1362,6 +1450,7 @@ def _live(
             checks["interactiveCalculator"] = _interactive_calculator_probe()
             checks["interactiveTextEdit"] = _interactive_textedit_probe()
 
+    status = _status_with_macos_live_proof(status, checks) if interactive else status
     live_ok = sys.platform == "darwin" and (checks.get("shell") or {}).get("containsExpected") is True
     live_ok = live_ok and status.get("browserBridge") is True and status.get("desktopBridge") is True
     live_ok = live_ok and status.get("desktopAutomationReady") is True and _route_ok(routes) and _runtime_blocks_clear(runtime_blocks)

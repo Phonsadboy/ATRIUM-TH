@@ -278,6 +278,49 @@ def _windows_artifact(**overrides):
                 "checks": {"dpiAwareness": True, "virtualScreen": True},
                 "virtualScreen": {"left": 0, "top": 0, "width": 1920, "height": 1080},
             },
+            "mcpExternalWriteReady": {
+                "ok": True,
+                "verified": True,
+                "returnCode": 0,
+                "stage": "mcp_external_write",
+                "proofFacet": "mcpExternalWriteReady",
+                "probe": True,
+                "ready": True,
+                "gatewayHealthOk": True,
+                "id": "mcp",
+                "status": "configured",
+                "readReady": True,
+                "writeReady": True,
+                "localFallback": False,
+                "externalWriteRequires": [],
+                "probeCommand": ".\\atrium.ps1 tools mcp-probe --json",
+                "setupCommand": ".\\atrium.ps1 tools mcp-gateway --json",
+            },
+            "windowsLiveProofRunner": {
+                "ok": True,
+                "verified": True,
+                "runner": "ops/windows_host_bridge_live_proof.ps1",
+                "command": ".\\atrium.ps1 automation windows-live-proof",
+                "failureStages": [
+                    "source_validate",
+                    "mcp_external_write",
+                    "windows_full_probe",
+                    "artifact_validate",
+                ],
+                "readinessGates": {
+                    "source": "source_validate",
+                    "mcpExternalWrite": "mcp_external_write",
+                    "browserDesktopSmoke": "windows_full_probe",
+                    "artifactValidation": "artifact_validate",
+                },
+                "repoRoot": "C:\\atrium",
+                "outputPath": "C:\\Temp\\atrium_host_bridge_windows_live.json",
+                "parityRunId": "parity-run-1",
+                "sourceFingerprint": _source()["sourceFingerprint"],
+                "sourceManifestSha256": _source()["sourceManifestSha256"],
+                "sourceFileCount": len(_source()["files"]),
+                "maxArtifactAgeHours": 24.0,
+            },
             "interactiveDesktop": {
                 "foregroundActivationVerified": True,
                 "activateApp": {
@@ -332,6 +375,14 @@ def _windows_artifact(**overrides):
         },
     }
     artifact.update(overrides)
+    source = artifact.get("source") if isinstance(artifact.get("source"), dict) else {}
+    checks = artifact.get("checks") if isinstance(artifact.get("checks"), dict) else {}
+    runner = checks.get("windowsLiveProofRunner") if isinstance(checks.get("windowsLiveProofRunner"), dict) else None
+    if runner is not None:
+        runner["parityRunId"] = artifact.get("parityRunId")
+        runner["sourceFingerprint"] = source.get("sourceFingerprint")
+        runner["sourceManifestSha256"] = source.get("sourceManifestSha256")
+        runner["sourceFileCount"] = source.get("sourceFileCount")
     return artifact
 
 
@@ -384,7 +435,105 @@ class HostBridgeParityReportTest(unittest.TestCase):
         self.assertTrue(report["results"]["windows"]["proofs"]["windowsInteractiveSessionIdentity"])
         self.assertTrue(report["results"]["windows"]["proofs"]["windowsUnicodeTyping"])
         self.assertTrue(report["results"]["windows"]["proofs"]["windowsKeyboardShortcut"])
+        self.assertTrue(report["results"]["windows"]["proofs"]["mcpExternalWriteReady"])
+        self.assertTrue(report["results"]["windows"]["proofs"]["windowsLiveProofRunner"])
         self.assertTrue(report["results"]["windows"]["proofs"]["notepadNativeAct"])
+
+    def test_parity_report_rejects_windows_artifact_without_mcp_external_write_proof(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            windows = _windows_artifact()
+            windows["checks"].pop("mcpExternalWriteReady")
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact())
+            windows_path = self._write_artifact(directory, "windows.json", windows)
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("windows: MCP external-write readiness proof is missing", findings)
+        self.assertFalse(report["results"]["windows"]["proofs"]["mcpExternalWriteReady"])
+
+    def test_parity_report_rejects_windows_artifact_without_mcp_stage_attestation(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            windows = _windows_artifact()
+            windows["checks"]["mcpExternalWriteReady"].pop("stage")
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact())
+            windows_path = self._write_artifact(directory, "windows.json", windows)
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("windows: MCP external-write readiness proof is missing", findings)
+        self.assertFalse(report["results"]["windows"]["proofs"]["mcpExternalWriteReady"])
+
+    def test_parity_report_rejects_windows_artifact_without_mcp_probe_attestation(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            windows = _windows_artifact()
+            windows["checks"]["mcpExternalWriteReady"].pop("probe")
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact())
+            windows_path = self._write_artifact(directory, "windows.json", windows)
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("windows: MCP external-write readiness proof is missing", findings)
+        self.assertFalse(report["results"]["windows"]["proofs"]["mcpExternalWriteReady"])
+
+    def test_parity_report_rejects_windows_artifact_without_live_runner_attestation(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            windows = _windows_artifact()
+            windows["checks"].pop("windowsLiveProofRunner")
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact())
+            windows_path = self._write_artifact(directory, "windows.json", windows)
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("windows: Windows live proof runner attestation is missing", findings)
+        self.assertFalse(report["results"]["windows"]["proofs"]["windowsLiveProofRunner"])
+
+    def test_parity_report_rejects_windows_artifact_without_runner_age_contract(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            windows = _windows_artifact()
+            windows["checks"]["windowsLiveProofRunner"]["maxArtifactAgeHours"] = 48.0
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact())
+            windows_path = self._write_artifact(directory, "windows.json", windows)
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("windows: Windows live proof runner attestation is missing", findings)
+        self.assertFalse(report["results"]["windows"]["proofs"]["windowsLiveProofRunner"])
+
+    def test_parity_report_rejects_windows_artifact_without_runner_stage_contract(self) -> None:
+        report_module = _load_report_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            windows = _windows_artifact()
+            windows["checks"]["windowsLiveProofRunner"].pop("failureStages")
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact())
+            windows_path = self._write_artifact(directory, "windows.json", windows)
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        findings = "\n".join(report["findings"])
+        self.assertFalse(report["ok"])
+        self.assertIn("windows: Windows live proof runner attestation is missing", findings)
+        self.assertFalse(report["results"]["windows"]["proofs"]["windowsLiveProofRunner"])
 
     def test_parity_report_writes_persisted_output_for_connector_proof(self) -> None:
         report_module = _load_report_module()
@@ -412,6 +561,108 @@ class HostBridgeParityReportTest(unittest.TestCase):
         self.assertTrue(persisted["results"]["macos"]["proofs"]["browserSnapshot"])
         self.assertTrue(persisted["results"]["windows"]["proofs"]["browserActIsolatedPlaywright"])
         self.assertTrue(persisted["results"]["windows"]["proofs"]["clipboardRoundTrip"])
+
+    def test_parity_report_rejects_windows_live_failure_artifact_without_noisy_facet_cascade(self) -> None:
+        report_module = _load_report_module()
+        source = _source()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact())
+            windows_path = self._write_artifact(
+                directory,
+                "windows-failed.json",
+                {
+                    "schemaVersion": 1,
+                    "ok": False,
+                    "mode": "windows_live_proof_failed",
+                    "generatedAt": _now_ms(),
+                    "parityRunId": "parity-run-1",
+                    "source": {
+                        "sourceFingerprint": source["sourceFingerprint"],
+                        "sourceManifestSha256": source["sourceManifestSha256"],
+                        "sourceFileCount": len(source["files"]),
+                    },
+                    "error": "Windows HostBridge live proof requires an interactive desktop session, not Services.",
+                    "preflight": {
+                        "os": {
+                            "isWindows": True,
+                            "sessionName": "Services",
+                            "isElevated": False,
+                        },
+                    },
+                },
+            )
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        self.assertFalse(report["ok"])
+        windows = report["results"]["windows"]
+        self.assertTrue(windows["present"])
+        self.assertFalse(windows["ok"])
+        self.assertEqual(windows["mode"], "windows_live_proof_failed")
+        self.assertEqual(windows["sourceFingerprint"], source["sourceFingerprint"])
+        self.assertEqual(windows["sourceManifestSha256"], source["sourceManifestSha256"])
+        self.assertEqual(windows["sourceFileCount"], len(source["files"]))
+        self.assertIn("interactive desktop session", windows["failureError"])
+        self.assertEqual(windows["failurePreflight"]["sessionName"], "Services")
+        findings = "\n".join(windows["findings"])
+        self.assertIn("Windows live proof runner failed before full proof artifact was produced", findings)
+        self.assertNotIn("required proof facet", findings)
+
+    def test_parity_report_surfaces_windows_live_failure_stage_and_partial_artifact(self) -> None:
+        report_module = _load_report_module()
+        source = _source()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact())
+            windows_path = self._write_artifact(
+                directory,
+                "windows-failed-partial.json",
+                {
+                    "schemaVersion": 1,
+                    "ok": False,
+                    "mode": "windows_live_proof_failed",
+                    "generatedAt": _now_ms(),
+                    "parityRunId": "parity-run-1",
+                    "source": {
+                        "sourceFingerprint": source["sourceFingerprint"],
+                        "sourceManifestSha256": source["sourceManifestSha256"],
+                        "sourceFileCount": len(source["files"]),
+                    },
+                    "failedStage": "live_proof_pipeline",
+                    "nextSteps": {
+                        "failedStage": "live_proof_pipeline",
+                        "commands": [
+                            ".\\atrium.ps1 doctor --json",
+                            ".\\atrium.ps1 report --bundle",
+                        ],
+                    },
+                    "partialArtifact": {
+                        "preserved": True,
+                        "mode": "live",
+                        "checkNames": ["browserRef", "interactiveNotepad"],
+                        "checkCount": 2,
+                    },
+                    "preflight": {
+                        "os": {
+                            "isWindows": True,
+                            "sessionName": "Console",
+                            "isElevated": True,
+                        },
+                    },
+                    "error": "Validate Windows HostBridge artifact failed",
+                },
+            )
+
+            report = report_module.evaluate_artifacts(macos_path, windows_path)
+
+        windows = report["results"]["windows"]
+        self.assertFalse(windows["ok"])
+        self.assertEqual(windows["failureStage"], "live_proof_pipeline")
+        self.assertEqual(windows["failurePartialArtifact"]["checkCount"], 2)
+        self.assertEqual(windows["failureNextSteps"]["failedStage"], "live_proof_pipeline")
+        self.assertIn(".\\atrium.ps1 report --bundle", windows["failureNextSteps"]["commands"])
+        self.assertEqual(windows["failurePreflight"]["sessionName"], "Console")
 
     def test_parity_report_proof_id_changes_when_proof_facet_changes(self) -> None:
         report_module = _load_report_module()
@@ -887,16 +1138,97 @@ class HostBridgeParityReportTest(unittest.TestCase):
             report = report_module.evaluate_artifacts(
                 macos_path,
                 windows_path,
-                current_source={"sourceFingerprint": "c" * 64, "gitHead": "d" * 40, "gitDirty": True},
+                current_source={
+                    "sourceFingerprint": "c" * 64,
+                    "sourceManifestSha256": "e" * 64,
+                    "sourceFileCount": len(_source()["files"]) + 1,
+                    "gitHead": "d" * 40,
+                    "gitDirty": True,
+                },
             )
 
         findings = "\n".join(report["findings"])
         self.assertFalse(report["ok"])
         self.assertIn("macos: artifact sourceFingerprint does not match current HostBridge source", findings)
+        self.assertIn("macos: artifact sourceManifestSha256 does not match current HostBridge source", findings)
+        self.assertIn("windows: artifact sourceFileCount does not match current HostBridge source", findings)
         self.assertIn("windows: artifact gitHead does not match current checkout", findings)
         self.assertEqual(report["currentSource"]["sourceFingerprint"], "c" * 64)
+        self.assertEqual(report["currentSource"]["sourceManifestSha256"], "e" * 64)
+        self.assertEqual(report["currentSource"]["sourceFileCount"], len(_source()["files"]) + 1)
         self.assertFalse(report["results"]["macos"]["ok"])
         self.assertFalse(report["results"]["windows"]["ok"])
+
+    def test_parity_report_rejects_failure_artifact_source_manifest_and_count_mismatch(self) -> None:
+        report_module = _load_report_module()
+        source = _source()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact(source=source))
+            windows_path = self._write_artifact(
+                directory,
+                "windows-failed.json",
+                {
+                    "schemaVersion": 1,
+                    "ok": False,
+                    "mode": "windows_live_proof_failed",
+                    "generatedAt": _now_ms(),
+                    "parityRunId": "parity-run-1",
+                    "sourceFingerprint": source["sourceFingerprint"],
+                    "sourceManifestSha256": "f" * 64,
+                    "sourceFileCount": len(source["files"]) - 1,
+                    "error": "Windows HostBridge live proof requires an interactive desktop session, not Services.",
+                    "preflight": {"os": {"isWindows": True, "sessionName": "Services", "isElevated": False}},
+                },
+            )
+
+            report = report_module.evaluate_artifacts(
+                macos_path,
+                windows_path,
+                current_source=source,
+            )
+
+        self.assertFalse(report["ok"])
+        findings = "\n".join(report["findings"])
+        self.assertIn("source manifest mismatch", findings)
+        self.assertIn("source file count mismatch", findings)
+        self.assertIn("windows: artifact sourceManifestSha256 does not match current HostBridge source", findings)
+        self.assertIn("windows: artifact sourceFileCount does not match current HostBridge source", findings)
+
+    def test_parity_report_flags_stale_windows_live_failure_artifact(self) -> None:
+        report_module = _load_report_module()
+        source = _source()
+        now = 1_800_000_000_000
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            macos_path = self._write_artifact(directory, "macos.json", _macos_artifact(generatedAt=now))
+            windows_path = self._write_artifact(
+                directory,
+                "windows-failed.json",
+                {
+                    "schemaVersion": 1,
+                    "ok": False,
+                    "mode": "windows_live_proof_failed",
+                    "generatedAt": now - (25 * 60 * 60 * 1000),
+                    "parityRunId": "parity-run-1",
+                    "sourceFingerprint": source["sourceFingerprint"],
+                    "sourceManifestSha256": source["sourceManifestSha256"],
+                    "sourceFileCount": len(source["files"]),
+                    "error": "Windows HostBridge live proof requires an interactive desktop session, not Services.",
+                    "preflight": {"os": {"isWindows": True, "sessionName": "Services", "isElevated": False}},
+                },
+            )
+
+            report = report_module.evaluate_artifacts(
+                macos_path,
+                windows_path,
+                current_source=source,
+                now_ms=now,
+            )
+
+        self.assertFalse(report["ok"])
+        self.assertIn("windows: artifact is stale", "\n".join(report["findings"]))
+        self.assertIn("windows: artifact is stale", "\n".join(report["results"]["windows"]["findings"]))
 
     def test_parity_report_can_skip_current_source_check_for_offline_audits(self) -> None:
         report_module = _load_report_module()
@@ -974,6 +1306,10 @@ class HostBridgeParityReportTest(unittest.TestCase):
         self.assertEqual(summary["sourceFileCount"], len(_source()["files"]))
         self.assertTrue(summary["proofs"]["notepadNativeAct"])
         self.assertTrue(summary["proofs"]["browserActIsolatedPlaywright"])
+        self.assertIn("notepadNativeAct", summary["requiredProofFacets"])
+        self.assertEqual(summary["missingProofFacets"], [])
+        self.assertGreater(summary["proofFacetCount"], 0)
+        self.assertEqual(summary["missingProofFacetCount"], 0)
         self.assertEqual(summary["findings"], [])
 
     def test_artifact_summary_rejects_source_mismatch(self) -> None:
@@ -1129,7 +1465,153 @@ class HostBridgeParityReportTest(unittest.TestCase):
 
         self.assertFalse(summary["ok"])
         self.assertFalse(summary["proofs"]["notepadNativeAct"])
+        self.assertIn("notepadNativeAct", summary["missingProofFacets"])
+        self.assertGreater(summary["missingProofFacetCount"], 0)
         self.assertIn("required proof facet notepadNativeAct", " ".join(summary["findings"]))
+
+    def test_artifact_summary_rejects_windows_live_failure_artifact_with_preflight_details(self) -> None:
+        summary_module = _load_summary_module()
+        source = _source()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            artifact = {
+                "schemaVersion": 1,
+                "ok": False,
+                "mode": "windows_live_proof_failed",
+                "generatedAt": _now_ms(),
+                "parityRunId": "parity-run-1",
+                "preflight": {
+                    "sourceFingerprint": source["sourceFingerprint"],
+                    "sourceManifestSha256": source["sourceManifestSha256"],
+                    "sourceFileCount": len(source["files"]),
+                    "os": {
+                        "isWindows": True,
+                        "sessionName": "Services",
+                        "isElevated": False,
+                    },
+                },
+                "error": "Windows HostBridge live proof requires an interactive desktop session, not Services.",
+            }
+            artifact_path = self._write_artifact(directory, "windows-failed.json", artifact)
+
+            summary = summary_module.summarize_artifact(
+                artifact_path,
+                label="windows",
+                expect_parity_run_id="parity-run-1",
+                expect_source_fingerprint=source["sourceFingerprint"],
+                expect_source_manifest_sha256=source["sourceManifestSha256"],
+                expect_source_file_count=len(source["files"]),
+                max_artifact_age_hours=24.0,
+            )
+
+        self.assertFalse(summary["ok"])
+        self.assertEqual(summary["mode"], "windows_live_proof_failed")
+        self.assertEqual(summary["sourceFingerprint"], source["sourceFingerprint"])
+        self.assertEqual(summary["sourceManifestSha256"], source["sourceManifestSha256"])
+        self.assertEqual(summary["sourceFileCount"], len(source["files"]))
+        self.assertIn("Windows live proof runner failed before full proof artifact was produced", " ".join(summary["findings"]))
+        self.assertIn("interactive desktop session", summary["failureError"])
+        self.assertEqual(summary["failurePreflight"]["sessionName"], "Services")
+        self.assertFalse(summary["proofs"]["browserOpen"])
+
+    def test_artifact_summary_surfaces_windows_live_failure_stage_and_partial_artifact(self) -> None:
+        summary_module = _load_summary_module()
+        source = _source()
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            artifact = {
+                "schemaVersion": 1,
+                "ok": False,
+                "mode": "windows_live_proof_failed",
+                "generatedAt": _now_ms(),
+                "parityRunId": "parity-run-1",
+                "source": {
+                    "sourceFingerprint": source["sourceFingerprint"],
+                    "sourceManifestSha256": source["sourceManifestSha256"],
+                    "sourceFileCount": len(source["files"]),
+                },
+                "failedStage": "live_proof_pipeline",
+                "nextSteps": {
+                    "failedStage": "live_proof_pipeline",
+                    "commands": [
+                        ".\\atrium.ps1 doctor --json",
+                        ".\\atrium.ps1 report --bundle",
+                    ],
+                },
+                "partialArtifact": {
+                    "preserved": True,
+                    "mode": "live",
+                    "checkNames": ["browserRef", "interactiveNotepad"],
+                    "checkCount": 2,
+                },
+                "preflight": {
+                    "os": {
+                        "isWindows": True,
+                        "sessionName": "Console",
+                        "isElevated": True,
+                    },
+                },
+                "error": "Validate Windows HostBridge artifact failed",
+            }
+            artifact_path = self._write_artifact(directory, "windows-failed-partial.json", artifact)
+
+            summary = summary_module.summarize_artifact(
+                artifact_path,
+                label="windows",
+                expect_parity_run_id="parity-run-1",
+                expect_source_fingerprint=source["sourceFingerprint"],
+                expect_source_manifest_sha256=source["sourceManifestSha256"],
+                expect_source_file_count=len(source["files"]),
+                max_artifact_age_hours=24.0,
+            )
+
+        self.assertFalse(summary["ok"])
+        self.assertEqual(summary["failureStage"], "live_proof_pipeline")
+        self.assertEqual(summary["failurePartialArtifact"]["mode"], "live")
+        self.assertEqual(summary["failurePartialArtifact"]["checkCount"], 2)
+        self.assertEqual(summary["failureNextSteps"]["failedStage"], "live_proof_pipeline")
+        self.assertIn(".\\atrium.ps1 report --bundle", summary["failureNextSteps"]["commands"])
+        self.assertEqual(summary["failurePreflight"]["sessionName"], "Console")
+
+    def test_artifact_summary_flags_stale_windows_live_failure_source(self) -> None:
+        summary_module = _load_summary_module()
+        source = _source()
+        stale_fingerprint = "f" * 64
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            artifact_path = self._write_artifact(
+                directory,
+                "windows-failed-stale.json",
+                {
+                    "schemaVersion": 1,
+                    "ok": False,
+                    "mode": "windows_live_proof_failed",
+                    "generatedAt": _now_ms() - (25 * 60 * 60 * 1000),
+                    "parityRunId": "parity-run-1",
+                    "sourceFingerprint": stale_fingerprint,
+                    "sourceManifestSha256": stale_fingerprint,
+                    "sourceFileCount": len(source["files"]) - 1,
+                    "error": "uv is required on PATH before running the Windows HostBridge live proof.",
+                    "preflight": {"os": {"isWindows": True, "sessionName": "Console", "isElevated": False}},
+                },
+            )
+
+            summary = summary_module.summarize_artifact(
+                artifact_path,
+                label="windows",
+                expect_parity_run_id="parity-run-1",
+                expect_source_fingerprint=source["sourceFingerprint"],
+                expect_source_manifest_sha256=source["sourceManifestSha256"],
+                expect_source_file_count=len(source["files"]),
+                max_artifact_age_hours=24.0,
+            )
+
+        self.assertFalse(summary["ok"])
+        findings = "\n".join(summary["findings"])
+        self.assertIn("sourceFingerprint mismatch", findings)
+        self.assertIn("sourceManifestSha256 mismatch", findings)
+        self.assertIn("sourceFileCount mismatch", findings)
+        self.assertIn("artifact is stale", findings)
 
     def test_source_summary_rejects_source_mismatch_before_probe_handoff(self) -> None:
         source_summary_module = _load_source_summary_module()

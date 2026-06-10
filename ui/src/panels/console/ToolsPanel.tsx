@@ -6,7 +6,7 @@ import { ACCENT_HEX } from '../../lib/visuals'
 import { relTime } from '../../lib/format'
 import { isExec } from '../../lib/threads'
 import { isHumanApproval } from '../../lib/approvals'
-import type { ToolCatalogItem, ToolName, ToolRun, ToolRunStatus, ToolRiskClass, Approval, PolicyMode } from '../../contract/types'
+import type { NativeRuntimeCommandKey, NativeRuntimeStatus, RuntimeStatusResponse, ToolCatalogItem, ToolName, ToolRun, ToolRunStatus, ToolRiskClass, Approval, PolicyMode } from '../../contract/types'
 import { Section, Loading, Empty, ErrorNote, Row, PrimaryBtn, GhostBtn, Tabs, FormCard, SubLabel, useAsync, useDepts, useNow } from './shared'
 
 type Tab = 'run' | 'runs' | 'approvals'
@@ -14,6 +14,39 @@ const TABS: { id: Tab; label: string }[] = [
   { id: 'run', label: 'แค็ตตาล็อก/รัน' },
   { id: 'runs', label: 'ประวัติการรัน' },
   { id: 'approvals', label: 'รออนุมัติ' },
+]
+
+const NATIVE_RUNTIME_COMMAND_KEYS: NativeRuntimeCommandKey[] = [
+  'doctorJson',
+  'statusJson',
+  'start',
+  'stop',
+  'restart',
+  'logsJson',
+  'reportBundle',
+  'providerStatus',
+  'providerReference',
+  'providerEnv',
+  'providerLoginChatGPT',
+  'providerLoginClaudeCode',
+  'providerDisconnectChatGPT',
+  'providerDisconnectClaudeCode',
+  'toolsStatus',
+  'toolsMcpGateway',
+  'toolsMcpProbe',
+  'toolsCatalog',
+  'permissionsStatus',
+  'permissionsFullAuto',
+  'automationStatus',
+  'automationSource',
+  'automationHandoff',
+  'automationSmoke',
+  'automationReport',
+  'automationAudit',
+  'automationWindowsProbe',
+  'automationWindowsLiveProof',
+  'automationWindowsArtifactValidate',
+  'automationAcceptWindows',
 ]
 
 const LEGACY_TOOLS = new Set<ToolName>(['read_file', 'write_file', 'http_get', 'run_command'])
@@ -101,6 +134,19 @@ function shellExampleCommand(): string[] {
     : ['pwd']
 }
 
+function displayText(value: unknown, fallback = '—'): string {
+  if (typeof value === 'string' && value.trim()) return value
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+  if (typeof value === 'boolean') return value ? 'yes' : 'no'
+  return fallback
+}
+
+function readinessLabel(value: unknown): { label: string; color: string } {
+  if (value === true) return { label: 'ready', color: ACCENT_HEX.teal }
+  if (value === false) return { label: 'not ready', color: ACCENT_HEX.coral }
+  return { label: 'unknown', color: ACCENT_HEX.honey }
+}
+
 function defaultArgsText(tool: ToolName): string {
   const desktopApp = desktopExampleAppName()
   const shellCommand = shellExampleCommand()
@@ -176,6 +222,7 @@ function CatalogAndRun() {
         <span className="text-[11px] font-medium text-[var(--color-cream-dim)]">สิทธิ์กลางของบริษัท</span>
         <Pill color={policy.hex}>{policy.label}</Pill>
       </div>
+      <NativeRuntimeCard />
       <RunForm catalog={catalog} />
       {error && <ErrorNote error={error} onRetry={reload} />}
       {loading && !data ? (
@@ -199,6 +246,94 @@ function CatalogAndRun() {
         </div>
       )}
     </div>
+  )
+}
+
+function NativeRuntimeCard() {
+  const { data, loading, error, reload } = useAsync(() => client.getRuntimeStatus(), [])
+  const runtime: RuntimeStatusResponse | null = data
+  const nativeRuntime: NativeRuntimeStatus | undefined = runtime?.v2?.nativeRuntime
+  const commands = nativeRuntime?.commands ?? {}
+  const commandCount = Object.keys(commands).length
+  const browser = readinessLabel(nativeRuntime?.browserAutomationReady)
+  const desktop = readinessLabel(nativeRuntime?.desktopAutomationReady)
+  const fullAutonomy = runtime?.v2?.fullAutonomy
+  const fullAutonomyReady = fullAutonomy && typeof fullAutonomy === 'object' ? (fullAutonomy as Record<string, unknown>).ready : undefined
+  const fullAuto = readinessLabel(fullAutonomyReady)
+  const cardColor = runtime?.ok ? ACCENT_HEX.teal : ACCENT_HEX.honey
+
+  return (
+    <FormCard
+      title={
+        <div className="flex items-center justify-between gap-2">
+          <span>native runtime</span>
+          <button
+            type="button"
+            onClick={reload}
+            className="rounded-lg border px-2 py-0.5 text-[10px]"
+            style={{ borderColor: withAlpha(cardColor, 0.35), color: cardColor }}
+          >
+            refresh
+          </button>
+        </div>
+      }
+    >
+      {loading && !runtime ? (
+        <Loading />
+      ) : error ? (
+        <ErrorNote error={error} onRetry={reload} />
+      ) : (
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Pill color={cardColor}>{runtime?.ok ? 'runtime ready' : 'runtime needs attention'}</Pill>
+            <Pill color={nativeRuntime?.nativeOnly ? ACCENT_HEX.teal : ACCENT_HEX.coral}>
+              {nativeRuntime?.nativeOnly ? 'native only' : 'native gap'}
+            </Pill>
+            <Pill color={nativeRuntime?.windowsNativePrimary ? ACCENT_HEX.teal : ACCENT_HEX.honey}>
+              windows primary
+            </Pill>
+            <Pill color={nativeRuntime?.windowsNativeHostOnly === true ? ACCENT_HEX.teal : ACCENT_HEX.coral}>
+              native host only
+            </Pill>
+          </div>
+          <div className="grid grid-cols-2 gap-2 text-[11px] text-[var(--color-cream-dim)]">
+            <div className="rounded-lg border p-2" style={{ borderColor: 'var(--color-line-soft)', background: 'var(--color-surface)' }}>
+              <div className="text-[10px] text-[var(--color-cream-faint)]">launcher</div>
+              <div className="mt-0.5 font-mono text-[11px] text-[var(--color-cream)]">{displayText(nativeRuntime?.launcher)}</div>
+            </div>
+            <div className="rounded-lg border p-2" style={{ borderColor: 'var(--color-line-soft)', background: 'var(--color-surface)' }}>
+              <div className="text-[10px] text-[var(--color-cream-faint)]">host</div>
+              <div className="mt-0.5 font-mono text-[11px] text-[var(--color-cream)]">{displayText(nativeRuntime?.hostPlatform)}</div>
+            </div>
+            <div className="rounded-lg border p-2" style={{ borderColor: 'var(--color-line-soft)', background: 'var(--color-surface)' }}>
+              <div className="text-[10px] text-[var(--color-cream-faint)]">browser tools</div>
+              <Pill color={browser.color}>{browser.label}</Pill>
+            </div>
+            <div className="rounded-lg border p-2" style={{ borderColor: 'var(--color-line-soft)', background: 'var(--color-surface)' }}>
+              <div className="text-[10px] text-[var(--color-cream-faint)]">desktop tools</div>
+              <Pill color={desktop.color}>{desktop.label}</Pill>
+            </div>
+            <div className="rounded-lg border p-2" style={{ borderColor: 'var(--color-line-soft)', background: 'var(--color-surface)' }}>
+              <div className="text-[10px] text-[var(--color-cream-faint)]">automation permission</div>
+              <Pill color={fullAuto.color}>{fullAuto.label}</Pill>
+            </div>
+            <div className="rounded-lg border p-2" style={{ borderColor: 'var(--color-line-soft)', background: 'var(--color-surface)' }}>
+              <div className="text-[10px] text-[var(--color-cream-faint)]">native commands</div>
+              <div className="mt-0.5 font-mono text-[11px] text-[var(--color-cream)]">{commandCount}</div>
+            </div>
+          </div>
+          {commandCount > 0 && (
+            <div className="grid grid-cols-2 gap-1.5 text-[10px] text-[var(--color-cream-faint)]">
+              {NATIVE_RUNTIME_COMMAND_KEYS.map((key) => (
+                <div key={key} className="min-w-0 truncate rounded border px-2 py-1 font-mono" style={{ borderColor: 'var(--color-line-soft)', background: 'var(--color-surface)' }}>
+                  {key}: {commands[key] ?? '—'}
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+    </FormCard>
   )
 }
 

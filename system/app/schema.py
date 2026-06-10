@@ -1582,6 +1582,8 @@ class HostBridgeParityStatusResponse(Schema):
     gaps: list[str] = Field(default_factory=list)
     report: dict[str, Any] = Field(default_factory=dict)
     local: dict[str, Any] = Field(default_factory=dict)
+    local_artifacts: dict[str, Any] = Field(default_factory=dict)
+    native_parity_matrix: dict[str, Any] = Field(default_factory=dict)
     contract: dict[str, Any] = Field(default_factory=dict)
     connectors: list[HostBridgeParityConnectorProof] = Field(default_factory=list)
     commands: dict[str, str] = Field(default_factory=dict)

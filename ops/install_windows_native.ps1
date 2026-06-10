@@ -33,6 +33,39 @@ function Test-AnyCommand {
     return $false
 }
 
+function ConvertTo-PowerShellSingleQuotedLiteral {
+    param([string]$Value)
+    return "'" + ($Value -replace "'", "''") + "'"
+}
+
+function Resolve-PowerShell {
+    foreach ($name in @("powershell.exe", "powershell", "pwsh.exe", "pwsh")) {
+        $command = Get-Command $name -ErrorAction SilentlyContinue
+        if ($command) {
+            if ($command.Source) {
+                return $command.Source
+            }
+            return $name
+        }
+    }
+    $standardPaths = [System.Collections.Generic.List[string]]::new()
+    if ($env:SystemRoot) {
+        $standardPaths.Add((Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"))
+        $standardPaths.Add((Join-Path $env:SystemRoot "SysWOW64\WindowsPowerShell\v1.0\powershell.exe"))
+    }
+    foreach ($root in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if ($root) {
+            $standardPaths.Add((Join-Path $root "PowerShell\7\pwsh.exe"))
+        }
+    }
+    foreach ($path in $standardPaths) {
+        if ($path -and (Test-Path $path)) {
+            return $path
+        }
+    }
+    throw "PowerShell is required to run ATRIUM native setup. Install Windows PowerShell or PowerShell 7, then rerun this installer."
+}
+
 function Invoke-Native {
     param(
         [string]$FilePath,
@@ -42,6 +75,33 @@ function Invoke-Native {
     & $FilePath @ArgumentList
     if ($LASTEXITCODE -ne 0) {
         throw "$FailureMessage (exit code $LASTEXITCODE)."
+    }
+}
+
+function Invoke-WingetInstall {
+    param(
+        [string]$PackageId,
+        [string]$DisplayName
+    )
+    $installArgs = @("install", "--id", $PackageId, "--exact", "--accept-source-agreements", "--accept-package-agreements")
+    try {
+        Invoke-Native -FilePath "winget" -ArgumentList $installArgs -FailureMessage "$DisplayName winget install failed"
+        return
+    }
+    catch {
+        $firstError = $_.Exception.Message
+        Write-Host "$DisplayName winget install failed once: $firstError"
+        Write-Host "Refreshing winget sources and retrying $DisplayName install."
+        try {
+            & winget source update
+            if ($LASTEXITCODE -ne 0) {
+                Write-Host "winget source update exited with code $LASTEXITCODE; retrying install anyway."
+            }
+        }
+        catch {
+            Write-Host "winget source update failed: $($_.Exception.Message); retrying install anyway."
+        }
+        Invoke-Native -FilePath "winget" -ArgumentList $installArgs -FailureMessage "$DisplayName winget install failed after source refresh. First attempt: $firstError"
     }
 }
 
@@ -93,6 +153,8 @@ function Add-CommonPaths {
         "$env:ProgramFiles\Git\cmd",
         "$env:ProgramFiles\nodejs",
         "$env:ProgramFiles\Docker\Docker\resources\bin",
+        "$env:ProgramFiles\PowerShell\7",
+        "${env:ProgramFiles(x86)}\PowerShell\7",
         "$env:LocalAppData\Programs\Python\Launcher",
         "$env:LocalAppData\Programs\Python\Python312",
         "$env:LocalAppData\Programs\Python\Python312\Scripts",
@@ -144,7 +206,7 @@ function Install-WingetPackageIfMissing {
         throw "$DisplayName is missing and winget is unavailable. Install $DisplayName manually, then rerun this installer."
     }
     Write-Step "Install $DisplayName"
-    Invoke-Native -FilePath "winget" -ArgumentList @("install", "--id", $PackageId, "--exact", "--accept-source-agreements", "--accept-package-agreements") -FailureMessage "$DisplayName winget install failed"
+    Invoke-WingetInstall -PackageId $PackageId -DisplayName $DisplayName
     Add-CommonPaths
     if (-not (Test-AnyCommand $CommandName)) {
         $expected = $CommandName -join " or "
@@ -155,7 +217,8 @@ function Install-WingetPackageIfMissing {
 function Test-Python3Available {
     $candidates = @(
         @{ Exe = "py"; Args = @("-3", "--version") },
-        @{ Exe = "python"; Args = @("--version") }
+        @{ Exe = "python"; Args = @("--version") },
+        @{ Exe = "python3"; Args = @("--version") }
     )
     foreach ($candidate in $candidates) {
         if (-not (Test-Command $candidate.Exe)) {
@@ -183,7 +246,7 @@ function Install-PythonIfMissing {
         throw "Python 3 is missing and winget is unavailable. Install Python 3 manually, then rerun this installer."
     }
     Write-Step "Install Python 3"
-    Invoke-Native -FilePath "winget" -ArgumentList @("install", "--id", "Python.Python.3.12", "--exact", "--accept-source-agreements", "--accept-package-agreements") -FailureMessage "Python 3 winget install failed"
+    Invoke-WingetInstall -PackageId "Python.Python.3.12" -DisplayName "Python 3"
     Add-CommonPaths
     if (-not (Test-Python3Available)) {
         throw "Python 3 installation did not expose a runnable Python 3 command. Restart PowerShell and rerun this installer, or install Python 3 manually."
@@ -226,7 +289,7 @@ function Install-ClaudeCodeIfMissing {
     if (Test-Command "winget") {
         Write-Step "Install Claude Code"
         try {
-            Invoke-Native -FilePath "winget" -ArgumentList @("install", "--id", "Anthropic.ClaudeCode", "--exact", "--accept-source-agreements", "--accept-package-agreements") -FailureMessage "Claude Code winget install failed"
+            Invoke-WingetInstall -PackageId "Anthropic.ClaudeCode" -DisplayName "Claude Code"
         }
         catch {
             $wingetError = $_.Exception.Message
@@ -313,7 +376,7 @@ if (-not $SkipBrowserInstall -and -not (Test-BrowserInstalled)) {
     if (Test-Command "winget") {
         Write-Step "Install Google Chrome"
         try {
-            Invoke-Native -FilePath "winget" -ArgumentList @("install", "--id", "Google.Chrome", "--exact", "--accept-source-agreements", "--accept-package-agreements") -FailureMessage "Google Chrome winget install failed"
+            Invoke-WingetInstall -PackageId "Google.Chrome" -DisplayName "Google Chrome"
             Add-CommonPaths
         }
         catch {
@@ -323,6 +386,9 @@ if (-not $SkipBrowserInstall -and -not (Test-BrowserInstalled)) {
     }
     else {
         Write-Host "No supported browser was found and winget is unavailable. Install Chrome, Edge, Brave, or Chromium manually, then run .\atrium.ps1 automation status --commands."
+    }
+    if (-not (Test-BrowserInstalled)) {
+        Write-Host "No supported browser is available yet. Install Chrome, Edge, Brave, or Chromium manually, then run .\atrium.ps1 automation status --commands."
     }
 }
 
@@ -350,11 +416,12 @@ else {
 Write-Step "Run ATRIUM native guided setup"
 Push-Location $installFullPath
 try {
+    $powerShellExe = Resolve-PowerShell
     if ($NoStart) {
-        Invoke-Native -FilePath "powershell" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ".\atrium.ps1", "setup", "--yes", "--no-start") -FailureMessage "ATRIUM native setup failed"
+        Invoke-Native -FilePath $powerShellExe -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ".\atrium.ps1", "setup", "--yes", "--no-start") -FailureMessage "ATRIUM native setup failed"
     }
     else {
-        Invoke-Native -FilePath "powershell" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ".\atrium.ps1", "setup", "--yes") -FailureMessage "ATRIUM native setup failed"
+        Invoke-Native -FilePath $powerShellExe -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ".\atrium.ps1", "setup", "--yes") -FailureMessage "ATRIUM native setup failed"
     }
 }
 finally {
@@ -365,24 +432,50 @@ Write-Host ""
 Write-Host "ATRIUM frontend: http://127.0.0.1:5173"
 Write-Host "ATRIUM backend:  http://127.0.0.1:8787"
 Write-Host ""
+$installPathLiteral = ConvertTo-PowerShellSingleQuotedLiteral $installFullPath
+Write-Host "ATRIUM repo:"
+Write-Host "  $installFullPath"
+Write-Host "Run the next commands from the repo directory:"
+Write-Host "  Set-Location -LiteralPath $installPathLiteral"
 Write-Host "Next native Windows checks:"
+Write-Host "  .\atrium.ps1 doctor"
+Write-Host "  .\atrium.ps1 doctor --json"
+Write-Host "  .\atrium.ps1 start"
 Write-Host "  .\atrium.ps1 provider status --probe"
 Write-Host "  .\atrium.ps1 provider status --probe --json"
+Write-Host "  .\atrium.ps1 provider reference"
+Write-Host "  .\atrium.ps1 provider reference --json"
+Write-Host "  .\atrium.ps1 provider env"
+Write-Host "  .\atrium.ps1 provider env --json"
 Write-Host "  .\atrium.ps1 provider login chatgpt"
 Write-Host "  .\atrium.ps1 provider login claude-code"
+Write-Host "  .\atrium.ps1 provider disconnect chatgpt"
+Write-Host "  .\atrium.ps1 provider disconnect claude-code"
+Write-Host "  .\atrium.ps1 permissions status"
+Write-Host "  .\atrium.ps1 permissions status --json"
+Write-Host "  .\atrium.ps1 permissions set full_auto --agent-full-access true"
 Write-Host "  .\atrium.ps1 tools status"
 Write-Host "  .\atrium.ps1 tools status --json"
+Write-Host "  .\atrium.ps1 tools mcp-gateway --json"
+Write-Host "  .\atrium.ps1 tools mcp-probe --json"
 Write-Host "  .\atrium.ps1 tools catalog"
 Write-Host "  .\atrium.ps1 tools catalog --json"
 Write-Host "  .\atrium.ps1 automation status --commands"
 Write-Host "  .\atrium.ps1 automation status --json"
+Write-Host "  .\atrium.ps1 automation source --json"
+Write-Host "  .\atrium.ps1 automation smoke --browser-url http://127.0.0.1:5173 --browser-profile atrium --output C:\Temp\atrium_host_bridge_windows_smoke.json"
+Write-Host "  .\atrium.ps1 automation windows-live-proof --parity-run-id <run-id> --source-fingerprint <fingerprint> --source-manifest-sha256 <manifest> --source-file-count <count> --max-artifact-age-hours 24.0 --output C:\Temp\atrium_host_bridge_windows_live.json"
+Write-Host "  .\atrium.ps1 automation artifact --label windows --expect-parity-run-id <run-id> --expect-source-fingerprint <fingerprint> --expect-source-manifest-sha256 <manifest> --expect-source-file-count <count> --max-artifact-age-hours 24.0 --json C:\Temp\atrium_host_bridge_windows_live.json"
 Write-Host "  .\atrium.ps1 automation audit"
+Write-Host "  .\atrium.ps1 automation windows-probe --full --browser-url http://127.0.0.1:5173 --browser-profile atrium --output C:\Temp\atrium_host_bridge_windows_probe.json  # raw diagnostic; automation smoke is the normal native smoke command"
 Write-Host "  .\atrium.ps1 status"
 Write-Host "  .\atrium.ps1 status --json"
 Write-Host "  .\atrium.ps1 logs"
 Write-Host "  .\atrium.ps1 logs --json"
 Write-Host "  .\atrium.ps1 report"
 Write-Host "  .\atrium.ps1 report --bundle"
+Write-Host "  .\atrium.ps1 stop"
 Write-Host "  .\atrium.ps1 restart"
 Write-Host "Optional cmd.exe shim:"
+Write-Host "  cd /d ""$installFullPath"""
 Write-Host "  atrium.cmd status"

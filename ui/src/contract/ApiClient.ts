@@ -65,6 +65,7 @@ import type {
   HealthResponse,
   HandoffMessage,
   HostBridgeParityStatusResponse,
+  RuntimeStatusResponse,
   AttachmentReferenceInput,
   ImportFileInput,
   ImportFileResponse,
@@ -1119,6 +1120,7 @@ export class ApiClient implements CompanyClient {
   artifactOpenUrl = (artifactId: string, version?: number): string =>
     `${this.baseUrl}/api/artifacts/${encodeURIComponent(artifactId)}/download${this.qs({ version, inline: true })}`
   getHealth = (): Promise<HealthResponse> => this.request('/health', 'GET')
+  getRuntimeStatus = (): Promise<RuntimeStatusResponse> => this.request('/api/runtime', 'GET')
   getVersionStatus = (): Promise<VersionStatusResponse> => this.request('/api/version', 'GET')
   updateVersion = (input: VersionUpdateInput = { restart: true }): Promise<VersionUpdateResponse> =>
     this.request('/api/version/update', 'POST', input)

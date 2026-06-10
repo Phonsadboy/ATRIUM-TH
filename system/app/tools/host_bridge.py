@@ -48,6 +48,7 @@ _MACOS_PREFLIGHT_CACHE: tuple[float, dict[str, Any]] | None = None
 _MACOS_ACCESSIBILITY_CACHE_TTL_SECONDS = 10.0
 _MACOS_ACCESSIBILITY_CACHE: tuple[float, bool | None] | None = None
 _BROWSER_PLAYWRIGHT_PACKAGE_CACHE_TTL_SECONDS = 10.0
+_BROWSER_PLAYWRIGHT_PACKAGE_TIMEOUT_SECONDS = 60.0
 _BROWSER_PLAYWRIGHT_PACKAGE_CACHE: tuple[float, str, dict[str, Any]] | None = None
 _WINDOWS_VISUAL_PREFLIGHT_TOOLS = {
     "browser.screenshot",
@@ -463,7 +464,7 @@ def _browser_playwright_package_status(node_executable: str | None = None) -> di
             cwd=str(cwd),
             text=True,
             capture_output=True,
-            timeout=5.0,
+            timeout=_BROWSER_PLAYWRIGHT_PACKAGE_TIMEOUT_SECONDS,
         )
         raw = (completed.stdout or "").strip().splitlines()[-1] if (completed.stdout or "").strip() else ""
         parsed = json.loads(raw) if raw else {}
