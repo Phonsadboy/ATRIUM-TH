@@ -2513,6 +2513,12 @@ def summarize_local_proof_artifacts(payload: object) -> list[str]:
         run_id = item.get("parityRunId")
         if isinstance(run_id, str) and run_id:
             parts.append(f"run={run_id}")
+        artifact_bytes = item.get("artifactBytes")
+        if isinstance(artifact_bytes, int) and not isinstance(artifact_bytes, bool) and artifact_bytes > 0:
+            parts.append(f"artifactBytes={artifact_bytes}")
+        artifact_sha = item.get("artifactSha256")
+        if isinstance(artifact_sha, str) and re.fullmatch(r"[0-9a-f]{64}", artifact_sha):
+            parts.append(f"artifactSha256={artifact_sha[:12]}")
         proof_facets = item.get("proofFacetCount") or item.get("expectedProofFacetCount")
         if isinstance(proof_facets, int) and proof_facets > 0:
             parts.append(f"proofFacets={proof_facets}")
