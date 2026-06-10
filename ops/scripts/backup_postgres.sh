@@ -38,15 +38,44 @@ docker_bin() {
   fi
 }
 
+pgvector_available() {
+  local pg_url="$1"
+  local result=""
+  if command -v psql >/dev/null 2>&1; then
+    result="$(psql -Atq --dbname "$pg_url" -c "SELECT to_regtype('vector') IS NOT NULL" 2>/dev/null || true)"
+    [[ "$result" == "t" || "$result" == "true" || "$result" == "1" ]]
+    return
+  fi
+
+  local docker
+  if docker="$(docker_bin)" && "$docker" info >/dev/null 2>&1; then
+    result="$("$docker" exec "$POSTGRES_CONTAINER" psql -Atq -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT to_regtype('vector') IS NOT NULL" 2>/dev/null || true)"
+    [[ "$result" == "t" || "$result" == "true" || "$result" == "1" ]]
+    return
+  fi
+  return 1
+}
+
+include_vector_extension() {
+  local pg_url="$1"
+  case "${ATRIUM_BACKUP_INCLUDE_VECTOR_EXTENSION:-auto}" in
+    1|true|TRUE|yes|YES|on|ON) return 0 ;;
+    0|false|FALSE|no|NO|off|OFF) return 1 ;;
+  esac
+  pgvector_available "$pg_url"
+}
+
 run_pg_dump() {
   local pg_url
   pg_url="$(normalize_pg_url "$DATABASE_URL")"
   local schema_args=()
   if [[ -n "$BACKUP_SCHEMA" && "$BACKUP_SCHEMA" != "all" ]]; then
     schema_args+=(--schema="$BACKUP_SCHEMA")
-    # Schema-scoped dumps do not include extensions from public, but the live
-    # atrium schema can contain pgvector columns that require this extension.
-    printf 'CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;\n'
+    # Schema-scoped dumps do not include extensions from public. Emit the
+    # pgvector prelude only when the source database actually has pgvector.
+    if include_vector_extension "$pg_url"; then
+      printf 'CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;\n'
+    fi
   fi
   if command -v pg_dump >/dev/null 2>&1; then
     pg_dump "${schema_args[@]}" "$pg_url"

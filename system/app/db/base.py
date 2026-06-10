@@ -242,15 +242,7 @@ async def init_db() -> None:
         if not migrations_current:
             await _run_postgres_migrations()
         async with engine.begin() as conn:
-            vector_ready = False
-            try:
-                await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-                vector_ready = True
-            except Exception:
-                try:
-                    vector_ready = bool((await conn.execute(text("SELECT to_regtype('vector') IS NOT NULL"))).scalar())
-                except Exception:
-                    vector_ready = False
+            vector_ready = await _postgres_vector_ready(conn)
             if vector_ready:
                 await _ensure_postgres_vector_schema(conn)
         return
@@ -259,15 +251,7 @@ async def init_db() -> None:
     async with engine.begin() as conn:
         vector_ready = False
         if settings.is_postgres:
-            # pgvector is optional; ignore if the extension isn't installed.
-            try:
-                await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-                vector_ready = True
-            except Exception:
-                try:
-                    vector_ready = bool((await conn.execute(text("SELECT to_regtype('vector') IS NOT NULL"))).scalar())
-                except Exception:
-                    vector_ready = False
+            vector_ready = await _postgres_vector_ready(conn)
         await conn.run_sync(Base.metadata.create_all)
         if settings.is_postgres and vector_ready:
             await _ensure_postgres_vector_schema(conn)
@@ -501,6 +485,27 @@ async def _ensure_sqlite_additive_schema(conn) -> None:
         await conn.execute(text(f'CREATE INDEX IF NOT EXISTS "{index_name}" ON "{table_name}" ({column_sql})'))
 
 
+async def _try_postgres_statement(conn, sql: str) -> bool:
+    try:
+        async with conn.begin_nested():
+            await conn.execute(text(sql))
+        return True
+    except Exception:
+        return False
+
+
+async def _postgres_vector_ready(conn) -> bool:
+    # pgvector is optional; failed extension creation must not abort the outer
+    # startup transaction on Windows/native Postgres installs without pgvector.
+    if await _try_postgres_statement(conn, "CREATE EXTENSION IF NOT EXISTS vector"):
+        return True
+    try:
+        async with conn.begin_nested():
+            return bool((await conn.execute(text("SELECT to_regtype('vector') IS NOT NULL"))).scalar())
+    except Exception:
+        return False
+
+
 async def _ensure_postgres_vector_schema(conn) -> None:
     """Best-effort pgvector column for semantic retrieval when Postgres has pgvector."""
     dim = int(get_settings().embedding_dim)
@@ -511,20 +516,18 @@ async def _ensure_postgres_vector_schema(conn) -> None:
         'ADD COLUMN IF NOT EXISTS embedding_ts BIGINT',
     ):
         await conn.execute(text(f'ALTER TABLE "memory_knowledge" {column_sql}'))
-    try:
-        await conn.execute(text(f'ALTER TABLE "memory_knowledge" ADD COLUMN IF NOT EXISTS embedding_vector vector({dim})'))
-    except Exception:
+    if not await _try_postgres_statement(
+        conn,
+        f'ALTER TABLE "memory_knowledge" ADD COLUMN IF NOT EXISTS embedding_vector vector({dim})',
+    ):
         return
-    try:
-        async with conn.begin_nested():
-            await conn.execute(text(
-                'CREATE INDEX IF NOT EXISTS "ix_memory_knowledge_embedding_vector" '
-                'ON "memory_knowledge" USING ivfflat (embedding_vector vector_cosine_ops)'
-            ))
-    except Exception:
-        # Some pgvector versions/configs require fixed-dimension expression
-        # indexes. Sequential vector search still works without this index.
-        pass
+    # Some pgvector versions/configs require fixed-dimension expression indexes.
+    # Sequential vector search still works without this index.
+    await _try_postgres_statement(
+        conn,
+        'CREATE INDEX IF NOT EXISTS "ix_memory_knowledge_embedding_vector" '
+        'ON "memory_knowledge" USING ivfflat (embedding_vector vector_cosine_ops)',
+    )
 
 
 async def dispose_db() -> None:

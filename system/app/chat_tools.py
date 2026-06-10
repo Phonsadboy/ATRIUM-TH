@@ -484,7 +484,8 @@ def chat_tool_system_instructions(departments: list[dict[str, Any]], active_dept
         "Use object-store uri/downloadUrl/previewUrl from video artifacts and context packets when referencing rendered files in chat; avoid exposing raw local paths unless includePaths was explicitly needed for a tool call. "
         "For long render/motion/transcribe work, request asyncMode/background, keep the returned jobId/statusUrl/logPath, poll video.job_status for progress/logs/result, use video.cancel_job when the user cancels, and video.resume_job only for failed or cancelled video jobs. "
         "Do not ask the user to re-upload a video when the chat attachment already has projectId, timelineId, renderId, artifactId, mediaHandle, or contextArgs. "
-        "Choose image generation parameters per request instead of relying on environment defaults: use size or width/height/aspectRatio/resolution, quality (or clarity), outputFormat, outputCompression, background, moderation, and n when the user request implies them. "
+        "Choose image generation parameters per request when the user request implies them. Defaults are size=auto, quality=auto, outputFormat=png, background=auto, moderation=auto, and n=1. "
+        "Only send outputCompression when you also set outputFormat to jpeg or webp; never send outputCompression with png or with omitted outputFormat because omitted outputFormat defaults to png. "
         "For gpt-image-2, arbitrary WIDTHxHEIGHT sizes must be divisible by 16, <=3840 per edge, 1:3..3:1 aspect ratio, and 655360..8294400 total pixels; use auto when unsure. "
         "Use quality=low for drafts/fast iterations, medium for normal work, and high for final or high-clarity assets. "
         "Do not request background=transparent with gpt-image-2 because that model does not support transparent backgrounds. "
@@ -1100,8 +1101,8 @@ def chat_tool_definitions(departments: list[dict[str, Any]], active_dept: dict[s
                     "resolution": {"type": "string", "description": "Optional preset with aspectRatio, for example hd, 2k, or 4k."},
                     "quality": {"type": "string", "enum": ["low", "medium", "high", "auto"], "description": "Rendering quality: low=draft/fast, medium=normal, high=final/high clarity, auto=model default."},
                     "clarity": {"type": "string", "description": "Natural-language alias for quality, for example draft, standard, final, sharp, ชัด."},
-                    "outputFormat": {"type": "string", "enum": ["png", "jpeg", "webp"], "description": "File format. Use jpeg for faster opaque photos, png for lossless, webp for compact web assets."},
-                    "outputCompression": {"type": "integer", "minimum": 0, "maximum": 100, "description": "Compression level for jpeg/webp only."},
+                    "outputFormat": {"type": "string", "enum": ["png", "jpeg", "webp"], "description": "File format. Defaults to png when omitted. Use jpeg for faster opaque photos, png for lossless, webp for compact web assets."},
+                    "outputCompression": {"type": "integer", "minimum": 0, "maximum": 100, "description": "Compression level for jpeg/webp only. Do not send this with png or omitted outputFormat; omitted outputFormat defaults to png."},
                     "background": {"type": "string", "enum": ["auto", "opaque", "transparent"], "description": "transparent is not supported by gpt-image-2."},
                     "moderation": {"type": "string", "enum": ["auto", "low"]},
                     "tags": {"type": "array", "items": {"type": "string"}},

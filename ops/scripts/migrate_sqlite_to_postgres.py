@@ -52,13 +52,34 @@ def _row_data(row: Any) -> dict[str, Any]:
     return {column.name: getattr(row, column.name) for column in row.__table__.columns}
 
 
-async def _prepare_target(engine: AsyncEngine, *, replace: bool) -> None:
+async def _prepare_target(engine: AsyncEngine, *, replace: bool) -> bool:
     async with engine.begin() as conn:
-        await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
+        vector_ready = await _pgvector_ready(conn)
         if replace:
             await conn.run_sync(Base.metadata.drop_all)
         await conn.run_sync(Base.metadata.create_all)
-        await conn.execute(text('ALTER TABLE "memory_knowledge" ADD COLUMN IF NOT EXISTS embedding_vector vector'))
+        if vector_ready:
+            await _try_execute(conn, 'ALTER TABLE "memory_knowledge" ADD COLUMN IF NOT EXISTS embedding_vector vector')
+    return vector_ready
+
+
+async def _try_execute(conn, sql: str) -> bool:
+    try:
+        async with conn.begin_nested():
+            await conn.execute(text(sql))
+        return True
+    except Exception:
+        return False
+
+
+async def _pgvector_ready(conn) -> bool:
+    if await _try_execute(conn, "CREATE EXTENSION IF NOT EXISTS vector"):
+        return True
+    try:
+        async with conn.begin_nested():
+            return bool((await conn.execute(text("SELECT to_regtype('vector') IS NOT NULL"))).scalar())
+    except Exception:
+        return False
 
 
 async def _try_create_vector_index(engine: AsyncEngine) -> None:
@@ -83,7 +104,9 @@ async def _copy_table(source: AsyncSession, target: AsyncSession, model: type[Ba
     return len(rows)
 
 
-async def _backfill_vectors_from_stored_json(target: AsyncSession) -> int:
+async def _backfill_vectors_from_stored_json(target: AsyncSession, *, vector_ready: bool) -> int:
+    if not vector_ready:
+        return 0
     rows = (
         await target.execute(
             select(T.MemoryKnowledge.id, T.MemoryKnowledge.embedding).where(T.MemoryKnowledge.embedding.is_not(None))
@@ -101,7 +124,13 @@ async def _backfill_vectors_from_stored_json(target: AsyncSession) -> int:
     return count
 
 
-async def _reembed_knowledge(target: AsyncSession, *, allow_fallback: bool, batch_size: int = 16) -> dict[str, Any]:
+async def _reembed_knowledge(
+    target: AsyncSession,
+    *,
+    allow_fallback: bool,
+    vector_ready: bool,
+    batch_size: int = 16,
+) -> dict[str, Any]:
     embedder = await resolve_embedder()
     if embedder.name.startswith("hash-") and not allow_fallback:
         raise RuntimeError("refusing to migrate knowledge with hash embeddings; start Ollama bge-m3 or pass --allow-fallback-embeddings")
@@ -122,10 +151,11 @@ async def _reembed_knowledge(target: AsyncSession, *, allow_fallback: bool, batc
             await target.execute(
                 update(T.MemoryKnowledge).where(T.MemoryKnowledge.id == knowledge_id).values(embedding=vector)
             )
-            await target.execute(
-                text('UPDATE "memory_knowledge" SET embedding_vector = CAST(:embedding AS vector) WHERE id = :id'),
-                {"id": knowledge_id, "embedding": _vector_literal(vector)},
-            )
+            if vector_ready:
+                await target.execute(
+                    text('UPDATE "memory_knowledge" SET embedding_vector = CAST(:embedding AS vector) WHERE id = :id'),
+                    {"id": knowledge_id, "embedding": _vector_literal(vector)},
+                )
             count += 1
     return {"provider": embedder.name, "dim": getattr(embedder, "dim", None), "count": count}
 
@@ -149,7 +179,7 @@ async def migrate(
     source_engine = create_async_engine(sqlite_url, future=True)
     target_engine = create_async_engine(postgres_url, future=True)
     try:
-        await _prepare_target(target_engine, replace=replace)
+        vector_ready = await _prepare_target(target_engine, replace=replace)
         counts: dict[str, int] = {}
         async with AsyncSession(source_engine, expire_on_commit=False) as source:
             async with AsyncSession(target_engine, expire_on_commit=False) as target:
@@ -159,13 +189,18 @@ async def migrate(
                     counts["memory_knowledge.reembedded"] = await _reembed_knowledge(
                         target,
                         allow_fallback=allow_fallback_embeddings,
+                        vector_ready=vector_ready,
                     )
                 else:
-                    counts["memory_knowledge.embedding_vector"] = await _backfill_vectors_from_stored_json(target)
+                    counts["memory_knowledge.embedding_vector"] = await _backfill_vectors_from_stored_json(
+                        target,
+                        vector_ready=vector_ready,
+                    )
                 await target.commit()
         await _reset_sequences(target_engine)
-        await _try_create_vector_index(target_engine)
-        return {"ok": True, "replace": replace, "counts": counts}
+        if vector_ready:
+            await _try_create_vector_index(target_engine)
+        return {"ok": True, "replace": replace, "pgvector": vector_ready, "counts": counts}
     finally:
         await source_engine.dispose()
         await target_engine.dispose()

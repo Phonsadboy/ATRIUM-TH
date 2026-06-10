@@ -16069,8 +16069,11 @@ async def get_image_generation_status() -> dict[str, Any]:
             "supported": sorted(GPT_IMAGE_MODELS),
             "guidance": (
                 "Use gpt-image-2 by default. Non-primary GPT image models require explicit user approval "
-                "or a prior gpt-image-2 failure. Model, size, quality, format, compression, background, "
-                "and moderation are per-request tool parameters; environment values are only fallback configuration."
+                "or a prior gpt-image-2 failure. Defaults are size=auto, quality=auto, outputFormat=png, "
+                "background=auto, moderation=auto, and n=1. Only send outputCompression when outputFormat "
+                "is explicitly jpeg or webp; do not send outputCompression with png or omitted outputFormat. "
+                "Model, size, quality, format, compression, background, and moderation are per-request tool "
+                "parameters; environment values are only fallback configuration."
             ),
         },
         "requestDefaults": {
@@ -16092,7 +16095,7 @@ async def get_image_generation_status() -> dict[str, Any]:
             "quality": ["low", "medium", "high", "auto"],
             "clarityAliases": {"draft": "low", "standard": "medium", "final": "high", "sharp": "high"},
             "outputFormat": ["png", "jpeg", "webp"],
-            "outputCompression": "0..100, only with jpeg or webp",
+            "outputCompression": "0..100, only when outputFormat is explicitly jpeg or webp; omit for png/default png",
             "background": ["auto", "opaque", "transparent"],
             "moderation": ["auto", "low"],
             "n": "1..10",

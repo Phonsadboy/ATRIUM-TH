@@ -8,6 +8,7 @@ doctor` works immediately after a fresh clone.
 from __future__ import annotations
 
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -20,6 +21,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -387,6 +389,14 @@ def command_path(name: str) -> str | None:
         ):
             if Path(candidate).exists():
                 return candidate
+    if name in {"pg_dump", "psql"} and platform.system() == "Windows":
+        program_files = Path(os.environ.get("ProgramFiles", "C:/Program Files"))
+        postgres_root = program_files / "PostgreSQL"
+        if postgres_root.exists():
+            candidates = sorted(postgres_root.glob(f"*/bin/{name}.exe"), reverse=True)
+            for candidate in candidates:
+                if candidate.exists():
+                    return str(candidate)
     if name == "python3" and platform.system() == "Windows":
         return windows_python3_command()
     if platform.system() == "Windows" and not name.lower().endswith((".exe", ".cmd", ".bat")):
@@ -516,6 +526,132 @@ def docker_ready() -> bool:
     if not docker:
         return False
     return run([docker, "info"], timeout=15).returncode == 0
+
+
+def configured_database_url() -> str:
+    values = parse_env_file(SYSTEM_ENV)
+    return (
+        os.environ.get("ATRIUM_DATABASE_URL")
+        or values.get("ATRIUM_DATABASE_URL")
+        or ""
+    ).strip()
+
+
+def configured_embedding_provider() -> str:
+    values = parse_env_file(SYSTEM_ENV)
+    return (
+        os.environ.get("ATRIUM_EMBEDDING_PROVIDER")
+        or values.get("ATRIUM_EMBEDDING_PROVIDER")
+        or "auto"
+    ).strip().lower()
+
+
+def configured_data_dir() -> Path:
+    values = parse_env_file(SYSTEM_ENV)
+    value = (
+        os.environ.get("ATRIUM_DATA_DIR")
+        or values.get("ATRIUM_DATA_DIR")
+        or "./data"
+    ).strip()
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else SYSTEM_DIR / path
+
+
+def configured_backup_dir() -> Path:
+    values = parse_env_file(SYSTEM_ENV)
+    value = (
+        os.environ.get("ATRIUM_BACKUP_DIR")
+        or values.get("ATRIUM_BACKUP_DIR")
+        or "./data/backups"
+    ).strip()
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else SYSTEM_DIR / path
+
+
+def uses_postgres_database(url: str | None = None) -> bool:
+    value = (url if url is not None else configured_database_url()).strip().lower()
+    return value.startswith(("postgresql://", "postgresql+asyncpg://", "postgres://"))
+
+
+def normalize_pg_tool_url(url: str) -> str:
+    if url.startswith("postgresql+asyncpg://"):
+        return "postgresql://" + url[len("postgresql+asyncpg://") :]
+    return url
+
+
+def _url_host_port(url: str, default_port: int) -> tuple[str, int]:
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return "", default_port
+    host = parsed.hostname or ""
+    try:
+        port = int(parsed.port or default_port)
+    except ValueError:
+        port = default_port
+    return host.lower(), port
+
+
+def _loopback_host(host: str) -> bool:
+    normalized = (host or "").strip().lower().strip("[]")
+    return normalized in {"", "localhost", "127.0.0.1", "::1"}
+
+
+def docker_stack_plan() -> dict[str, object]:
+    """Describe which Docker-backed services would actually help this host."""
+    database_url = configured_database_url()
+    ollama_url = configured_ollama_url()
+    services: list[str] = []
+    required_services: list[str] = []
+    satisfied: list[str] = []
+    notes: list[str] = []
+
+    if uses_postgres_database(database_url):
+        host, port = _url_host_port(database_url, 5432)
+        if host == "postgres":
+            services.append("postgres")
+            required_services.append("postgres")
+        elif _loopback_host(host):
+            if port_open(port):
+                satisfied.append(f"postgres:native:{port}")
+            else:
+                services.append("postgres")
+                required_services.append("postgres")
+        else:
+            satisfied.append(f"postgres:external:{host}:{port}")
+    else:
+        satisfied.append("database:sqlite")
+
+    if ollama_url and not uses_external_ollama(ollama_url):
+        host, port = _url_host_port(ollama_url, 11434)
+        mode = configured_embedding_provider()
+        if host == "ollama":
+            services.append("ollama")
+            if mode in {"local", "ollama"}:
+                required_services.append("ollama")
+        elif _loopback_host(host):
+            if port_open(port):
+                satisfied.append(f"ollama:native:{port}")
+            else:
+                services.append("ollama")
+                if mode in {"local", "ollama"}:
+                    required_services.append("ollama")
+                else:
+                    notes.append("ollama missing; auto embeddings can fall back to hash/Voyage/OpenAI settings")
+        else:
+            satisfied.append(f"ollama:external:{host}:{port}")
+    elif ollama_url:
+        satisfied.append("ollama:external")
+
+    unique_services = list(dict.fromkeys(services))
+    unique_required = list(dict.fromkeys(required_services))
+    return {
+        "services": unique_services,
+        "requiredServices": unique_required,
+        "required": bool(unique_required),
+        "satisfied": satisfied,
+        "notes": notes,
+    }
 
 
 def wait_for_docker_ready(*, seconds: int = 240, assume_yes: bool = False, prompt: bool = True) -> bool:
@@ -1326,10 +1462,18 @@ def docker_report_lines() -> list[str]:
     payload = collect_docker_payload()
     compose_cmd = payload.get("compose")
     docker = command_path("docker")
+    plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
     lines = [
         f"docker.cli={'present' if docker else 'missing'}",
         f"docker.compose={' '.join(compose_cmd) if isinstance(compose_cmd, list) else 'missing'}",
+        f"docker.required={bool_text(plan.get('required'))}",
     ]
+    services = plan.get("services")
+    if isinstance(services, list) and services:
+        lines.append("docker.services=" + ",".join(str(item) for item in services))
+    satisfied = plan.get("satisfied")
+    if isinstance(satisfied, list) and satisfied:
+        lines.append("docker.satisfied=" + ",".join(str(item) for item in satisfied))
     lines.append(f"docker.running={bool_text(payload.get('running'))}")
     if payload.get("error"):
         lines.append(f"docker.error={payload.get('error')}")
@@ -1339,10 +1483,14 @@ def docker_report_lines() -> list[str]:
 def collect_docker_payload() -> dict[str, object]:
     docker = command_path("docker")
     compose_cmd = docker_compose_cmd() if docker else None
+    plan = docker_stack_plan()
     payload: dict[str, object] = {
         "cli": docker or None,
         "compose": compose_cmd,
         "running": False,
+        "plan": plan,
+        "required": bool(plan.get("required")),
+        "requiredServices": plan.get("requiredServices", []),
     }
     if not docker:
         payload["error"] = "docker CLI missing"
@@ -4158,14 +4306,14 @@ def provider_status_from_env() -> list[str]:
 
 def doctor_tool_names() -> tuple[str, ...]:
     if windows_native():
-        return ("git", "node", "pnpm", "uv", "python3", "docker", "winget", "powershell", "claude")
-    return ("git", "brew", "node", "pnpm", "uv", "python3", "docker")
+        return ("git", "node", "pnpm", "uv", "python3", "winget", "powershell", "claude")
+    return ("git", "brew", "node", "pnpm", "uv", "python3")
 
 
 def report_tool_names() -> tuple[str, ...]:
     if windows_native():
-        return ("git", "node", "pnpm", "uv", "python3", "docker", "winget", "powershell", "claude")
-    return ("git", "brew", "node", "pnpm", "uv", "python3", "docker", "screen")
+        return ("git", "node", "pnpm", "uv", "python3", "winget", "powershell", "claude")
+    return ("git", "brew", "node", "pnpm", "uv", "python3", "screen")
 
 
 def command_provider(args: argparse.Namespace) -> int:
@@ -4870,8 +5018,15 @@ def command_doctor(_args: argparse.Namespace) -> int:
     for tool in doctor_tool_names():
         found = report_command_path(tool)
         print_check(bool(found), tool, found or "missing")
-    compose_cmd = docker_compose_cmd()
-    print_check(bool(compose_cmd), "docker compose", " ".join(compose_cmd) if compose_cmd else "missing")
+    docker_payload = collect_docker_payload()
+    docker_plan = docker_payload.get("plan") if isinstance(docker_payload.get("plan"), dict) else {}
+    compose_cmd = docker_payload.get("compose")
+    docker_required = bool(docker_plan.get("required"))
+    if docker_required:
+        print_check(bool(compose_cmd), "docker compose", " ".join(compose_cmd) if isinstance(compose_cmd, list) else "missing")
+    else:
+        detail = " ".join(compose_cmd) if isinstance(compose_cmd, list) else "missing; optional for native/manual services"
+        print_info("docker compose", detail)
     print_check(browser_installed(), "Chromium browser", "Chrome/Edge/Brave/Chromium installed" if browser_installed() else "missing")
 
     print_header("Windows Native Entrypoints")
@@ -5170,29 +5325,45 @@ def atrium_services_running() -> bool:
 
 def start_docker_stack() -> None:
     print_header("Start Docker")
+    plan = docker_stack_plan()
+    services = [str(item) for item in plan.get("services", []) if str(item).strip()]
+    required_services = [str(item) for item in plan.get("requiredServices", []) if str(item).strip()]
+    satisfied = [str(item) for item in plan.get("satisfied", []) if str(item).strip()]
+    if not services:
+        detail = "; ".join(satisfied) if satisfied else "no Docker-backed services required by current env"
+        print_info("Docker", f"not needed; {detail}")
+        return
+
     docker = command_path("docker")
     compose_cmd = docker_compose_cmd() if docker else None
     if not docker or not compose_cmd:
-        if windows_native():
-            raise StepFailure("Docker Compose is unavailable", next_step=f"Install/update Docker Desktop, then run {local_cli_command('doctor')}.")
-        print_check(False, "Docker Compose", "missing")
+        if required_services:
+            raise StepFailure(
+                "Docker Compose is unavailable for required local services",
+                next_step=(
+                    f"Missing services: {', '.join(required_services)}\n"
+                    "Start native Postgres/Ollama, adjust system/.env to point at existing services, "
+                    f"or install/update Docker Desktop and rerun {local_cli_command('start')}."
+                ),
+            )
+        print_info("Docker Compose", f"missing; optional services not started: {', '.join(services)}")
         return
     if run([docker, "info"], timeout=10).returncode != 0:
-        if windows_native():
+        if required_services:
             if not wait_for_docker_ready(seconds=120, assume_yes=True, prompt=False):
                 raise StepFailure(
-                    "Docker is not running",
-                    next_step=f"Open Docker Desktop, accept any Windows prompts, wait until it is running, then run {local_cli_command('start')} again.",
+                    "Docker is not running for required local services",
+                    next_step=(
+                        f"Missing services: {', '.join(required_services)}\n"
+                        f"Open Docker Desktop, start native services, or update system/.env, then run {local_cli_command('start')} again."
+                    ),
                 )
         else:
-            print_check(False, "Docker", "not running; open Docker Desktop if full stack services are missing")
+            notes = plan.get("notes") if isinstance(plan.get("notes"), list) else []
+            detail = "; ".join(str(item) for item in notes) or f"optional services not started: {', '.join(services)}"
+            print_info("Docker", f"not running; {detail}")
             return
-    ollama_url = configured_ollama_url()
-    if uses_external_ollama(ollama_url):
-        print_info("Ollama", f"using external service at {ollama_url}; skipping container")
-        compose(["up", "-d", "postgres"], timeout=300)
-    else:
-        compose(["up", "-d", "postgres", "ollama"], timeout=300)
+    compose(["up", "-d", *services], timeout=300)
 
 
 def command_setup(args: argparse.Namespace) -> int:
@@ -5555,18 +5726,29 @@ def command_status(args: argparse.Namespace) -> int:
         print_info(line)
 
     print_header("Docker")
-    docker = command_path("docker")
-    if docker and docker_compose_cmd():
-        if run([docker, "info"], timeout=10).returncode == 0:
-            cmd = docker_compose_cmd()
-            assert cmd is not None
-            result = run([*cmd, "ps"], timeout=30)
+    docker_payload = collect_docker_payload()
+    docker = docker_payload.get("cli")
+    docker_plan = docker_payload.get("plan") if isinstance(docker_payload.get("plan"), dict) else {}
+    compose_cmd = docker_payload.get("compose")
+    docker_required = bool(docker_plan.get("required"))
+    if docker and isinstance(compose_cmd, list):
+        if docker_payload.get("running") is True:
+            result = run([*compose_cmd, "ps"], timeout=30)
             if result.stdout.strip():
                 print(redact_text(result.stdout.strip()))
+            else:
+                print_info("Docker", "running; no compose services listed")
+        elif docker_required:
+            print_check(False, "Docker", str(docker_payload.get("error") or "not running"))
         else:
-            print_check(False, "Docker", "not running")
+            print_info("Docker", f"not running; optional ({docker_payload.get('error') or 'docker info failed'})")
     else:
-        print_check(False, "Docker Compose", "missing")
+        if docker_required:
+            print_check(False, "Docker Compose", "missing")
+        else:
+            satisfied = docker_plan.get("satisfied") if isinstance(docker_plan.get("satisfied"), list) else []
+            detail = "; ".join(str(item) for item in satisfied) if satisfied else "optional for Docker-backed full stack"
+            print_info("Docker Compose", f"missing; {detail}")
 
     print_header("HTTP")
     runtime_payload: object | None = None
@@ -5697,6 +5879,243 @@ def command_restart(args: argparse.Namespace) -> int:
         return stop_code
     start_args = argparse.Namespace(force=args.force, wait_seconds=args.wait_seconds)
     return command_start(start_args)
+
+
+def _sqlite_backup_source_path() -> Path:
+    database_url = configured_database_url()
+    if database_url.startswith("sqlite"):
+        parsed = urllib.parse.urlparse(database_url)
+        if parsed.path:
+            return Path(urllib.parse.unquote(parsed.path)).expanduser()
+    return configured_data_dir() / "atrium.db"
+
+
+def _copy_offsite(files: Sequence[Path], offsite_dir: str | None) -> list[str]:
+    if not offsite_dir:
+        return []
+    target = Path(offsite_dir).expanduser()
+    target.mkdir(parents=True, exist_ok=True)
+    copied: list[str] = []
+    for path in files:
+        dest = target / path.name
+        shutil.copy2(path, dest)
+        copied.append(str(dest))
+    return copied
+
+
+def _write_key_value_manifest(path: Path, values: dict[str, object]) -> None:
+    lines = [f"{key}={value}" for key, value in values.items()]
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def command_backup(args: argparse.Namespace) -> int:
+    ensure_repo_root()
+    output_dir = Path(args.output_dir).expanduser() if args.output_dir else configured_backup_dir()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    offsite_dir = args.offsite_dir or os.environ.get("ATRIUM_BACKUP_OFFSITE_DIR") or ""
+    require_offsite = bool(args.require_offsite)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+
+    if uses_postgres_database():
+        result = run_postgres_backup(
+            output_dir,
+            stamp=stamp,
+            schema=args.schema,
+            offsite_dir=offsite_dir,
+            require_offsite=require_offsite,
+            timeout=args.timeout,
+        )
+    else:
+        result = run_sqlite_backup(
+            output_dir,
+            stamp=stamp,
+            offsite_dir=offsite_dir,
+            require_offsite=require_offsite,
+        )
+
+    if args.json:
+        print(json.dumps(redact_json_value(result), ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+
+    print_header("Backup")
+    print_check(bool(result.get("ok")), "backup", str(result.get("backend") or "unknown"))
+    for key in ("backupFile", "manifest", "sha256File", "backupDir"):
+        value = result.get(key)
+        if value:
+            print_info(key, str(value))
+    copied = result.get("offsiteFiles")
+    if isinstance(copied, list) and copied:
+        print_info("offsite", "; ".join(str(item) for item in copied))
+    if result.get("skipped"):
+        print_info("skipped", str(result.get("message") or "nothing to back up yet"))
+    return 0
+
+
+def run_sqlite_backup(
+    output_dir: Path,
+    *,
+    stamp: str,
+    offsite_dir: str,
+    require_offsite: bool,
+) -> dict[str, object]:
+    db_path = _sqlite_backup_source_path()
+    if not db_path.exists():
+        if require_offsite and not offsite_dir:
+            raise StepFailure(
+                "SQLite backup cannot satisfy required offsite copy",
+                next_step="Set ATRIUM_BACKUP_OFFSITE_DIR or pass --offsite-dir, then rerun backup.",
+            )
+        return {
+            "ok": True,
+            "backend": "sqlite",
+            "skipped": True,
+            "message": "SQLite database file does not exist yet",
+            "backupDir": str(output_dir),
+        }
+    dest = output_dir / f"atrium-sqlite-{stamp}.db"
+    shutil.copy2(db_path, dest)
+    files = [dest]
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(str(db_path) + suffix)
+        if sidecar.exists():
+            sidecar_dest = Path(str(dest) + suffix)
+            shutil.copy2(sidecar, sidecar_dest)
+            files.append(sidecar_dest)
+    sha, size = file_sha256_and_size(dest)
+    manifest = output_dir / f"atrium-sqlite-{stamp}.manifest.json"
+    manifest_payload = {
+        "format": "atrium-sqlite-backup-manifest-v1",
+        "createdAt": stamp,
+        "source": str(db_path),
+        "files": [str(path) for path in files],
+        "sha256": sha,
+        "sizeBytes": size,
+    }
+    manifest.write_text(json.dumps(manifest_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    files.append(manifest)
+    offsite_files = _copy_offsite(files, offsite_dir)
+    if require_offsite and not offsite_files:
+        raise StepFailure(
+            "SQLite backup completed locally but offsite copy is required",
+            next_step="Set ATRIUM_BACKUP_OFFSITE_DIR or pass --offsite-dir, then rerun backup.",
+        )
+    return {
+        "ok": True,
+        "backend": "sqlite",
+        "backupDir": str(output_dir),
+        "backupFile": str(dest),
+        "manifest": str(manifest),
+        "sha256": sha,
+        "sizeBytes": size,
+        "offsiteFiles": offsite_files,
+    }
+
+
+def pgvector_available(pg_url: str) -> bool:
+    psql = command_path("psql")
+    if not psql:
+        return False
+    result = run(
+        [psql, "-Atq", "--dbname", pg_url, "-c", "SELECT to_regtype('vector') IS NOT NULL"],
+        timeout=10,
+    )
+    return result.returncode == 0 and result.stdout.strip().lower() in {"t", "true", "1"}
+
+
+def run_postgres_backup(
+    output_dir: Path,
+    *,
+    stamp: str,
+    schema: str,
+    offsite_dir: str,
+    require_offsite: bool,
+    timeout: int,
+) -> dict[str, object]:
+    pg_url = normalize_pg_tool_url(configured_database_url())
+    pg_dump = command_path("pg_dump")
+    if not pg_dump:
+        script = ROOT / "ops" / "scripts" / "backup_postgres.sh"
+        bash = command_path("bash") or "/bin/bash"
+        if platform.system() != "Windows" and script.exists() and Path(bash).exists():
+            env = os.environ.copy()
+            env["ATRIUM_DATABASE_URL"] = pg_url
+            env["ATRIUM_BACKUP_DIR"] = str(output_dir)
+            env["ATRIUM_BACKUP_SCHEMA"] = schema
+            if offsite_dir:
+                env["ATRIUM_BACKUP_OFFSITE_DIR"] = offsite_dir
+            if require_offsite:
+                env["ATRIUM_BACKUP_REQUIRE_OFFSITE"] = "true"
+            result = run([bash, str(script)], env=env, timeout=timeout)
+            if result.returncode != 0:
+                raise StepFailure("Postgres backup failed", next_step=redact_text(result.stderr or result.stdout)[:1200])
+            return {
+                "ok": True,
+                "backend": "postgres",
+                "backupDir": str(output_dir),
+                "stdout": redact_text(result.stdout[-2000:]),
+            }
+        raise StepFailure(
+            "pg_dump is missing",
+            next_step="Install PostgreSQL client tools and make pg_dump available on PATH, then rerun backup.",
+        )
+
+    out = output_dir / f"atrium-{stamp}.sql.gz"
+    sha_file = Path(str(out) + ".sha256")
+    manifest = Path(str(out) + ".manifest")
+    dump_cmd = [pg_dump, "--dbname", pg_url]
+    if schema and schema != "all":
+        dump_cmd.append(f"--schema={schema}")
+    result = run(dump_cmd, timeout=timeout)
+    if result.returncode != 0:
+        raise StepFailure("Postgres backup failed", next_step=redact_text(result.stderr or result.stdout)[:1200])
+
+    prelude = ""
+    if schema and schema != "all" and pgvector_available(pg_url):
+        prelude = "CREATE EXTENSION IF NOT EXISTS vector WITH SCHEMA public;\n"
+    with gzip.open(out, "wb", compresslevel=9) as handle:
+        if prelude:
+            handle.write(prelude.encode("utf-8"))
+        handle.write(result.stdout.encode("utf-8"))
+    sha, size = file_sha256_and_size(out)
+    sha_file.write_text(f"{sha}  {out.name}\n", encoding="utf-8")
+    manifest_values = {
+        "format": "atrium-backup-manifest-v1",
+        "created_utc": stamp,
+        "backup_file": out.name,
+        "schema": schema,
+        "postgres_database": "configured-url",
+        "sha256": sha or "",
+        "size_bytes": size or 0,
+        "gzip_ok": "true",
+        "offsite_copied": "false",
+        "offsite_dir": "",
+    }
+    files = [out, sha_file, manifest]
+    offsite_files: list[str] = []
+    if offsite_dir:
+        offsite_files = _copy_offsite([out, sha_file], offsite_dir)
+        manifest_values["offsite_copied"] = "true"
+        manifest_values["offsite_dir"] = offsite_dir
+    elif require_offsite:
+        raise StepFailure(
+            "Postgres backup completed locally but offsite copy is required",
+            next_step="Set ATRIUM_BACKUP_OFFSITE_DIR or pass --offsite-dir, then rerun backup.",
+        )
+    _write_key_value_manifest(manifest, manifest_values)
+    if offsite_dir:
+        _copy_offsite([manifest], offsite_dir)
+        offsite_files.append(str(Path(offsite_dir).expanduser() / manifest.name))
+    return {
+        "ok": True,
+        "backend": "postgres",
+        "backupDir": str(output_dir),
+        "backupFile": str(out),
+        "sha256File": str(sha_file),
+        "manifest": str(manifest),
+        "sha256": sha,
+        "sizeBytes": size,
+        "offsiteFiles": offsite_files,
+    }
 
 
 def collect_logs_payload(service: str = "all", lines: int = 80) -> dict[str, object]:
@@ -6261,6 +6680,15 @@ def build_parser() -> argparse.ArgumentParser:
     logs.add_argument("-n", "--lines", type=int, default=80)
     logs.add_argument("--json", action="store_true", help="print redacted log payload as JSON")
     logs.set_defaults(func=command_logs)
+
+    backup = sub.add_parser("backup", help="run a local ATRIUM database backup now")
+    backup.add_argument("--output-dir", help="directory for backup files; defaults to ATRIUM_BACKUP_DIR or system/data/backups")
+    backup.add_argument("--offsite-dir", help="optional directory to copy backup artifacts after local verification")
+    backup.add_argument("--require-offsite", action="store_true", help="fail unless --offsite-dir or ATRIUM_BACKUP_OFFSITE_DIR is set")
+    backup.add_argument("--schema", default="atrium", help="Postgres schema to dump; use 'all' for a full database dump")
+    backup.add_argument("--timeout", type=int, default=300, help="Postgres pg_dump timeout in seconds")
+    backup.add_argument("--json", action="store_true", help="print redacted backup result JSON")
+    backup.set_defaults(func=command_backup)
 
     report = sub.add_parser("report", help="print a redacted support report")
     report.add_argument("-o", "--output", help="write report to a file instead of stdout")
