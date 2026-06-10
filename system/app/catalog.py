@@ -151,6 +151,8 @@ MODELS: dict[str, dict] = {
         "inputPerMTok": 5.0,
         "outputPerMTok": 30.0,
         "contextWindowTokens": 1_000_000,
+        "supportsFastMode": True,
+        "supportedSpeeds": ["standard", "fast"],
         "supportedEfforts": ["low", "medium", "high", "xhigh"],
         "defaultThinkingEffort": "medium",
         "blurb": "GPT route หลักผ่าน Responses API สำหรับงาน reasoning หนัก",
@@ -163,6 +165,8 @@ MODELS: dict[str, dict] = {
         "inputPerMTok": 0.75,
         "outputPerMTok": 4.5,
         "contextWindowTokens": 1_000_000,
+        "supportsFastMode": True,
+        "supportedSpeeds": ["standard", "fast"],
         "supportedEfforts": ["low", "medium", "high", "xhigh"],
         "defaultThinkingEffort": "medium",
         "blurb": "รุ่น GPT เบา เร็วกว่า เหมาะกับงานทั่วไปและงาน UI agent",
@@ -175,6 +179,8 @@ MODELS: dict[str, dict] = {
         "inputPerMTok": 2.5,
         "outputPerMTok": 15.0,
         "contextWindowTokens": 1_000_000,
+        "supportsFastMode": True,
+        "supportedSpeeds": ["standard", "fast"],
         "supportedEfforts": ["low", "medium", "high", "xhigh"],
         "defaultThinkingEffort": "medium",
         "blurb": "รุ่น GPT กลางสำหรับงาน reasoning และ coding ผ่าน Responses API",
@@ -205,13 +211,13 @@ SPEED_MODES: dict[str, dict] = {
         "id": "standard",
         "label": "Standard",
         "apiShape": "omit speed",
-        "blurb": "Claude response path ปกติ",
+        "blurb": "response path ปกติ ใช้ระดับ Think ตามที่เลือก",
     },
     "fast": {
         "id": "fast",
         "label": "Fast",
-        "apiShape": 'beta fast-mode-2026-02-01 + speed:"fast"',
-        "blurb": "Claude Fast Mode ใช้ได้เฉพาะ Opus 4.8, Opus 4.7 และ Opus 4.6",
+        "apiShape": 'Claude beta fast-mode-2026-02-01 หรือ OpenAI reasoning.effort:"low"',
+        "blurb": "Fast Mode สำหรับรุ่นที่รองรับ: Claude Opus ใช้ fast beta; GPT ใช้ reasoning effort ต่ำเพื่อลด latency",
     },
 }
 
@@ -221,7 +227,11 @@ SPEED_ORDER: list[str] = ["standard", "fast"]
 
 # xhigh is only offered on these models (mirrors OPUS_HIGH_EFFORT_MODELS in models.ts).
 _XHIGH_MODELS = {"claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8"}
-FAST_MODE_MODELS = {"claude-opus-4-6", "claude-opus-4-7", "claude-opus-4-8"}
+FAST_MODE_MODELS = {
+    model_id
+    for model_id, model in MODELS.items()
+    if "fast" in model.get("supportedSpeeds", [])
+}
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
 DEFAULT_SPEED = "standard"
@@ -291,6 +301,11 @@ def default_thinking_effort_for_model(model_id: str) -> str:
 
 
 def speeds_for_model(model_id: str) -> list[str]:
+    explicit = MODELS.get(model_id, {}).get("supportedSpeeds")
+    if isinstance(explicit, list) and explicit:
+        valid = [s for s in SPEED_ORDER if s in explicit]
+        if valid:
+            return valid
     return [s for s in SPEED_ORDER if s == "standard" or model_id in FAST_MODE_MODELS]
 
 
@@ -306,7 +321,7 @@ def coerce_thinking_effort(model_id: str, effort: str) -> str:
 
 
 def coerce_model_speed(model_id: str, speed: str | None) -> str:
-    """Fast Mode is a separate switch and only legal on selected Opus models."""
+    """Fast Mode is a separate switch and only legal on models that advertise it."""
     requested = speed if speed in SPEED_ORDER else DEFAULT_SPEED
     return requested if is_speed_available_for_model(model_id, requested) else DEFAULT_SPEED
 

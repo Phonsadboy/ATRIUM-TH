@@ -464,7 +464,8 @@ class ChatGPTAccountResponsesProvider(OpenAIResponsesProvider):
         tools: list[dict[str, Any]] | None = None,
     ):
         client = self._ensure_client()
-        requested_effort = self._effort(effort)
+        requested_speed = self._speed(speed)
+        requested_effort = self._requested_effort(effort, requested_speed)
         payload = self._payload(
             system=system,
             messages=messages,
@@ -486,6 +487,7 @@ class ChatGPTAccountResponsesProvider(OpenAIResponsesProvider):
             data,
             fallback_model=model,
             effort=requested_effort,
+            speed=requested_speed,
             generation_ms=generation_ms,
         )
         if not result.tool_calls and result.text.strip() == "(ไม่มีเนื้อหาตอบกลับ)":

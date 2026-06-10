@@ -229,7 +229,7 @@ function EditDeptForm({ dept, onClose }: { dept: Department; onClose: () => void
           </div>
         </Field>
 
-        {/* fast mode — Opus-only; availability comes from the live catalog and
+        {/* fast mode availability comes from the live catalog and
             the backend re-validates on save */}
         <div
           className="flex items-center justify-between rounded-xl border px-3 py-2.5"
@@ -245,10 +245,10 @@ function EditDeptForm({ dept, onClose }: { dept: Department; onClose: () => void
             <div className="text-[12px] font-medium text-[var(--color-cream)]">⚡ Fast Mode</div>
             <div className="text-[10px] text-[var(--color-cream-faint)]">
               {fastSupported
-                ? fastMode?.blurb ?? 'ตอบเร็วขึ้นด้วย Claude Fast Mode'
+                ? fastMode?.blurb ?? 'ตอบเร็วขึ้นเมื่อรุ่นนี้รองรับ Fast Mode'
                 : modelInfo.tier === 'gpt'
-                  ? 'GPT route ใช้ Standard speed เสมอ'
-                  : 'รุ่นนี้ไม่รองรับ Fast Mode — เลือก Opus เพื่อเปิด'}
+                  ? 'GPT รุ่นนี้ยังไม่ประกาศรองรับ Fast Mode'
+                  : 'รุ่นนี้ไม่รองรับ Fast Mode'}
             </div>
           </div>
           <Toggle

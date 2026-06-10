@@ -78,7 +78,12 @@ from .chat_streaming import (
 )
 from .clock import DAY_MS, day_key, now_ms
 from .config import Settings, get_settings
-from .context_budget import estimate_llm_context_tokens, model_auto_compact_context_tokens
+from .context_budget import (
+    estimate_llm_context_tokens,
+    estimate_text_tokens,
+    model_auto_compact_context_tokens,
+    model_context_window_tokens,
+)
 from .db.base import commit_and_release, session_scope
 from .db.repo import Repo, office_layout_context
 from .events import hub
@@ -130,6 +135,7 @@ EXECUTIVE_SUMMARY_JITTER_MS = 15 * 60_000
 EXECUTIVE_SUMMARY_NEXT_RUN_KEY = "nextAutoSummaryAt"
 EXECUTIVE_SUMMARY_LAST_ATTEMPT_KEY = "lastAutoSummaryAttemptAt"
 EXECUTIVE_WAKE_EVENTS = {"dept_done", "blocked", "budget", "escalate"}
+EXECUTIVE_DEPARTMENT_WAKE_ENTITY = "executive_department_wake"
 ENGINE_ERROR_NOTIFY_INTERVAL_MS = 5 * 60_000
 KNOWLEDGE_DEBT_NOTIFY_MIN_DEBT = 5
 DAILY_DIGEST_SAMPLE_LIMIT = 5
@@ -601,6 +607,12 @@ def _engine_cost_estimate(
 def _clip_text(text: Any, limit: int = 4000) -> str:
     s = str(text or "").replace("\r\n", "\n").strip()
     return s if len(s) <= limit else s[: limit - 1] + "…"
+
+
+def _clip_text_tail(text: Any, limit: int = 4000) -> str:
+    """Clip keeping the newest end — for transcripts where the tail matters most."""
+    s = str(text or "").replace("\r\n", "\n").strip()
+    return s if len(s) <= limit else "…" + s[-(limit - 1):]
 
 
 def _parse_json_object_with_meta(text: str) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -1344,6 +1356,75 @@ async def _thread_messages_for_live_prompt(repo: Repo, thread_id: str, *, minimu
     return await repo.thread_messages(thread_id, limit=max(minimum_limit, limit))
 
 
+async def _thread_compaction_boundary(repo: Repo, thread_id: str) -> dict[str, Any] | None:
+    if not thread_id:
+        return None
+    with contextlib.suppress(Exception):
+        return await repo.get_entity("thread_compaction", thread_id)
+    return None
+
+
+def _message_after_boundary(msg: dict[str, Any], up_to_ts: int, up_to_id: str) -> bool:
+    ts = int(msg.get("ts") or 0)
+    if ts != up_to_ts:
+        return ts > up_to_ts
+    # Tie-break mirrors repo ordering (ts, id) so the cut is deterministic.
+    return str(msg.get("id") or "") > up_to_id
+
+
+def _history_after_compaction(
+    history: list[dict[str, Any]],
+    boundary: dict[str, Any] | None,
+) -> tuple[list[dict[str, Any]], str]:
+    """Drop messages already folded into a compaction archive; return the summary context."""
+    if not boundary:
+        return history, ""
+    up_to_ts = int(boundary.get("upToTs") or 0)
+    up_to_id = str(boundary.get("upToId") or "")
+    if up_to_ts <= 0:
+        return history, ""
+    trimmed = [msg for msg in history if _message_after_boundary(msg, up_to_ts, up_to_id)]
+    if len(trimmed) == len(history):
+        return history, ""
+    summary = _clip_text(boundary.get("summary"), 1600)
+    if not summary:
+        return trimmed, ""
+    label = f"สรุปบทสนทนาก่อนหน้าใน thread นี้ที่ถูกบีบอัดแล้ว (archive {boundary.get('archiveId') or '-'})"
+    return trimmed, f"{label}:\n{summary}"
+
+
+def _history_message_token_estimate(msg: dict[str, Any]) -> int:
+    if msg.get("pending"):
+        return 0
+    role = "user" if msg.get("role") == "user" else "assistant"
+    prefix = "" if role == "user" else f"{msg.get('authorName', 'agent')}: "
+    text = message_text_with_attachment_refs(str(msg.get("text") or ""), msg.get("attachments") or [])
+    return 6 + estimate_text_tokens(f"{prefix}{text}")
+
+
+def _trim_history_to_model_window(
+    system: str,
+    history: list[dict[str, Any]],
+    user_msg: dict[str, Any],
+    model: str,
+    *,
+    guard_ratio: float,
+) -> tuple[list[dict[str, Any]], int]:
+    """Hard backstop below compaction: drop oldest messages until the prompt fits the model window."""
+    if guard_ratio <= 0 or not history:
+        return history, 0
+    budget = int(model_context_window_tokens(model) * min(guard_ratio, 1.0))
+    total = estimate_llm_context_tokens(system, _llm_chat_history(history, user_msg))
+    if total <= budget:
+        return history, 0
+    trimmed = list(history)
+    dropped = 0
+    while len(trimmed) > 1 and total > budget:
+        total -= _history_message_token_estimate(trimmed.pop(0))
+        dropped += 1
+    return trimmed, dropped
+
+
 async def _chat_context_tokens_for_turn(
     dept: dict[str, Any],
     system: str,
@@ -1456,6 +1537,225 @@ def _task_watch_flow(dept: dict[str, Any], task: dict[str, Any], event: str) -> 
     }
 
 
+def _task_originated_from_executive(task: dict[str, Any] | None) -> bool:
+    if not isinstance(task, dict):
+        return False
+    origin = task.get("origin") if isinstance(task.get("origin"), dict) else {}
+    watchers = {str(item) for item in list(task.get("watchers") or [])}
+    return (
+        str(origin.get("kind") or "") == "executive"
+        or is_exec(str(origin.get("id") or ""))
+        or "executive" in watchers
+        or EXEC_ID in watchers
+    )
+
+
+def _executive_wake_event_id(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:40]
+
+
+async def _has_executive_wake_event(repo: Repo, key: str) -> bool:
+    get_entity = getattr(repo, "get_entity", None)
+    if not callable(get_entity):
+        return False
+    try:
+        record = await get_entity(EXECUTIVE_DEPARTMENT_WAKE_ENTITY, _executive_wake_event_id(key))
+    except Exception:
+        return False
+    return bool(record)
+
+
+async def _record_executive_wake_event(
+    repo: Repo,
+    *,
+    key: str,
+    job_id: str,
+    source_message_id: str,
+    reply_message_id: str,
+    event: str,
+    source_department_id: str,
+    task_id: str | None,
+    ts: int,
+) -> None:
+    put_entity = getattr(repo, "put_entity", None)
+    if not callable(put_entity):
+        return
+    record = {
+        "id": _executive_wake_event_id(key),
+        "dedupeKey": key,
+        "jobId": job_id,
+        "sourceMessageId": source_message_id,
+        "replyMessageId": reply_message_id,
+        "event": event,
+        "sourceDepartmentId": source_department_id,
+        "taskId": task_id,
+        "ts": ts,
+    }
+    with contextlib.suppress(Exception):
+        await put_entity(EXECUTIVE_DEPARTMENT_WAKE_ENTITY, record, dept=EXEC_ID, status="queued", ts=ts)
+
+
+async def _queue_executive_wake_from_department_update(
+    repo: Repo,
+    dept: dict[str, Any],
+    *,
+    event: str,
+    summary: str,
+    task: dict[str, Any] | None = None,
+    source_message: dict[str, Any] | None = None,
+    trigger_id: str | None = None,
+    now: int | None = None,
+    severity: str = "info",
+) -> bool:
+    dept_id = str(dept.get("id") or "")
+    if not dept_id or is_exec(dept_id) or not get_settings().engine_enabled:
+        return False
+    exec_dept = await repo.get_department(EXEC_ID)
+    if not exec_dept:
+        return False
+    ts = now or now_ms()
+    task_id = str(task.get("id") or "") if isinstance(task, dict) and task.get("id") else None
+    source_id = str((source_message or {}).get("id") or trigger_id or task_id or event)
+    dedupe_key = f"executive_department_wake:{event}:{dept_id}:{task_id or '-'}:{source_id}"
+    if await _has_executive_wake_event(repo, dedupe_key):
+        return False
+
+    source_name = dept.get("name") or dept.get("agentName") or dept_id
+    task_title = f" งาน “{task.get('title')}”" if isinstance(task, dict) and task.get("title") else ""
+    wake_text = (
+        f"ฝ่าย{source_name}มีอัปเดตกลับมาจากคำถาม/งานที่ผู้บริหารมอบหมาย{task_title}:\n"
+        f"{_clip_text(summary, 1800)}\n\n"
+        "ให้ผู้บริหารอ่านอัปเดตนี้แล้วตอบผู้ใช้ในห้องผู้บริหารทันที: สรุปผลล่าสุด, "
+        "บอกว่างานพอปิด/ต้องตรวจ/ต้องรอต่อหรือไม่, และสั่งงานต่อด้วย tool หากต้องให้แผนกอื่นทำต่อ."
+    )
+    flow = _task_watch_flow(dept, task, event) if isinstance(task, dict) else {
+        "kind": "department_work",
+        "title": f"ฝ่าย{source_name}",
+        "steps": [{"kind": event, "label": event.replace("_", " "), "departmentId": dept_id}],
+        "refs": {"departmentId": dept_id, "threadId": thread_id_for(dept_id)},
+    }
+    source_msg = system_chat_message(
+        EXEC_THREAD,
+        wake_text,
+        department_id=dept_id,
+        flow=flow,
+        severity=severity,
+        ts=ts,
+    )
+    source_msg["input"] = {
+        "status": "sent",
+        "executiveWake": True,
+        "executiveWakeEvent": event,
+        "sourceDepartmentId": dept_id,
+        "taskId": task_id,
+        "triggerId": trigger_id,
+    }
+    source_msg["input"] = {k: v for k, v in source_msg["input"].items() if v is not None}
+    reply_id = uid("msg")
+    job_id = uid("job")
+    reply = {
+        "id": reply_id,
+        "threadId": EXEC_THREAD,
+        "role": "executive",
+        "authorName": exec_dept.get("agentName") or exec_dept.get("name") or "ผู้บริหาร",
+        "text": f"ได้รับอัปเดตจากฝ่าย{source_name} กำลังสรุปกลับผู้ใช้...",
+        "ts": ts + 1,
+        "pending": True,
+        "status": "queued",
+        "replyToMessageId": source_msg["id"],
+        "input": {
+            "status": "queued",
+            "executiveWake": True,
+            "sourceDepartmentId": dept_id,
+            "taskId": task_id,
+        },
+        **agent_message_metadata(exec_dept),
+    }
+    payload = {
+        "threadId": EXEC_THREAD,
+        "departmentId": EXEC_ID,
+        "userMessageId": source_msg["id"],
+        "replyMessageId": reply_id,
+        "text": wake_text,
+        "userTs": source_msg["ts"],
+        "replyTs": reply["ts"],
+        "thinkingEffort": "low",
+        "speed": "fast",
+        "attachments": [],
+        "mentions": [],
+        "statusMessage": reply["text"],
+        "nudge": {
+            "sourceDepartmentId": dept_id,
+            "sourceThreadId": thread_id_for(dept_id),
+            "targetDepartmentId": EXEC_ID,
+            "requestedBy": "department_update",
+            "event": event,
+            "taskId": task_id,
+        },
+    }
+    enqueue_once = getattr(repo, "enqueue_once", None)
+    if callable(enqueue_once):
+        kept_job_id = await enqueue_once(
+            job_id,
+            "chat_reply",
+            payload,
+            ts,
+            priority=1,
+            dedupe_key=dedupe_key,
+        )
+        if kept_job_id != job_id:
+            return False
+    else:
+        await repo.enqueue(job_id, "chat_reply", payload, ts, priority=1)
+
+    await repo.add_message(source_msg)
+    await repo.add_message(reply)
+    await _record_executive_wake_event(
+        repo,
+        key=dedupe_key,
+        job_id=job_id,
+        source_message_id=source_msg["id"],
+        reply_message_id=reply_id,
+        event=event,
+        source_department_id=dept_id,
+        task_id=task_id,
+        ts=ts,
+    )
+    await repo.add_activity(_activity(
+        f"ปลุกผู้บริหารให้ตอบผู้ใช้จากอัปเดตของฝ่าย{source_name}",
+        type_="message",
+        department_id=EXEC_ID,
+        severity=severity,
+        ts=ts,
+    ))
+    hub.pulse({
+        "kind": "chat_activity",
+        "threadId": EXEC_THREAD,
+        "msgId": source_msg["id"],
+        "departmentId": dept_id,
+        "message": source_msg,
+    })
+    hub.pulse({"kind": "msg_start", "threadId": EXEC_THREAD, "msgId": reply_id, "message": reply})
+    hub.mark_dirty()
+    return True
+
+
+def _department_reply_was_requested_by_executive(
+    reply: dict[str, Any],
+    *,
+    task: dict[str, Any] | None = None,
+    nudge: dict[str, Any] | None = None,
+) -> bool:
+    if str(reply.get("status") or "sent") != "sent":
+        return False
+    if _task_originated_from_executive(task):
+        return True
+    nudge = nudge if isinstance(nudge, dict) else {}
+    source_dept_id = str(nudge.get("sourceDepartmentId") or "")
+    source_thread_id = str(nudge.get("sourceThreadId") or "")
+    return is_exec(source_dept_id) or source_thread_id == EXEC_THREAD
+
+
 async def _add_executive_watch_line(
     repo: Repo,
     dept: dict[str, Any],
@@ -1490,6 +1790,7 @@ async def _add_executive_department_reply_line(
     reply: dict[str, Any],
     *,
     task: dict[str, Any] | None = None,
+    nudge: dict[str, Any] | None = None,
     now: int | None = None,
 ) -> None:
     status = str(reply.get("status") or "sent")
@@ -1512,6 +1813,18 @@ async def _add_executive_department_reply_line(
         severity=severity,
         now=now,
     )
+    if _department_reply_was_requested_by_executive(reply, task=task, nudge=nudge):
+        await _queue_executive_wake_from_department_update(
+            repo,
+            dept,
+            event="department_reply",
+            summary=f"ฝ่าย{dept.get('name', dept.get('id'))} {label}: {text}",
+            task=task,
+            source_message=reply,
+            trigger_id=str(reply.get("id") or ""),
+            now=now,
+            severity=severity,
+        )
 
 
 async def _tool_activity_lines(
@@ -1710,6 +2023,7 @@ async def _maybe_enqueue_chat_compaction(
     message_count: int | None = None,
     estimated_context_tokens: int | None = None,
     context_token_source: str = "estimate",
+    window_guard_trimmed: bool = False,
     now: int,
 ) -> bool:
     settings = get_settings()
@@ -1724,6 +2038,10 @@ async def _maybe_enqueue_chat_compaction(
     reason = ""
     if context_tokens > compact_context_threshold:
         reason = "context_threshold"
+    elif window_guard_trimmed:
+        # The hard window backstop had to drop history — compaction is overdue
+        # even though the post-trim estimate sits below the model threshold.
+        reason = "window_guard"
     else:
         threshold = int(settings.compact_message_threshold)
         count = int(message_count or 0)
@@ -1731,8 +2049,13 @@ async def _maybe_enqueue_chat_compaction(
             reason = "message_threshold"
     if not reason:
         return False
-    await repo.enqueue(
-        uid("job"),
+    cooldown_s = max(0, int(getattr(settings, "compact_cooldown_s", 0) or 0))
+    last_compaction_at = int((dept.get("memory") or {}).get("lastCompactionAt") or 0)
+    if cooldown_s and last_compaction_at and now - last_compaction_at < cooldown_s * 1000:
+        return False
+    job_id = uid("job")
+    kept_job_id = await repo.enqueue_once(
+        job_id,
         "compact_dept",
         {
             "departmentId": dept["id"],
@@ -1745,7 +2068,10 @@ async def _maybe_enqueue_chat_compaction(
         },
         now,
         priority=2,
+        dedupe_key=f"compact:{thread_id}",
     )
+    if kept_job_id != job_id:
+        return False
     metric = (
         f" context {context_tokens:,}/{compact_context_threshold:,} tokens"
         if context_tokens
@@ -1759,6 +2085,24 @@ async def _maybe_enqueue_chat_compaction(
         ts=now,
     ))
     return True
+
+
+_CONTEXT_OVERFLOW_PATTERNS = (
+    "prompt is too long",
+    "context_length_exceeded",
+    "context length",
+    "maximum context",
+    "exceeds the maximum number of tokens",
+    "input is too long",
+    "too many input tokens",
+    "request_too_large",
+    "input length and `max_tokens` exceed",
+)
+
+
+def _is_context_overflow_error(detail: Any) -> bool:
+    text = str(detail or "").lower()
+    return any(pattern in text for pattern in _CONTEXT_OVERFLOW_PATTERNS)
 
 
 def _chat_reply_finished_state(dept: dict[str, Any]) -> str:
@@ -1975,6 +2319,8 @@ async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int)
         if msg.get("id") == user_message_id:
             break
         history.append(msg)
+    compaction_boundary = await _thread_compaction_boundary(repo, thread_id)
+    history, compaction_context = _history_after_compaction(history, compaction_boundary)
 
     if not existing_reply:
         wake_status = str(payload.get("statusMessage") or "").strip()
@@ -2103,6 +2449,8 @@ async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int)
 
     departments = await repo.list_departments()
     memory_context, memory_hits = await _chat_memory_context(repo, dept, str(user_msg.get("text") or ""))
+    if compaction_context:
+        memory_context = (memory_context + "\n\n" if memory_context else "") + compaction_context
     tool_memory_context = await recent_tool_run_context(repo, dept, thread_id)
     if tool_memory_context:
         memory_context = (memory_context + "\n\n" if memory_context else "") + tool_memory_context
@@ -2140,9 +2488,26 @@ async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int)
         system = f"{system}\n\n{meeting_context(meeting, meeting_participant_rows)}"
     runtime_tools = chat_tool_definitions(departments, turn_dept)
     tool_system = chat_tool_system_instructions(departments, turn_dept) if runtime_tools else ""
+    full_turn_system = f"{system}\n\n{tool_system}" if tool_system else system
+    history, window_trimmed_count = _trim_history_to_model_window(
+        full_turn_system,
+        history,
+        user_msg,
+        str(turn_dept.get("model") or DEFAULT_MODEL),
+        guard_ratio=float(settings.chat_context_window_guard_ratio),
+    )
+    if window_trimmed_count:
+        await repo.add_activity(_activity(
+            f"ตัดข้อความเก่า {window_trimmed_count} รายการออกจาก prompt ของ{dept['agentName']} "
+            "เพราะบริบทใกล้เกิน context window ของโมเดล (รอผล compaction)",
+            type_="system",
+            department_id=dept["id"],
+            severity="warn",
+            ts=now,
+        ))
     estimated_context_tokens, context_token_source = await _chat_context_tokens_for_turn(
         turn_dept,
-        f"{system}\n\n{tool_system}" if tool_system else system,
+        full_turn_system,
         history,
         user_msg,
         tools=runtime_tools,
@@ -2188,53 +2553,98 @@ async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int)
 
     stopped = False
     stream_error: str | None = None
+    overflow_retry_used = False
     try:
-        result = None
-        runtime_system = (
-            f"{system}\n\n{chat_tool_system_instructions(departments, turn_dept)}"
-            if runtime_tools
-            else system
-        )
-        use_agent_runtime = _uses_agent_runtime_for_chat(settings, turn_dept)
-        if use_agent_runtime:
-            result = await _complete_runtime_turn(
-                repo,
-                turn_dept,
-                category="chat",
-                system=runtime_system,
-                messages=_llm_chat_history(history, user_msg),
-                now=now,
-                thread_id=thread_id,
-                on_stream_event=handle_chat_stream_event,
-                input_tokens=4500,
-                client_tools=runtime_tools,
-                stream_msg_id=reply_message_id,
-                requested_by=str(user_msg.get("authorName") or user_msg.get("author") or turn_dept.get("agentName") or turn_dept["id"]),
-            )
-        if result is None and not use_agent_runtime:
-            result = await _complete_engine_chat_with_tools(
-                repo,
-                turn_dept,
-                system=system,
-                history=history,
-                user_msg=user_msg,
-                thread_id=thread_id,
-                now=now,
-                on_stream_event=handle_chat_stream_event,
-                stream_msg_id=reply_message_id,
-            )
-    except ChatStreamCancelled:
-        stopped = True
-        result = _partial_chat_result(turn_dept, sink.text, stop_reason="cancelled")
-    except Exception as exc:
-        error_type, stream_error = provider_exception_detail(exc)
-        result = _partial_chat_result(
-            turn_dept,
-            sink.text,
-            stop_reason="error",
-            error_type=error_type,
-            error_detail=stream_error,
-        )
+        while True:
+            try:
+                result = None
+                runtime_system = (
+                    f"{system}\n\n{chat_tool_system_instructions(departments, turn_dept)}"
+                    if runtime_tools
+                    else system
+                )
+                use_agent_runtime = _uses_agent_runtime_for_chat(settings, turn_dept)
+                if use_agent_runtime:
+                    result = await _complete_runtime_turn(
+                        repo,
+                        turn_dept,
+                        category="chat",
+                        system=runtime_system,
+                        messages=_llm_chat_history(history, user_msg),
+                        now=now,
+                        thread_id=thread_id,
+                        on_stream_event=handle_chat_stream_event,
+                        input_tokens=4500,
+                        client_tools=runtime_tools,
+                        stream_msg_id=reply_message_id,
+                        requested_by=str(user_msg.get("authorName") or user_msg.get("author") or turn_dept.get("agentName") or turn_dept["id"]),
+                    )
+                if result is None and not use_agent_runtime:
+                    result = await _complete_engine_chat_with_tools(
+                        repo,
+                        turn_dept,
+                        system=system,
+                        history=history,
+                        user_msg=user_msg,
+                        thread_id=thread_id,
+                        now=now,
+                        on_stream_event=handle_chat_stream_event,
+                        stream_msg_id=reply_message_id,
+                    )
+                break
+            except ChatStreamCancelled:
+                stopped = True
+                result = _partial_chat_result(turn_dept, sink.text, stop_reason="cancelled")
+                break
+            except Exception as exc:
+                error_type, detail = provider_exception_detail(exc)
+                # Last-resort recovery: halve the history and retry once, but only
+                # when nothing streamed yet so the bubble cannot duplicate text.
+                if (
+                    not overflow_retry_used
+                    and _is_context_overflow_error(detail)
+                    and not sink.text
+                    and len(history) > 1
+                ):
+                    overflow_retry_used = True
+                    history = history[len(history) // 2:]
+                    safety_warnings.append({
+                        "code": "context_overflow_trimmed",
+                        "message": "บริบทเต็ม ระบบตัดประวัติเก่าลงครึ่งหนึ่งแล้วลองตอบใหม่",
+                        "severity": "warn",
+                    })
+                    await repo.add_activity(_activity(
+                        f"context window เต็มระหว่างตอบแชตของ{dept['agentName']} "
+                        f"ตัดประวัติเหลือ {len(history)} ข้อความแล้วลองใหม่ พร้อมคิว compact ด่วน",
+                        type_="system",
+                        department_id=dept["id"],
+                        severity="warn",
+                        ts=now,
+                    ))
+                    with contextlib.suppress(Exception):
+                        await repo.enqueue_once(
+                            uid("job"),
+                            "compact_dept",
+                            {
+                                "departmentId": dept["id"],
+                                "threadId": thread_id,
+                                "reason": "context_overflow",
+                                "model": str(turn_dept.get("model") or DEFAULT_MODEL),
+                            },
+                            now,
+                            priority=1,
+                            dedupe_key=f"compact:{thread_id}",
+                        )
+                    continue
+                stream_error = detail
+                result = _partial_chat_result(
+                    turn_dept,
+                    sink.text,
+                    stop_reason="error",
+                    error_type=error_type,
+                    error_detail=stream_error,
+                )
+                break
     finally:
         chat_streams.finish(thread_id, reply_message_id)
 
@@ -2286,6 +2696,7 @@ async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int)
         message_count=len(history) + 2,
         estimated_context_tokens=estimated_context_tokens,
         context_token_source=context_token_source,
+        window_guard_trimmed=bool(window_trimmed_count),
         now=now,
     )
     result.meta["ragHitIds"] = [hit["id"] for hit in memory_hits]
@@ -2328,7 +2739,7 @@ async def _process_chat_reply_job(repo: Repo, payload: dict[str, Any], now: int)
     await repo.update_message(reply)
     if not is_exec(dept["id"]):
         current_task = await repo.get_task(str(dept.get("currentTaskId"))) if dept.get("currentTaskId") else None
-        await _add_executive_department_reply_line(repo, dept, reply, task=current_task, now=now)
+        await _add_executive_department_reply_line(repo, dept, reply, task=current_task, nudge=nudge, now=now)
         if nudge or deferred_wake or image_generation_wake or video_job_wake:
             source_dept = None
             source_dept_id = str((nudge or {}).get("sourceDepartmentId") or "").strip()
@@ -3650,8 +4061,11 @@ async def _compact_department(
     now: int,
     thread_id: str | None = None,
 ) -> bool:
-    saved = 8000 + int(random.random() * 30000)
-    messages = await repo.thread_messages(thread_id, limit=500) if thread_id else []
+    messages = [
+        msg
+        for msg in (await repo.thread_messages(thread_id, limit=500) if thread_id else [])
+        if not msg.get("pending")
+    ]
     transcript = _format_transcript(messages) if messages else None
     memory_context = await _task_memory_context(repo, dept, None)
     system = _department_system(
@@ -3677,7 +4091,7 @@ async def _compact_department(
             role="user",
             content=(
                 f"department={dept['id']} thread={thread_id or 'recent-work'}\n"
-                f"transcript:\n{_clip_text(transcript or 'ไม่มี transcript; compact สถานะงานล่าสุดของแผนกนี้', 30000)}"
+                f"transcript:\n{_clip_text_tail(transcript or 'ไม่มี transcript; compact สถานะงานล่าสุดของแผนกนี้', 30000)}"
             ),
         )],
         now=now,
@@ -3691,6 +4105,12 @@ async def _compact_department(
         f"ย่อบริบท thread {thread_id} พร้อมเก็บ transcript ต้นฉบับไว้ตรวจสอบย้อนหลัง"
         if thread_id else
         "ย่อบริบทล่าสุดเป็นประเด็นสำคัญ เก็บต้นฉบับไว้อ้างอิงได้"
+    )
+    # Real prompt relief: folded transcript tokens minus the summary that replaces it.
+    saved = (
+        max(0, estimate_text_tokens(transcript) - estimate_text_tokens(archive_summary))
+        if transcript
+        else 0
     )
     archive = {
         "id": uid("arc"),
@@ -3782,6 +4202,22 @@ async def _compact_department(
         "workingUpdatedAt": now,
     }
     await repo.save_department(dept)
+    if thread_id and messages:
+        last = messages[-1]
+        boundary = {
+            "id": thread_id,
+            "threadId": thread_id,
+            "departmentId": dept["id"],
+            "upToTs": int(last.get("ts") or now),
+            "upToId": str(last.get("id") or ""),
+            "archiveId": archive["id"],
+            "summary": archive_summary,
+            "messageCount": len(messages),
+            "updatedAt": now,
+        }
+        existing_boundary = await repo.get_entity("thread_compaction", thread_id)
+        if not existing_boundary or int(existing_boundary.get("upToTs") or 0) <= boundary["upToTs"]:
+            await repo.put_entity("thread_compaction", boundary, dept=dept["id"], status="active", ts=now)
     await repo.add_activity(_activity(
         f"บีบอัดความจำด้วย LLM: เก็บ {len(knowledge_items)} knowledge จาก archive {archive['id']} · ประหยัด {saved / 1000:.1f}k โทเค็น",
         type_="compaction",
@@ -5376,6 +5812,20 @@ async def request_task_close_approval(
     await repo.save_department(dept)
     await repo.add_approval(approval)
     await _task_close_approval_message(repo, approval, dept, task, now)
+    if _task_originated_from_executive(task):
+        await _queue_executive_wake_from_department_update(
+            repo,
+            dept,
+            event="task_close_requested",
+            summary=(
+                f"ฝ่าย{dept.get('name', dept['id'])}ขอปิดงาน “{task['title']}” แล้ว "
+                f"รอผู้บริหารอนุมัติ approval={approval['id']}"
+            ),
+            task=task,
+            trigger_id=approval["id"],
+            now=now,
+            severity="warn",
+        )
     await emit_work_status_notice(
         repo,
         event="task_close_requested",
@@ -6234,6 +6684,20 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
             dept["currentTaskId"] = None
             await repo.save_department(dept)
             return True
+        step_index = len(task.get("log", [])) + 1
+        await emit_work_status_notice(
+            repo,
+            event="task_working",
+            summary=(
+                f"ฝ่าย{dept.get('name', dept['id'])}กำลังทำงาน “{task['title']}” "
+                f"(step {step_index})"
+            ),
+            source_dept=dept,
+            task=task,
+            severity="info",
+            now=now,
+            dedupe_key=f"task_working:{task['id']}:{step_index}",
+        )
         step = await _llm_work_step(repo, dept, task, now)
         if step is None:
             if reset_autonomy_schedule:
@@ -6304,6 +6768,17 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
                 severity="warn",
                 now=now,
             )
+            if _task_originated_from_executive(task):
+                await _queue_executive_wake_from_department_update(
+                    repo,
+                    dept,
+                    event="task_blocked",
+                    summary=f"งาน “{task['title']}” ติดปัญหา: {log_line}",
+                    task=task,
+                    trigger_id=f"{task['id']}:blocked:{repeat_count}",
+                    now=now,
+                    severity="warn",
+                )
             await emit_work_status_notice(
                 repo,
                 event="task_blocked",
@@ -6362,6 +6837,17 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
                 severity="good",
                 now=now,
             )
+            if _task_originated_from_executive(task):
+                await _queue_executive_wake_from_department_update(
+                    repo,
+                    dept,
+                    event="task_review",
+                    summary=f"งาน “{task['title']}” พร้อมตรวจแล้ว: {log_line}",
+                    task=task,
+                    trigger_id=f"{task['id']}:review",
+                    now=now,
+                    severity="good",
+                )
             await emit_work_status_notice(
                 repo,
                 event="task_review",
@@ -6396,6 +6882,20 @@ async def _advance_department(repo: Repo, dept: dict[str, Any], tasks: list[dict
 
     if state == "review":
         if task:
+            review_index = sum(1 for line in task.get("log", []) if "review" in str(line).lower()) + 1
+            await emit_work_status_notice(
+                repo,
+                event="task_reviewing",
+                summary=(
+                    f"ฝ่าย{dept.get('name', dept['id'])}กำลังตรวจคุณภาพงาน “{task['title']}” "
+                    f"(review {review_index})"
+                ),
+                source_dept=dept,
+                task=task,
+                severity="info",
+                now=now,
+                dedupe_key=f"task_reviewing:{task['id']}:{review_index}",
+            )
             review = await _llm_review_task(repo, dept, task, departments, now)
             if review is None:
                 return False

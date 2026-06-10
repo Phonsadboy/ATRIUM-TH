@@ -7,9 +7,9 @@ import type { CatalogResponse, ModelId, ModelSpeed } from '../contract/types'
 /**
  * Live model/provider catalog from `GET /api/catalog`, fetched once and cached
  * at module scope. The backend is the source of truth for which models can run
- * Claude Fast Mode (`models[].supportedSpeeds`) and which speed modes exist
+ * Fast Mode (`models[].supportedSpeeds`) and which speed modes exist
  * (`speedModes`); the UI reads those to enable/disable the Fast toggle per
- * model. Until the fetch resolves — or if it fails — we fall back to the static
+ * model. Until the fetch resolves, or if it fails, we fall back to the static
  * mirror in `contract/models.ts`.
  */
 export interface SpeedCatalog {

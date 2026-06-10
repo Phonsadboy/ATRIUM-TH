@@ -100,6 +100,16 @@ class OpenAIResponsesProvider:
     def _effort(effort: str) -> str:
         return effort if effort in OPENAI_EFFORTS else "medium"
 
+    @classmethod
+    def _requested_effort(cls, effort: str, speed: str) -> str:
+        if speed == "fast":
+            return "low"
+        return cls._effort(effort)
+
+    @staticmethod
+    def _speed(speed: str) -> str:
+        return "fast" if speed == "fast" else "standard"
+
     @staticmethod
     def _tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
         if not tools:
@@ -438,6 +448,7 @@ class OpenAIResponsesProvider:
         *,
         fallback_model: str,
         effort: str,
+        speed: str,
         generation_ms: int,
     ) -> LLMResult:
         output_items = data.get("output") if isinstance(data.get("output"), list) else []
@@ -494,7 +505,7 @@ class OpenAIResponsesProvider:
             generation_ms=generation_ms,
             model=str(data.get("model") or fallback_model),
             provider_id=self.id,
-            speed="standard",
+            speed=speed,
             stop_reason="tool_calls" if tool_calls else status,
             content=content,
             tool_calls=tool_calls,
@@ -502,6 +513,7 @@ class OpenAIResponsesProvider:
                 "request_id": data.get("id"),
                 "wireApi": "responses",
                 "store": False,
+                "requestedEffort": effort,
             },
         )
 
@@ -553,7 +565,8 @@ class OpenAIResponsesProvider:
         tools: list[dict[str, Any]] | None = None,
     ) -> LLMResult:
         client = self._ensure_client()
-        requested_effort = self._effort(effort)
+        requested_speed = self._speed(speed)
+        requested_effort = self._requested_effort(effort, requested_speed)
         payload = self._payload(
             system=system,
             messages=messages,
@@ -580,6 +593,7 @@ class OpenAIResponsesProvider:
                 resp.json(),
                 fallback_model=model,
                 effort=requested_effort,
+                speed=requested_speed,
                 generation_ms=generation_ms,
             )
             if self._has_empty_visible_output(result) and attempt == 0:
@@ -603,7 +617,8 @@ class OpenAIResponsesProvider:
         tools: list[dict[str, Any]] | None = None,
     ):
         client = self._ensure_client()
-        requested_effort = self._effort(effort)
+        requested_speed = self._speed(speed)
+        requested_effort = self._requested_effort(effort, requested_speed)
         payload = self._payload(
             system=system,
             messages=messages,
@@ -702,6 +717,7 @@ class OpenAIResponsesProvider:
                 data,
                 fallback_model=model,
                 effort=requested_effort,
+                speed=requested_speed,
                 generation_ms=generation_ms,
             )
             if self._has_empty_visible_output(result) and attempt == 0:

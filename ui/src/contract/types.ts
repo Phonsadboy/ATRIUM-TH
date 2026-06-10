@@ -38,7 +38,7 @@ export type ModelId =
 
 export type ThinkingEffort = 'off' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 
-/** Claude Fast Mode switch. Only legal on selected Opus models; the backend is
+/** Fast Mode switch. Only legal on models that advertise it; the backend is
  *  the final arbiter and coerces an unsupported request back to 'standard'. */
 export type ModelSpeed = 'standard' | 'fast'
 
@@ -95,7 +95,7 @@ export interface Department {
   providerId: AiProviderId
   model: ModelId
   thinkingEffort: ThinkingEffort
-  /** standard response path, or Claude Fast Mode (Opus-only). */
+  /** standard response path, or Fast Mode when the selected model supports it. */
   speed: ModelSpeed
   agentName: string
   state: AgentState

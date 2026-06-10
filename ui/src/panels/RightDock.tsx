@@ -390,9 +390,11 @@ export function RightDock() {
                   }}
                   title={
                     fastSupported
-                      ? 'Claude Fast Mode — ตอบเร็วขึ้น (เฉพาะ Opus)'
+                      ? model.tier === 'gpt'
+                        ? 'GPT Fast Mode — ใช้ reasoning effort ต่ำเพื่อลด latency'
+                        : 'Claude Fast Mode — ตอบเร็วขึ้นสำหรับรุ่นที่รองรับ'
                       : model.tier === 'gpt'
-                        ? 'GPT route ใช้ Standard speed เสมอ'
+                        ? 'GPT รุ่นนี้ยังไม่ประกาศรองรับ Fast Mode'
                         : 'รุ่นนี้ไม่รองรับ Fast Mode'
                   }
                   aria-pressed={fastOn}

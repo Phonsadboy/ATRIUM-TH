@@ -6748,6 +6748,21 @@ async def _create_task_tool(repo: Repo, args: dict[str, Any], active_dept: dict[
             "reason": "task_assigned",
         })
         hub.mark_dirty()
+    else:
+        await emit_work_status_notice(
+            repo,
+            event="task_queued",
+            summary=(
+                f"งาน “{task['title']}” ถูกมอบหมายให้{_department_label(target)}แล้ว "
+                "แต่แผนกยังไม่ว่าง จึงอยู่ในคิวรอเริ่มอัตโนมัติ"
+            ),
+            source_dept=active_dept,
+            target_dept=target,
+            task=task,
+            severity="info",
+            now=now,
+            dedupe_key=f"task_queued:{task['id']}",
+        )
     return {
         "ok": True,
         "tool": "create_task",

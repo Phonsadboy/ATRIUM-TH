@@ -169,7 +169,11 @@ from .engine import (
     run_engine_tick,
     run_image_generation_loop,
     run_trigger_scheduler_loop,
+    _history_after_compaction,
     _is_user_paused,
+    _queue_executive_wake_from_department_update,
+    _thread_compaction_boundary,
+    _task_originated_from_executive,
 )
 from .ids import uid
 from .memory.debt import compute_department_knowledge_debt
@@ -9252,8 +9256,14 @@ async def _maybe_enqueue_context_compaction(
             reason = "message_threshold"
     if not reason:
         return False
-    await repo.enqueue(
-        uid("job"),
+    now = now_ms()
+    cooldown_s = max(0, int(getattr(settings, "compact_cooldown_s", 0) or 0))
+    last_compaction_at = int((dept.get("memory") or {}).get("lastCompactionAt") or 0)
+    if cooldown_s and last_compaction_at and now - last_compaction_at < cooldown_s * 1000:
+        return False
+    job_id = uid("job")
+    kept_job_id = await repo.enqueue_once(
+        job_id,
         "compact_dept",
         {
             "departmentId": dept["id"],
@@ -9264,9 +9274,12 @@ async def _maybe_enqueue_context_compaction(
             "compactContextThreshold": compact_context_threshold,
             "model": model,
         },
-        now_ms(),
+        now,
         priority=2,
+        dedupe_key=f"compact:{thread_id}",
     )
+    if kept_job_id != job_id:
+        return False
     metric = (
         f" context {context_tokens:,}/{compact_context_threshold:,} tokens"
         if context_tokens
@@ -9751,6 +9764,8 @@ async def _send_war_room_message(
         draft_cleared = await _delete_thread_draft(repo, thread_id)
 
         history = await _thread_messages_for_live_prompt(repo, thread_id)
+        compaction_boundary = await _thread_compaction_boundary(repo, thread_id)
+        prompt_history, compaction_context = _history_after_compaction(history, compaction_boundary)
         user_msg = {**user_msg, "warRoomId": war_room_id}
         await repo.add_message(user_msg)
         activity = _activity(
@@ -9853,7 +9868,7 @@ async def _send_war_room_message(
     })
     hub.mark_dirty()
 
-    working_history = [*history, user_msg, system_line]
+    working_history = [*prompt_history, user_msg, system_line]
     total_usd = 0.0
     all_rag_hits: list[str] = []
     compact_any = False
@@ -9885,6 +9900,8 @@ async def _send_war_room_message(
             blocked = await _budget_block_reason(repo, turn_dept, estimated_usd)
             if not blocked:
                 memory_context, memory_hits = await _retrieval_context(repo, dept, input.text)
+                if compaction_context:
+                    memory_context = (memory_context + "\n\n" if memory_context else "") + compaction_context
                 tool_memory_context = await recent_tool_run_context(repo, dept, thread_id)
                 if tool_memory_context:
                     memory_context = (memory_context + "\n\n" if memory_context else "") + tool_memory_context
@@ -10355,6 +10372,8 @@ async def _complete_chat_turn(
     async with session_scope() as s:
         repo = Repo(s)
         departments = await repo.list_departments()
+        compaction_boundary = await _thread_compaction_boundary(repo, thread_id)
+        history, compaction_context = _history_after_compaction(history, compaction_boundary)
         estimated_usd = _chat_cost_estimate(turn_dept)
         blocked = await _budget_block_reason(repo, turn_dept, estimated_usd)
         if blocked:
@@ -10445,6 +10464,8 @@ async def _complete_chat_turn(
 
             await ensure_executive_runtime_agent(repo, turn_dept)
         memory_context, memory_hits = await _retrieval_context(repo, turn_dept, text)
+        if compaction_context:
+            memory_context = (memory_context + "\n\n" if memory_context else "") + compaction_context
         tool_memory_context = await recent_tool_run_context(repo, turn_dept, thread_id)
         if tool_memory_context:
             memory_context = (memory_context + "\n\n" if memory_context else "") + tool_memory_context
@@ -12891,6 +12912,8 @@ async def send_message(thread_id: str, input: SendMessageInput, request: Request
         if legacy_department_thread and routed_department_id is None:
             routed_department_id = current_dept["id"]
         history = await _thread_messages_for_live_prompt(repo, thread_id)
+        compaction_boundary = await _thread_compaction_boundary(repo, thread_id)
+        prompt_history, compaction_context = _history_after_compaction(history, compaction_boundary)
         existing_user_msg = await repo.get_message(input.client_message_id) if input.client_message_id else None
         if existing_user_msg:
             if existing_user_msg.get("threadId") not in {thread_id, requested_thread_id} or existing_user_msg.get("role") != "user":
@@ -13180,6 +13203,8 @@ async def send_message(thread_id: str, input: SendMessageInput, request: Request
                 draft_cleared=draft_cleared,
             )
         memory_context, memory_hits = await _retrieval_context(repo, dept, input.text)
+        if compaction_context:
+            memory_context = (memory_context + "\n\n" if memory_context else "") + compaction_context
         tool_memory_context = await recent_tool_run_context(repo, dept, thread_id)
         if tool_memory_context:
             memory_context = (memory_context + "\n\n" if memory_context else "") + tool_memory_context
@@ -13189,7 +13214,7 @@ async def send_message(thread_id: str, input: SendMessageInput, request: Request
         memory_context = await _append_executive_office_layout_context(repo, dept, departments, memory_context)
         context_tokens, context_token_source = await _context_tokens_for_turn(
             dept,
-            history,
+            prompt_history,
             user_msg,
             memory_context=memory_context,
             departments=departments,
@@ -13198,7 +13223,7 @@ async def send_message(thread_id: str, input: SendMessageInput, request: Request
             repo,
             thread_id=thread_id,
             dept=dept,
-            message_count=len(history) + 2,
+            message_count=len(prompt_history) + 2,
             estimated_context_tokens=context_tokens,
             context_token_source=context_token_source,
         )
@@ -13239,7 +13264,7 @@ async def send_message(thread_id: str, input: SendMessageInput, request: Request
     try:
         result = await _complete_with_provider(
             turn_dept,
-            history,
+            prompt_history,
             user_msg,
             memory_context,
             departments=departments,
@@ -15089,6 +15114,20 @@ async def create_handoff_message(handoff_id: str, input: CreateHandoffMessageInp
             now=now,
             dedupe_key=f"{event}:{handoff_id}:{msg['id']}",
         )
+        if input.act in {"reply", "deliver", "return"} and _task_originated_from_executive(task):
+            actor_dept = await repo.get_department(str(input.from_ or ""))
+            if actor_dept:
+                await _queue_executive_wake_from_department_update(
+                    repo,
+                    actor_dept,
+                    event=event,
+                    summary=f"{actor_name} {visibility_event_label(event)}: {_clip_text(input.text, 1200) or '-'}",
+                    task=task,
+                    source_message=msg,
+                    trigger_id=msg["id"],
+                    now=now,
+                    severity="good" if input.act in {"reply", "deliver", "return"} else "info",
+                )
         await repo.add_activity(_activity(
             f"handoff {handoff_id}: {input.act}",
             type_="handoff",

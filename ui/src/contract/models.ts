@@ -21,7 +21,7 @@ export interface ModelInfo {
   /** USD per million tokens. Real provider billing can differ; used for local cost accounting. */
   inputPerMTok: number
   outputPerMTok: number
-  /** Response speeds this model offers. Fast Mode is Opus-only; the backend
+  /** Response speeds this model offers. The backend
    *  catalog (`models[].supportedSpeeds`) is authoritative and overlays this. */
   supportedSpeeds: ModelSpeed[]
   supportedEfforts?: ThinkingEffort[]
@@ -142,7 +142,7 @@ export const MODELS: Record<ModelId, ModelInfo> = {
     providerIds: ['openai', 'chatgpt_account'],
     inputPerMTok: 5,
     outputPerMTok: 30,
-    supportedSpeeds: ['standard'],
+    supportedSpeeds: ['standard', 'fast'],
     supportedEfforts: ['low', 'medium', 'high', 'xhigh'],
     defaultThinkingEffort: 'medium',
     contextWindowTokens: 1_000_000,
@@ -155,7 +155,7 @@ export const MODELS: Record<ModelId, ModelInfo> = {
     providerIds: ['openai', 'chatgpt_account'],
     inputPerMTok: 0.75,
     outputPerMTok: 4.5,
-    supportedSpeeds: ['standard'],
+    supportedSpeeds: ['standard', 'fast'],
     supportedEfforts: ['low', 'medium', 'high', 'xhigh'],
     defaultThinkingEffort: 'medium',
     contextWindowTokens: 1_000_000,
@@ -168,7 +168,7 @@ export const MODELS: Record<ModelId, ModelInfo> = {
     providerIds: ['openai', 'chatgpt_account'],
     inputPerMTok: 2.5,
     outputPerMTok: 15,
-    supportedSpeeds: ['standard'],
+    supportedSpeeds: ['standard', 'fast'],
     supportedEfforts: ['low', 'medium', 'high', 'xhigh'],
     defaultThinkingEffort: 'medium',
     contextWindowTokens: 1_000_000,
@@ -250,13 +250,13 @@ export const SPEED_MODES: Record<ModelSpeed, SpeedModeInfo> = {
     id: 'standard',
     label: 'Standard',
     apiShape: 'omit speed',
-    blurb: 'Claude response path ปกติ',
+    blurb: 'response path ปกติ ใช้ระดับ Think ตามที่เลือก',
   },
   fast: {
     id: 'fast',
     label: 'Fast',
-    apiShape: 'beta fast-mode-2026-02-01 + speed:"fast"',
-    blurb: 'Claude Fast Mode — ตอบเร็วขึ้น ใช้ได้เฉพาะ Opus 4.8/4.7 (ค่าใช้จ่ายต่อโทเคนสูงกว่า)',
+    apiShape: 'Claude beta fast-mode-2026-02-01 หรือ OpenAI reasoning.effort:"low"',
+    blurb: 'Fast Mode สำหรับรุ่นที่รองรับ: Claude Opus ใช้ fast beta; GPT ใช้ reasoning effort ต่ำเพื่อลด latency',
   },
 }
 

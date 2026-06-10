@@ -119,8 +119,8 @@ export interface CompanyClient {
   setDepartmentProvider(departmentId: ID, providerId: AiProviderId): void
   setDepartmentModel(departmentId: ID, model: ModelId): void
   setDepartmentThinkingEffort(departmentId: ID, effort: ThinkingEffort): void
-  /** Toggle Claude Fast Mode for a department. The backend decides whether the
-   *  model can run fast and the UI syncs to the returned (coerced) value. */
+  /** Toggle Fast Mode for a department. The backend decides whether the model
+   *  can run fast and the UI syncs to the returned (coerced) value. */
   setDepartmentSpeed(departmentId: ID, speed: ModelSpeed): void
   setDepartmentAutonomy(departmentId: ID, autonomy: boolean): void
   /** set the company-wide daily spend cap (USD) */

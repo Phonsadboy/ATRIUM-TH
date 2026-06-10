@@ -12,7 +12,10 @@ from .threads import EXEC_ID, EXEC_THREAD, is_exec, thread_id_for
 
 WORK_STATUS_EVENT_LABELS: dict[str, str] = {
     "task_assigned": "รับมอบหมายงาน",
+    "task_queued": "รอคิวแผนก",
     "task_started": "เริ่มงาน",
+    "task_working": "กำลังทำงาน",
+    "task_reviewing": "กำลังตรวจงาน",
     "task_review": "พร้อมตรวจ",
     "task_blocked": "ติดปัญหา",
     "task_revising": "ต้องแก้ก่อนปิด",

@@ -333,7 +333,7 @@ class Settings(BaseSettings):
     # Recent chat messages sent directly to the model before long-term memory/RAG.
     # Raw thread history remains stored separately; this only controls prompt assembly.
     # <= 0 sends every fetched thread message into prompt assembly.
-    chat_history_messages: int = 0
+    chat_history_messages: int = 200
     # Recent completed tool runs summarized into chat context. Full tool payloads
     # remain in agent_tool_run records and are fetched only when needed.
     chat_tool_memory_runs: int = 20
@@ -357,6 +357,12 @@ class Settings(BaseSettings):
     compact_claude_context_tokens: int = 180_000
     compact_gpt_context_tokens: int = 230_000
     compact_context_window_ratio: float = 0.8
+    # Skip re-enqueueing compaction while the last one is this fresh; <= 0 disables.
+    compact_cooldown_s: int = 300
+    # Hard prompt backstop below compaction: trim oldest history once the estimated
+    # context exceeds this share of the model window; <= 0 disables. A trim also
+    # queues compaction (reason "window_guard") so the smart path catches up.
+    chat_context_window_guard_ratio: float = 0.80
     # <= 0 disables the app-level per-user chat rate gate.
     chat_rate_limit_per_minute: int = 0
     chat_budget_warning_ratio: float = 0.85
