@@ -138,8 +138,8 @@ http://127.0.0.1:5173
 ทำต่อจากจุดที่ค้าง ตรวจ full stack, provider readiness, /api/runtime, logs และเปิด ATRIUM ให้พร้อมใช้งานจริง
 ```
 
-รายละเอียดเชิง operations อยู่ที่ [ops/README.md](ops/README.md)  
-รายละเอียด backend อยู่ที่ [system/README.md](system/README.md)  
+รายละเอียดเชิง operations อยู่ที่ [ops/README.md](ops/README.md)
+รายละเอียด backend อยู่ที่ [system/README.md](system/README.md)
 รายละเอียด frontend อยู่ที่ [ui/README.md](ui/README.md)
 
 ## English
@@ -260,6 +260,6 @@ http://127.0.0.1:5173
 - At least one provider is ready, or `status` explains the blocker
 - `report --bundle` can produce a redacted support zip without printing secrets
 
-For deeper operations, see [ops/README.md](ops/README.md).  
-For backend work, see [system/README.md](system/README.md).  
+For deeper operations, see [ops/README.md](ops/README.md).
+For backend work, see [system/README.md](system/README.md).
 For frontend work, see [ui/README.md](ui/README.md).

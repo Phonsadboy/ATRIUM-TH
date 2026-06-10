@@ -9,6 +9,7 @@ yarn-error.log*
 pnpm-debug.log*
 
 # Local-only workspace folders
+/.claude/
 /.local/
 /local-artifacts/
 /scratch/
@@ -61,7 +62,7 @@ playwright-report/
 /doc/
 /documentation/
 *.md
-!README.md
+!/README.md
 **/tests/
 **/test/
 **/test_*.py

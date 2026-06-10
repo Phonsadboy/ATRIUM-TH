@@ -3720,12 +3720,20 @@ class WindowsHostBridgeTest(unittest.TestCase):
                 return failure_payload, None
             return None, "missing"
 
-        with mock.patch.object(main_module, "_host_bridge_load_json_file", side_effect=fake_load):
+        with (
+            mock.patch.object(main_module, "_host_bridge_load_json_file", side_effect=fake_load),
+            mock.patch.object(Path, "read_bytes", return_value=b"windows-failure-proof"),
+        ):
             artifacts = main_module._host_bridge_local_proof_artifacts(current_source)
 
         self.assertTrue(artifacts["windowsLocal"]["exists"])
         self.assertFalse(artifacts["windowsLocal"]["ok"])
         self.assertFalse(artifacts["windowsLocal"]["usable"])
+        self.assertEqual(artifacts["windowsLocal"]["artifactBytes"], len(b"windows-failure-proof"))
+        self.assertEqual(
+            artifacts["windowsLocal"]["artifactSha256"],
+            main_module.hashlib.sha256(b"windows-failure-proof").hexdigest(),
+        )
         self.assertEqual(artifacts["windowsLocal"]["mode"], "windows_live_proof_failed")
         self.assertEqual(artifacts["windowsLocal"]["sourceStatus"], "current")
         self.assertEqual(artifacts["windowsLocal"]["failedChecks"], ["windows_live_proof_failed"])
