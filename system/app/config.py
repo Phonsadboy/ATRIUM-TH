@@ -373,11 +373,19 @@ class Settings(BaseSettings):
     # forever. Long model turns can still run for many minutes; exceeding this
     # marks the job failed so the next tick can continue with other work.
     engine_job_timeout_s: float = 1800.0
-    # Chat replies are user-visible and serialize per department, so keep their
-    # timeout shorter than long-running background work.
+    # Chat replies are user-visible and may run tool-heavy turns on slower
+    # machines. This is an inactivity timeout: active streams/tool loops can run
+    # longer as long as they keep emitting progress.
     chat_reply_timeout_s: float = Field(
         default=300.0,
         validation_alias=AliasChoices("ATRIUM_CHAT_REPLY_TIMEOUT_S", "CHAT_REPLY_TIMEOUT_S"),
+    )
+    # Number of automatic requeues after a chat reply is inactive for the
+    # timeout window. The final timeout still marks the message failed so the
+    # user gets a retry control instead of an indefinite spinner.
+    chat_reply_timeout_retries: int = Field(
+        default=1,
+        validation_alias=AliasChoices("ATRIUM_CHAT_REPLY_TIMEOUT_RETRIES", "CHAT_REPLY_TIMEOUT_RETRIES"),
     )
     engine_tick_timeout_s: float = 1800.0
     engine_stale_after_s: float = 600.0

@@ -129,6 +129,7 @@ _OBJECTIVE_ENQUEUE_LOCK = asyncio.Lock()
 _TRIGGER_ENQUEUE_LOCK = asyncio.Lock()
 DEDICATED_WORKER_JOB_KINDS = {"chat_reply", "image_generation", "trigger_run"}
 CHAT_REPLY_DEFER_COLLISION_MS = 750
+CHAT_TOOL_PROGRESS_HEARTBEAT_S = 30.0
 BUDGET_NEAR_CAP_RATIO = 0.8
 EXECUTIVE_SUMMARY_INTERVAL_MS = 60 * 60_000
 EXECUTIVE_SUMMARY_JITTER_MS = 15 * 60_000
@@ -387,6 +388,25 @@ async def _runtime_degraded_retry_reason(settings: Settings | None = None, dept:
     if health.get("ok") is True and health.get("degraded") is not True:
         return None
     return _runtime_degraded_reason(health)
+
+
+async def _chat_tool_progress_heartbeat(thread_id: str, msg_id: str, run: dict[str, Any]) -> None:
+    """Emit visible progress while a long-running chat tool is still active."""
+    while True:
+        await asyncio.sleep(CHAT_TOOL_PROGRESS_HEARTBEAT_S)
+        ts = chat_streams.touch(thread_id, msg_id)
+        hub.pulse({
+            "kind": "tool_activity",
+            "threadId": thread_id,
+            "msgId": msg_id,
+            "run": {
+                **run,
+                "status": "running",
+                "heartbeatAt": ts,
+            },
+        })
+
+
 _JOB_CLAIM_LOCK = asyncio.Lock()
 
 
@@ -428,6 +448,8 @@ def engine_runtime_snapshot(settings: Settings | None = None) -> dict[str, Any]:
         "tickSeconds": settings.tick_seconds,
         "jobTimeoutS": settings.engine_job_timeout_s,
         "chatReplyTimeoutS": _job_timeout_s_for_kind("chat_reply", settings),
+        "chatReplyTimeoutMode": "inactivity",
+        "chatReplyTimeoutRetries": _chat_reply_timeout_retry_limit(settings),
         "tickTimeoutS": settings.engine_tick_timeout_s,
         "chatReplyWorker": {
             **_CHAT_REPLY_WORKER_RUNTIME,
@@ -1146,6 +1168,7 @@ async def _complete_runtime_turn(
         if thread_id and stream_msg_id:
             pulse = runtime_event_to_hub_pulse(event, thread_id=thread_id, msg_id=stream_msg_id)
             if pulse:
+                chat_streams.touch(thread_id, stream_msg_id)
                 hub.pulse(pulse)
                 try:
                     from .telegram_gateway import maybe_stream_telegram_progress_event
@@ -1178,14 +1201,35 @@ async def _complete_runtime_turn(
                 await _record_suppressed_engine_error(repo, "runtime_event_ledger", exc, now=now_ms())
 
     async def execute_runtime_tool(call: LLMToolCall) -> dict[str, Any]:
-        async with session_scope() as s:
-            return await run_chat_tool(
-                Repo(s),
-                call,
-                active_dept=dept,
-                thread_id=thread_id or thread_id_for(dept["id"]),
-                requested_by=requested_by or dept.get("agentName", dept["id"]),
-            )
+        heartbeat_task: asyncio.Task[None] | None = None
+        if thread_id and stream_msg_id:
+            heartbeat_task = asyncio.create_task(_chat_tool_progress_heartbeat(
+                thread_id,
+                stream_msg_id,
+                {
+                    "id": call.id,
+                    "toolUseId": call.id,
+                    "tool": call.name,
+                    "departmentId": dept["id"],
+                    "args": call.input or {},
+                    "status": "running",
+                    "startedAt": now_ms(),
+                },
+            ))
+        try:
+            async with session_scope() as s:
+                return await run_chat_tool(
+                    Repo(s),
+                    call,
+                    active_dept=dept,
+                    thread_id=thread_id or thread_id_for(dept["id"]),
+                    requested_by=requested_by or dept.get("agentName", dept["id"]),
+                )
+        finally:
+            if heartbeat_task is not None:
+                heartbeat_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await heartbeat_task
 
     try:
         result = await complete_agent_via_runtime(
@@ -1954,6 +1998,7 @@ async def _complete_engine_chat_with_tools(
         messages.append(assistant_tool_message(result))
         round_records: list[dict[str, Any]] = []
         for call in result.tool_calls:
+            heartbeat_task: asyncio.Task[None] | None = None
             if on_stream_event is not None and stream_msg_id:
                 pulse = {
                     "kind": "tool_call",
@@ -1969,7 +2014,9 @@ async def _complete_engine_chat_with_tools(
                         "startedAt": now_ms(),
                     },
                 }
+                chat_streams.touch(thread_id, stream_msg_id)
                 hub.pulse(pulse)
+                heartbeat_task = asyncio.create_task(_chat_tool_progress_heartbeat(thread_id, stream_msg_id, pulse["run"]))
                 try:
                     from .telegram_gateway import maybe_stream_telegram_progress_event
 
@@ -1982,14 +2029,20 @@ async def _complete_engine_chat_with_tools(
                     )
                 except Exception as exc:
                     await _record_suppressed_engine_error(repo, "telegram_progress.tool_call", exc, now=now_ms())
-            async with session_scope() as s:
-                record = await run_chat_tool(
-                    Repo(s),
-                    call,
-                    active_dept=dept,
-                    thread_id=thread_id,
-                    requested_by=str(user_msg.get("authorName") or user_msg.get("author") or dept.get("agentName") or dept["id"]),
-                )
+            try:
+                async with session_scope() as s:
+                    record = await run_chat_tool(
+                        Repo(s),
+                        call,
+                        active_dept=dept,
+                        thread_id=thread_id,
+                        requested_by=str(user_msg.get("authorName") or user_msg.get("author") or dept.get("agentName") or dept["id"]),
+                    )
+            finally:
+                if heartbeat_task is not None:
+                    heartbeat_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await heartbeat_task
             round_records.append(record)
             if on_stream_event is not None and stream_msg_id:
                 pulse = {
@@ -1998,6 +2051,7 @@ async def _complete_engine_chat_with_tools(
                     "msgId": stream_msg_id,
                     "run": record,
                 }
+                chat_streams.touch(thread_id, stream_msg_id)
                 hub.pulse(pulse)
                 try:
                     from .telegram_gateway import maybe_stream_telegram_progress_event
@@ -2132,8 +2186,8 @@ async def _mark_chat_reply_timeout(repo: Repo, payload: dict[str, Any], *, timeo
         with contextlib.suppress(Exception):
             messages = await repo.thread_messages(thread_id, limit=50)
             existing = next((msg for msg in messages if msg.get("id") == reply_message_id), None)
-    detail = f"chat_reply job exceeded {timeout_s:g}s"
-    fallback_text = "การตอบแชตหมดเวลา ระบบปิดสถานะกำลังตอบแล้ว สามารถสั่งให้ลองใหม่ได้"
+    detail = f"chat_reply job had no activity for {timeout_s:g}s"
+    fallback_text = "การตอบแชตเงียบเกินกำหนด ระบบปิดสถานะกำลังตอบแล้ว สามารถสั่งให้ลองใหม่ได้"
     if existing:
         text = str(existing.get("text") or "").strip() or fallback_text
         reply = {
@@ -2170,6 +2224,83 @@ async def _mark_chat_reply_timeout(repo: Repo, payload: dict[str, Any], *, timeo
     })
 
 
+async def _mark_chat_reply_timeout_retrying(
+    repo: Repo,
+    payload: dict[str, Any],
+    *,
+    timeout_s: float,
+    retry_delay_ms: int,
+    now: int,
+) -> None:
+    thread_id = str(payload.get("threadId") or "")
+    reply_message_id = str(payload.get("replyMessageId") or "")
+    user_message_id = str(payload.get("userMessageId") or "")
+    if not thread_id or not reply_message_id:
+        return
+    existing = None
+    with contextlib.suppress(Exception):
+        existing = await repo.get_message(reply_message_id, thread_id=thread_id)
+    if not existing:
+        with contextlib.suppress(Exception):
+            messages = await repo.thread_messages(thread_id, limit=50)
+            existing = next((msg for msg in messages if msg.get("id") == reply_message_id), None)
+    retry_after = now + max(1, int(retry_delay_ms or 0))
+    detail = f"chat_reply job had no activity for {timeout_s:g}s; retrying automatically"
+    fallback_text = "งานตอบกลับเงียบเกินกำหนด ระบบกำลังเข้าคิวลองต่ออัตโนมัติ"
+    if existing:
+        reply = {
+            **existing,
+            "text": str(existing.get("text") or "").strip() or fallback_text,
+            "ts": now,
+            "pending": True,
+            "status": "queued",
+            "replyToMessageId": existing.get("replyToMessageId") or user_message_id or None,
+            "error": {
+                "code": "chat_reply_timeout_retry",
+                "detail": detail,
+                "retryable": True,
+                "retryAfter": retry_after,
+            },
+            "timeoutRecovery": {
+                "timeoutS": timeout_s,
+                "retryAfter": retry_after,
+                "retryDelayMs": retry_delay_ms,
+            },
+        }
+        reply.pop("completedAt", None)
+        await repo.update_message(reply)
+    else:
+        reply = {
+            "id": reply_message_id,
+            "threadId": thread_id,
+            "role": "agent",
+            "authorName": str(payload.get("departmentName") or payload.get("agentName") or "AI"),
+            "text": fallback_text,
+            "ts": now,
+            "pending": True,
+            "status": "queued",
+            "replyToMessageId": user_message_id or None,
+            "error": {
+                "code": "chat_reply_timeout_retry",
+                "detail": detail,
+                "retryable": True,
+                "retryAfter": retry_after,
+            },
+            "timeoutRecovery": {
+                "timeoutS": timeout_s,
+                "retryAfter": retry_after,
+                "retryDelayMs": retry_delay_ms,
+            },
+        }
+        await repo.add_message(reply)
+    hub.pulse({
+        "kind": "msg_queued",
+        "threadId": thread_id,
+        "msgId": reply_message_id,
+        "message": reply,
+    })
+
+
 def _job_timeout_retry_delay_ms(settings: Settings | None = None) -> int:
     settings = settings or get_settings()
     try:
@@ -2177,6 +2308,15 @@ def _job_timeout_retry_delay_ms(settings: Settings | None = None) -> int:
     except (TypeError, ValueError):
         delay_s = 60.0
     return int(max(1.0, delay_s) * 1000)
+
+
+def _chat_reply_timeout_retry_limit(settings: Settings | None = None) -> int:
+    settings = settings or get_settings()
+    try:
+        raw = int(getattr(settings, "chat_reply_timeout_retries", 1) or 0)
+    except (TypeError, ValueError):
+        raw = 1
+    return max(0, raw)
 
 
 async def _record_job_timeout_recovery(
@@ -2223,13 +2363,18 @@ async def _record_job_timeout_recovery(
     with contextlib.suppress(Exception):
         await repo.put_entity("job_timeout_recovery", record, status=action, ts=now)
     with contextlib.suppress(Exception):
+        timeout_detail = (
+            f"{kind or 'job'} {job_id or '(unknown)'} had no activity for {timeout_s:g}s"
+            if kind == "chat_reply"
+            else f"{kind or 'job'} {job_id or '(unknown)'} exceeded {timeout_s:g}s"
+        )
         detail = (
             f"requeued after {int(retry_delay_ms or 0)}ms"
             if action == "requeue"
             else "closed chat reply and marked failed"
         )
         await repo.add_activity(_activity(
-            f"job timeout recovery: {kind or 'job'} {job_id or '(unknown)'} exceeded {timeout_s:g}s; {detail}",
+            f"job timeout recovery: {timeout_detail}; {detail}",
             type_="system",
             severity="warn",
             ts=now,
@@ -2246,7 +2391,28 @@ async def _handle_job_timeout(
 ) -> dict[str, Any]:
     kind = str(getattr(job, "kind", "") or "")
     if kind == "chat_reply":
-        await _mark_chat_reply_timeout(repo, dict(getattr(job, "payload", None) or {}), timeout_s=timeout_s, now=now)
+        attempts = max(0, int(getattr(job, "attempts", 0) or 0))
+        retry_limit = _chat_reply_timeout_retry_limit(settings)
+        payload = dict(getattr(job, "payload", None) or {})
+        if attempts < retry_limit:
+            retry_delay_ms = _job_timeout_retry_delay_ms(settings)
+            await _mark_chat_reply_timeout_retrying(
+                repo,
+                payload,
+                timeout_s=timeout_s,
+                retry_delay_ms=retry_delay_ms,
+                now=now,
+            )
+            await _record_job_timeout_recovery(
+                repo,
+                job,
+                timeout_s=timeout_s,
+                now=now,
+                action="requeue",
+                retry_delay_ms=retry_delay_ms,
+            )
+            return {"action": "requeue", "retryDelayMs": retry_delay_ms}
+        await _mark_chat_reply_timeout(repo, payload, timeout_s=timeout_s, now=now)
         await _record_job_timeout_recovery(repo, job, timeout_s=timeout_s, now=now, action="fail")
         return {"action": "fail", "retryDelayMs": None}
     retry_delay_ms = _job_timeout_retry_delay_ms(settings)
@@ -3626,6 +3792,7 @@ def _job_record(job: Any) -> SimpleNamespace:
         id=str(getattr(job, "id", "")),
         kind=str(getattr(job, "kind", "")),
         payload=dict(getattr(job, "payload", None) or {}),
+        attempts=int(getattr(job, "attempts", 0) or 0),
     )
 
 
@@ -3706,21 +3873,63 @@ def _job_timeout_s_for_kind(kind: str, settings: Settings) -> float:
     return _positive_timeout_s(getattr(settings, "engine_job_timeout_s", None), default=1800.0)
 
 
+def _chat_reply_job_thread_and_message(job: Any) -> tuple[str, str]:
+    payload = dict(getattr(job, "payload", None) or {})
+    return str(payload.get("threadId") or ""), str(payload.get("replyMessageId") or "")
+
+
+async def _await_chat_reply_activity(
+    task: asyncio.Task[Any],
+    *,
+    job: Any,
+    inactivity_timeout_s: float,
+) -> Any:
+    thread_id, reply_message_id = _chat_reply_job_thread_and_message(job)
+    inactivity_ms = int(max(1.0, float(inactivity_timeout_s)) * 1000)
+    last_seen = chat_streams.touch(thread_id, reply_message_id) if thread_id and reply_message_id else now_ms()
+    while True:
+        latest = chat_streams.last_progress_at(reply_message_id) if reply_message_id else None
+        if latest is not None:
+            last_seen = max(last_seen, latest)
+        remaining_ms = inactivity_ms - max(0, now_ms() - last_seen)
+        if remaining_ms <= 0:
+            if task.done():
+                return await task
+            raise asyncio.TimeoutError
+        done, _ = await asyncio.wait({task}, timeout=remaining_ms / 1000)
+        if task in done:
+            return await task
+
+
 async def _process_claimed_job_record(job: SimpleNamespace, settings: Settings | None = None) -> int:
     settings = settings or get_settings()
-    timeout_s = _job_timeout_s_for_kind(str(getattr(job, "kind", "") or ""), settings)
+    kind = str(getattr(job, "kind", "") or "")
+    timeout_s = _job_timeout_s_for_kind(kind, settings)
+    processing_task: asyncio.Task[Any] | None = None
     async with session_scope() as s:
         repo = Repo(s)
         try:
-            await asyncio.wait_for(_process_due_job(repo, job, now_ms()), timeout=timeout_s)
+            if kind == "chat_reply":
+                processing_task = asyncio.create_task(_process_due_job(repo, job, now_ms()))
+                await _await_chat_reply_activity(processing_task, job=job, inactivity_timeout_s=timeout_s)
+            else:
+                await asyncio.wait_for(_process_due_job(repo, job, now_ms()), timeout=timeout_s)
             await repo.mark_job(job.id, "done")
             return 1
         except _RetryJobLater as exc:
             await repo.mark_job(job.id, "queued", error=exc.reason, run_after=now_ms() + exc.delay_ms)
         except asyncio.TimeoutError:
+            if processing_task is not None and not processing_task.done():
+                processing_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await processing_task
             timeout_now = now_ms()
             recovery = await _handle_job_timeout(repo, job, timeout_s=timeout_s, now=timeout_now, settings=settings)
-            error = f"TimeoutError: job exceeded {timeout_s:g}s"
+            error = (
+                f"TimeoutError: chat reply inactive for {timeout_s:g}s"
+                if kind == "chat_reply"
+                else f"TimeoutError: job exceeded {timeout_s:g}s"
+            )
             if recovery.get("action") == "requeue":
                 await repo.mark_job(
                     job.id,

@@ -4,6 +4,7 @@ import { useSelector, client } from '../state/useCompany'
 import { useUI } from '../state/ui'
 import { Avatar, withAlpha } from '../components/primitives'
 import { ACCENT_HEX } from '../lib/visuals'
+import { compareChatOrder } from '../lib/messageOrder'
 import { money } from '../lib/format'
 import type {
   AccentName,
@@ -214,13 +215,15 @@ function groupToolActivityMessages(messages: ChatMessage[]): ChatListItem[] {
 }
 
 function mergeMessages(history: ChatMessage[] | null, live: ChatMessage[]): ChatMessage[] {
-  if (!history) return live
+  if (!history) return [...live].sort(compareChatOrder)
   const byId = new Map<string, ChatMessage>()
   for (const message of history) byId.set(message.id, message)
   for (const message of live) byId.set(message.id, message)
-  return [...byId.values()].sort((a, b) => a.ts - b.ts || a.id.localeCompare(b.id))
+  return [...byId.values()].sort(compareChatOrder)
 }
 
+// Raw chronological compare — used for history-pagination cursors only;
+// display order (live replies pinned last) comes from compareChatOrder.
 function compareMessages(a: ChatMessage, b: ChatMessage): number {
   return a.ts - b.ts || a.id.localeCompare(b.id)
 }
@@ -388,6 +391,7 @@ function routeLabel(m: ChatMessage, deptNameById: Map<string, string>): string |
 
 function liveStatusLabel(m: ChatMessage): string {
   if (m.toolRuns?.some((r) => r.status === 'running')) return 'กำลังใช้เครื่องมือ'
+  if (m.error?.code === 'chat_reply_timeout_retry') return 'เงียบเกินกำหนด กำลังลองต่ออัตโนมัติ'
   if (m.status === 'queued') return 'อยู่ในคิว กำลังเตรียมบริบท'
   if (m.streaming) return 'กำลังคิดและส่งคำตอบแบบสด'
   return 'กำลังคิดและเตรียมคำตอบ'

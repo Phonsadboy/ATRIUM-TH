@@ -7,6 +7,7 @@ import type {
   ReassignTaskInput,
   Unsubscribe,
 } from './client'
+import { compareChatOrder } from '../lib/messageOrder'
 import type {
   AiProviderId,
   ActivityEvent,
@@ -1304,7 +1305,7 @@ export class ApiClient implements CompanyClient {
           const seg = this.streamSegments.get(m.id)
           return seg && seg.length ? { ...m, segments: seg } : m
         })
-        .sort((a, b) => a.ts - b.ts)
+        .sort(compareChatOrder)
     }
     return threads
   }

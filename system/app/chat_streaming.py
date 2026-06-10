@@ -43,19 +43,37 @@ class ChatStreamRegistry:
         self._by_msg: dict[str, asyncio.Event] = {}
         self._thread_by_msg: dict[str, str] = {}
         self._latest_by_thread: dict[str, str] = {}
+        self._progress_by_msg: dict[str, int] = {}
 
     def start(self, thread_id: str, msg_id: str) -> asyncio.Event:
         ev = asyncio.Event()
         self._by_msg[msg_id] = ev
         self._thread_by_msg[msg_id] = thread_id
         self._latest_by_thread[thread_id] = msg_id
+        self.touch(thread_id, msg_id)
         return ev
 
     def finish(self, thread_id: str, msg_id: str) -> None:
         self._by_msg.pop(msg_id, None)
         self._thread_by_msg.pop(msg_id, None)
+        self._progress_by_msg.pop(msg_id, None)
         if self._latest_by_thread.get(thread_id) == msg_id:
             self._latest_by_thread.pop(thread_id, None)
+
+    def touch(self, thread_id: str | None, msg_id: str | None) -> int:
+        if not msg_id:
+            return now_ms()
+        ts = now_ms()
+        self._progress_by_msg[str(msg_id)] = ts
+        if thread_id:
+            self._thread_by_msg[str(msg_id)] = str(thread_id)
+            self._latest_by_thread[str(thread_id)] = str(msg_id)
+        return ts
+
+    def last_progress_at(self, msg_id: str | None) -> int | None:
+        if not msg_id:
+            return None
+        return self._progress_by_msg.get(str(msg_id))
 
     def stop(self, *, thread_id: str | None = None, msg_id: str | None = None) -> tuple[bool, str | None]:
         if not msg_id and thread_id:
@@ -122,9 +140,13 @@ class ChatMessageStreamSink:
         return {**msg, "channelReply": merged}
 
     async def start(self) -> None:
+        chat_streams.touch(self.thread_id, self.msg_id)
         self.message["text"] = ""
         self.message["pending"] = True
         self.message["status"] = "sending"
+        # The bubble was created at enqueue time; a queued/deferred job can start
+        # much later. Stamp the actual answer start so ordering tracks reality.
+        self.message["ts"] = now_ms()
         self.message.pop("error", None)
         self.message.pop("runtime", None)
         await self.persist(pending=True, force=True)
@@ -133,6 +155,7 @@ class ChatMessageStreamSink:
     async def handle(self, event: LLMStreamEvent) -> None:
         if self.cancel_event.is_set():
             raise ChatStreamCancelled()
+        chat_streams.touch(self.thread_id, self.msg_id)
         if event.kind == "thinking_delta":
             self.thinking += event.text
             hub.pulse({
@@ -168,6 +191,7 @@ class ChatMessageStreamSink:
     async def persist(self, *, pending: bool, force: bool = False) -> None:
         if not force and len(self.text) == self._last_persist_len:
             return
+        chat_streams.touch(self.thread_id, self.msg_id)
         msg = {**self.message, "text": self.text, "pending": pending}
         msg = await self._merge_latest_channel_reply(msg)
         if self.repo is not None:
